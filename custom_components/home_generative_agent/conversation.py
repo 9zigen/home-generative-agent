@@ -29,9 +29,10 @@ from homeassistant.components.conversation import (
     trace,
 )
 from homeassistant.components.conversation.models import AbstractConversationAgent
-from homeassistant.const import MATCH_ALL
+from homeassistant.const import MATCH_ALL, STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.exceptions import HomeAssistantError, TemplateError
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import intent, llm, template
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.util import ulid
@@ -104,6 +105,9 @@ from .const import (
     RECOMMENDED_VOICE_ACK_TIMING,
     SCHEMA_FIRST_YAML_PROMPT,
     SIGNAL_TOOL_INDEX_UPDATED,
+    SPEAKER_KNOWN_PROMPT,
+    SPEAKER_SENSOR_NAME,
+    SPEAKER_UNKNOWN_PROMPT,
     SUBENTRY_TYPE_MODEL_PROVIDER,
     TOOL_CALL_ERROR_SYSTEM_MESSAGE,
     TOOL_SUBSET_PROMPT,
@@ -1479,6 +1483,36 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
 
         return "\n".join(stable_parts), volatile.strip()
 
+    def _speaker_prompt(self, device_id: str | None) -> str:
+        """
+        Say who is speaking, when the requesting device recognizes voices.
+
+        Pulsar satellites publish the recognized voice as an ESPHome text sensor
+        named "Speaker". Looking it up on the requesting device keeps a request
+        typed elsewhere from picking up the last name heard. The result changes
+        between turns, so it belongs in the volatile part of the prompt.
+        """
+        if not device_id:
+            return ""
+        registry = er.async_get(self.hass)
+        sensor = next(
+            (
+                entry.entity_id
+                for entry in er.async_entries_for_device(registry, device_id)
+                if entry.platform == "esphome"
+                and entry.domain == "sensor"
+                and entry.original_name == SPEAKER_SENSOR_NAME
+            ),
+            None,
+        )
+        if sensor is None:
+            return ""
+        state = self.hass.states.get(sensor)
+        name = state.state if state else STATE_UNKNOWN
+        if name in (STATE_UNKNOWN, STATE_UNAVAILABLE, ""):
+            return SPEAKER_UNKNOWN_PROMPT
+        return SPEAKER_KNOWN_PROMPT.format(name=name)
+
     async def _async_run_ainvoke(
         self,
         app: Any,
@@ -2042,6 +2076,9 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
 
         prompt, volatile_prompt = self._async_render_system_prompt(
             llm_context, user_name, llm_api, has_tools=bool(tools)
+        )
+        volatile_prompt = "\n".join(
+            filter(None, [volatile_prompt, self._speaker_prompt(llm_context.device_id)])
         )
 
         # Use the already-configured chat model from __init__.py.

@@ -7,6 +7,12 @@ their own. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+## [3.44.10-alab.1] - 2026-11-02
+
+### Added
+
+- **The agent knows who is speaking on a voice-recognizing satellite.** When a request comes from a device with a Pulsar "Speaker" text sensor, the prompt names the recognized voice, or says not to address the speaker by name if the voice is not recognized. The name is for personalization only and never authorizes anything. Requests from other devices are unaffected.
+
 ## [3.44.10] - 2026-10-22
 
 ### Fixed
