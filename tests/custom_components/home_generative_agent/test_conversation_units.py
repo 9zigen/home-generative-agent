@@ -2262,7 +2262,8 @@ def test_speaker_prompt_names_the_recognized_voice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A recognized voice is named, and never as authorization."""
-    prompt = _speaker_entity(monkeypatch, "Алексей")._speaker_prompt("device")
+    entity = _speaker_entity(monkeypatch, "Алексей")
+    prompt = entity._speaker_prompt(entity._speaker_name("device"))
     assert '"Алексей"' in prompt
     assert "never to authorize" in prompt
 
@@ -2272,7 +2273,8 @@ def test_speaker_prompt_without_a_recognized_voice(
     monkeypatch: pytest.MonkeyPatch, state: str | None
 ) -> None:
     """A device that recognizes voices but heard no known one forbids using a name."""
-    prompt = _speaker_entity(monkeypatch, state)._speaker_prompt("device")
+    entity = _speaker_entity(monkeypatch, state)
+    prompt = entity._speaker_prompt(entity._speaker_name("device"))
     assert "do not address them by name" in prompt
     assert "unavailable" not in prompt
 
@@ -2286,7 +2288,8 @@ def test_speaker_prompt_ignores_other_entities(
 ) -> None:
     """Only a Pulsar speaker sensor on the device counts."""
     entity = _speaker_entity(monkeypatch, "Алексей", **other)
-    assert entity._speaker_prompt("device") == ""
+    assert entity._speaker_name("device") is None
+    assert entity._speaker_prompt(None) == ""
 
 
 def test_speaker_prompt_needs_a_device(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2452,8 +2455,8 @@ def test_each_turn_gets_its_own_pin_reply() -> None:
     """
     src = inspect.getsource(HGAConversationEntity._async_handle_message_active)
     assert "start_pin_turn(" in src
-    assert "runtime_data.pending_actions, conversation_id, user_input.text" in src
-    assert '"thread_id": conversation_id,' in src
+    assert "runtime_data.pending_actions, thread_id, user_input.text" in src
+    assert '"thread_id": thread_id,' in src
 
 
 def test_the_pin_turn_starts_before_any_early_return() -> None:
@@ -3546,3 +3549,12 @@ async def test_a_renamed_remote_server_is_indexed_again() -> None:
     value = rd.store.aput.call_args.kwargs["value"]
     assert value["content"] == "intent__HassTurnOn (at Cabin): Turns on a device"
     assert rd.tool_index_houses == {"mcp-cabin": "Cabin"}
+
+
+def test_thread_is_per_speaker_only_on_devices_that_recognize_voices() -> None:
+    """Each voice gets its own history; other requests keep the conversation's."""
+    thread = HGAConversationEntity._thread_id
+    assert thread("conv", "Алексей") == "conv:Алексей"
+    assert thread("conv", "Алексей") != thread("conv", "Платон")
+    assert thread("conv", "unknown") == "conv:unknown"
+    assert thread("conv", None) == "conv"
