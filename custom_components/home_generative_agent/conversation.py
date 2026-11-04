@@ -1483,17 +1483,17 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
 
         return "\n".join(stable_parts), volatile.strip()
 
-    def _speaker_prompt(self, device_id: str | None) -> str:
+    def _speaker_name(self, device_id: str | None) -> str | None:
         """
-        Say who is speaking, when the requesting device recognizes voices.
+        Return who is speaking, when the requesting device recognizes voices.
 
         Pulsar satellites publish the recognized voice as an ESPHome text sensor
         named "Speaker". Looking it up on the requesting device keeps a request
-        typed elsewhere from picking up the last name heard. The result changes
-        between turns, so it belongs in the volatile part of the prompt.
+        typed elsewhere from picking up the last name heard. A device without the
+        sensor gives None; one that heard no known voice gives STATE_UNKNOWN.
         """
         if not device_id:
-            return ""
+            return None
         registry = er.async_get(self.hass)
         sensor = next(
             (
@@ -1506,12 +1506,31 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
             None,
         )
         if sensor is None:
-            return ""
+            return None
         state = self.hass.states.get(sensor)
         name = state.state if state else STATE_UNKNOWN
-        if name in (STATE_UNKNOWN, STATE_UNAVAILABLE, ""):
+        return STATE_UNKNOWN if name in (STATE_UNAVAILABLE, "") else name
+
+    @staticmethod
+    def _speaker_prompt(speaker: str | None) -> str:
+        """Say who is speaking; it changes between turns, so the prompt part is volatile."""
+        if speaker is None:
+            return ""
+        if speaker == STATE_UNKNOWN:
             return SPEAKER_UNKNOWN_PROMPT
-        return SPEAKER_KNOWN_PROMPT.format(name=name)
+        return SPEAKER_KNOWN_PROMPT.format(name=speaker)
+
+    @staticmethod
+    def _thread_id(conversation_id: str, speaker: str | None) -> str:
+        """
+        Return the checkpointer thread: one per speaker within a conversation.
+
+        A satellite keeps one conversation for everyone in the room, and the model
+        repeats an answer it finds in its history over the speaker named in the
+        prompt. Separate threads keep one person's turns from answering another's.
+        Pending actions follow the thread, so a misheard voice cannot confirm one.
+        """
+        return f"{conversation_id}:{speaker}" if speaker else conversation_id
 
     async def _async_run_ainvoke(
         self,
@@ -2012,12 +2031,15 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
                 response=intent_response, conversation_id=conversation_id
             )
 
+        speaker = self._speaker_name(llm_context.device_id)
+        thread_id = self._thread_id(conversation_id, speaker)
+
         # A PIN confirmation is accepted only from this message, and a PIN
         # prompt waiting in this conversation is answered by it or not at all,
         # so this runs before any other early return. A turn that fails keeps
         # the prompt for the user's next message (keep_pin_prompts).
         pin_reply = start_pin_turn(
-            runtime_data.pending_actions, conversation_id, user_input.text
+            runtime_data.pending_actions, thread_id, user_input.text
         )
 
         # Multi-API initialization
@@ -2078,7 +2100,7 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
             llm_context, user_name, llm_api, has_tools=bool(tools)
         )
         volatile_prompt = "\n".join(
-            filter(None, [volatile_prompt, self._speaker_prompt(llm_context.device_id)])
+            filter(None, [volatile_prompt, self._speaker_prompt(speaker)])
         )
 
         # Use the already-configured chat model from __init__.py.
@@ -2118,7 +2140,7 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
 
         app_config: RunnableConfig = {
             "configurable": {
-                "thread_id": conversation_id,
+                "thread_id": thread_id,
                 "user_id": clean_user_name,
                 "pin_reply": pin_reply,
                 "requester_is_admin": requester_is_admin,

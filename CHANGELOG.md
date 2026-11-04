@@ -7,6 +7,12 @@ their own. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+## [3.44.10-alab.2] - 2026-11-04
+
+### Fixed
+
+- **People sharing a voice satellite no longer get each other's answers.** On a device with a Pulsar speaker sensor, each recognized voice now has its own conversation history, because the model repeated an answer from its history over the speaker named in the prompt. Existing history stays under the old thread and is not carried over.
+
 ## [3.44.10-alab.1] - 2026-11-02
 
 ### Added
