@@ -328,13 +328,13 @@ class HgaMemoryCard extends HTMLElement {
   }
 }
 
+// HGA loads this file itself; a hand-added Resources entry would load it again.
 if (!customElements.get("hga-memory-card")) {
   customElements.define("hga-memory-card", HgaMemoryCard);
+  window.customCards = window.customCards || [];
+  window.customCards.push({
+    type: "hga-memory-card",
+    name: "HGA Memories",
+    description: "Browse, search, edit, move and delete long-term memories per person.",
+  });
 }
-
-window.customCards = window.customCards || [];
-window.customCards.push({
-  type: "hga-memory-card",
-  name: "HGA Memories",
-  description: "Browse, search, edit, move and delete long-term memories per person.",
-});

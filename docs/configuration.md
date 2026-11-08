@@ -422,7 +422,7 @@ The agent saves a fact when you ask it to ("remember that I drink tea without su
 
 **By voice:** ask what it remembers about you, or tell it to forget something. A voice only reaches its own memories.
 
-**On a dashboard:** add the resource `/hga-card/hga-memory-card.js` (JavaScript Module), then the card:
+**On a dashboard:** add the card, which HGA loads itself:
 
 ```yaml
 type: custom:hga-memory-card

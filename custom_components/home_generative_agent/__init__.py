@@ -21,6 +21,7 @@ import psycopg_pool
 import voluptuous as vol
 from homeassistant.components import media_source
 from homeassistant.components.camera.const import DOMAIN as CAMERA_DOMAIN
+from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.http.server import StaticPathConfig
 from homeassistant.config_entries import (
     SIGNAL_CONFIG_ENTRY_CHANGED,
@@ -53,6 +54,7 @@ from homeassistant.helpers.target import (
     TargetSelection,
     async_extract_referenced_entity_ids,
 )
+from homeassistant.loader import async_get_integration
 from homeassistant.util import dt as dt_util
 from homeassistant.util.ssl import SSL_ALPN_HTTP11, client_context
 from langchain_core.runnables import ConfigurableField
@@ -176,6 +178,7 @@ from .const import (
     FEATURE_NAMES,
     HGA_CARD_STATIC_PATH,
     HGA_CARD_STATIC_PATH_LEGACY,
+    HGA_FRONTEND_CARDS,
     MODEL_CATEGORY_SPECS,
     NO_DATABASE_ENROLL_MESSAGE,
     NO_DATABASE_REMEDIATION,
@@ -1505,6 +1508,18 @@ def _provider_setting(
         if value:
             return str(value)
     return None
+
+
+async def _async_load_frontend_cards(hass: HomeAssistant) -> None:
+    """
+    Load the dashboard cards on every frontend page.
+
+    The version in the URL replaces the file the browser cached for a release
+    before this one.
+    """
+    version = (await async_get_integration(hass, DOMAIN)).version
+    for card in HGA_FRONTEND_CARDS:
+        add_extra_js_url(hass, f"{HGA_CARD_STATIC_PATH}/{card}?v={version}")
 
 
 def _resolve_www_dir() -> str | None:
@@ -4315,6 +4330,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
                     ),
                 ]
             )
+            await _async_load_frontend_cards(hass)
         hass.data[DOMAIN]["http_registered"] = True
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
