@@ -7,6 +7,14 @@ their own. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+## [3.45.0-alab.2] - 2026-11-08
+
+Fork release: 3.45.0-alab.1 plus the person link from the upstream pull request.
+
+### Added
+
+- **A recognized voice is linked to its Home Assistant person.** The "Speaker" text sensor now counts from any integration on the satellite's device. A voice that matches a person by name, id or entity id is named with that person entity in the prompt, and its history is kept per person. When the person has a login, the voice uses that user's long-term memories instead of the shared satellite ones. It still grants no admin rights. History kept under the voice name moves to a new thread keyed by the person.
+
 ## [3.45.0-alab.1] - 2026-11-08
 
 Fork release: upstream 3.45.0 with the voice-satellite changes from 3.44.10-alab.1 and .2.
