@@ -7,6 +7,14 @@ their own. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+## [3.45.0-alab.4] - 2026-11-08
+
+Fork release: 3.45.0-alab.3 plus the memory tool on every turn.
+
+### Fixed
+
+- **"Remember this" requests can be saved.** The long-term memory tool is now offered on every turn, because tool search often missed it and the agent then refused the save. An exclusion still removes it, and it does not count against the always-included tools limit.
+
 ## [3.45.0-alab.3] - 2026-11-08
 
 Fork release: 3.45.0-alab.2 plus the speaker sensor option from the upstream pull request.
