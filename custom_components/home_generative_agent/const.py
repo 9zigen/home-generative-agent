@@ -402,6 +402,23 @@ CONF_SENTINEL_DAILY_DIGEST_TIME = "sentinel_daily_digest_time"
 RECOMMENDED_SENTINEL_DAILY_DIGEST_ENABLED: bool = False
 RECOMMENDED_SENTINEL_DAILY_DIGEST_TIME: str = "08:00:00"
 
+# ---- Sentinel full-text record (#922) ----
+# A mobile push is capped at MAX_MOBILE_MESSAGE_CHARS and scrolls away. On =
+# an alert sent to a notify service also gets its full text as a Home
+# Assistant persistent notification, except network / HA-security findings
+# and a notify service that already is a persistent notification. Off by
+# default so an upgrade does not start filling the notification panel of
+# installs that already get pushes.
+CONF_SENTINEL_PERSISTENT_RECORD = "sentinel_persistent_record"
+RECOMMENDED_SENTINEL_PERSISTENT_RECORD: bool = False
+
+# ---- Sentinel heating/cooling context (#922) ----
+# Weather entity or temperature sensor for the outdoor temperature shown when
+# heating or cooling explains a power finding (#922). Empty: the first
+# weather entity with a temperature.
+CONF_SENTINEL_OUTDOOR_TEMPERATURE_ENTITY = "sentinel_outdoor_temperature_entity"
+RECOMMENDED_SENTINEL_OUTDOOR_TEMPERATURE_ENTITY = ""
+
 # ---- Sentinel network security audit (docs/network-security-plan.md) ----
 # Master switch for the network section of the snapshot and every network /
 # HA-security rule. Off = the section carries no capabilities, so the rules
@@ -506,6 +523,13 @@ CONF_CHAT_REASONING_BY_MODEL = "chat_reasoning_by_model"
 ANTHROPIC_THINKING_MIN_BUDGET = 1024
 ANTHROPIC_THINKING_MAX_BUDGET = 32768
 ANTHROPIC_THINKING_RESPONSE_TOKENS = 4096
+# max_tokens for an Anthropic request that does not size it itself (extended
+# thinking does, above). langchain-anthropic would otherwise send the output
+# limit of the model the provider was built with (128000 for
+# claude-sonnet-4-6) to every model the provider serves, which the API rejects
+# for a model with a lower limit such as claude-haiku-4-5 (64000, issue #929).
+# It is capped at the requested model's own output limit where that is known.
+ANTHROPIC_DEFAULT_MAX_TOKENS = 16384
 
 # ---- Fallback configuration ----
 CONF_FEATURE_FALLBACK_PROVIDER_IDS = "fallback_provider_ids"

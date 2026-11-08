@@ -30,6 +30,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from homeassistant.core import callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_call_later, async_track_time_change
 from homeassistant.util import dt as dt_util
 
@@ -44,13 +45,19 @@ from custom_components.home_generative_agent.const import (
     CONF_SENTINEL_AREA_NOTIFY_MAP,
     CONF_SENTINEL_DAILY_DIGEST_ENABLED,
     CONF_SENTINEL_DAILY_DIGEST_TIME,
+    CONF_SENTINEL_PERSISTENT_RECORD,
     CONF_SENTINEL_RESPONSE_LANGUAGE,
     RECOMMENDED_SENTINEL_DAILY_DIGEST_ENABLED,
     RECOMMENDED_SENTINEL_DAILY_DIGEST_TIME,
+    RECOMMENDED_SENTINEL_PERSISTENT_RECORD,
     SNOOZE_24H,
     SNOOZE_PERMANENT,
 )
 from custom_components.home_generative_agent.core.utils import extract_final
+from custom_components.home_generative_agent.sentinel.hvac_context import (
+    hvac_explained_by,
+    outdoor_reading,
+)
 from custom_components.home_generative_agent.sentinel.models import (
     RULE_NAMED_TEMPLATES,
     SEMANTIC_KEY_SLUG_PREFIX,
@@ -104,6 +111,13 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(__name__)
 
 MAX_MOBILE_MESSAGE_CHARS = 220
+
+# A notify service whose "push" is itself a persistent notification; the
+# full-text record (#922) would post the alert twice. Same set as
+# agent/critical_push.py's _NOT_A_PUSH; any persistent_notification.* service
+# counts too.
+_NOT_A_PUSH = frozenset({"notify.persistent_notification"})
+
 # Ceiling for the burst-batch digest body (header plus per-finding lines).
 MAX_BATCH_BODY_CHARS = 1200
 # Ceiling for the "Also: ..." line a grouped push adds under its body. It has
@@ -319,11 +333,7 @@ class SentinelNotifier:
         clean_explanation = _redact_if_sensitive(explanation, finding)
 
         severity = finding.severity
-        title_key = {
-            "high": "severity_title_high",
-            "low": "severity_title_low",
-        }.get(severity, "severity_title_medium")
-        title = notif_msg(self._hass, title_key)
+        title = _severity_title(finding, self._hass)
         interrupt_level = _SEVERITY_INTERRUPT_LEVEL.get(severity, "active")
         subtitle = _build_subtitle(finding, self._hass, snapshot)
         mobile_msg = _mobile_message(
@@ -381,9 +391,10 @@ class SentinelNotifier:
                 and finding.type not in CHANGE_ALERT_RULE_TYPES
             ):
                 # Rate limit exceeded — buffer this finding.  Hold the redacted
-                # explanation, never the raw one: the flush discards it today,
-                # but storing the unredacted text would silently bypass
-                # _redact_if_sensitive the moment anyone renders it.
+                # explanation, never the raw one: with the full-text record on
+                # (#922) the flush renders it into each held finding's record,
+                # so storing the unredacted text would bypass
+                # _redact_if_sensitive.
                 self._held_batch.append((finding, clean_explanation, target_service))
                 if self._batch_cancel is None:
                     self._batch_cancel = async_call_later(
@@ -410,21 +421,77 @@ class SentinelNotifier:
                     "push": {"interruption-level": interrupt_level},
                 },
             }
+            if self._keeps_record(f"{domain}.{service}", finding):
+                # Before the push: a removed or renamed notify service raises
+                # here even with blocking=False, and then the record is the
+                # only copy of the alert (#922). The record is a side copy, so
+                # its own failure never stops the push.
+                await self._async_keep_record(finding, title, persistent_msg)
             LOGGER.debug("Sending sentinel notification via %s.", target_service)
             await self._hass.services.async_call(domain, service, data, blocking=False)
         else:
             LOGGER.debug("Sending sentinel notification via persistent_notification.")
-            await self._hass.services.async_call(
-                "persistent_notification",
-                "create",
-                {
-                    "title": title,
-                    "message": persistent_msg,
-                    "notification_id": f"hga_sentinel_{finding.anomaly_id}",
-                },
-                blocking=False,
-            )
+            await self._async_create_record(finding, title, persistent_msg)
         return True
+
+    def _keeps_record(self, target: str, finding: AnomalyFinding) -> bool:
+        """
+        Return True when *finding*, pushed to *target*, also keeps a record (#922).
+
+        Not when the push already is a persistent notification, which would
+        post the alert twice, and never for a network or HA-security finding:
+        persistent notifications reach every signed-in user, and these name
+        tokens, accounts and devices meant for the push's own recipient.
+        """
+        # Home Assistant matches services case-insensitively.
+        target = target.lower()
+        return (
+            bool(
+                self._options.get(
+                    CONF_SENTINEL_PERSISTENT_RECORD,
+                    RECOMMENDED_SENTINEL_PERSISTENT_RECORD,
+                )
+            )
+            and target not in _NOT_A_PUSH
+            and not target.startswith("persistent_notification.")
+            and not _is_network_finding(finding)
+        )
+
+    async def _async_keep_record(
+        self, finding: AnomalyFinding, title: str, message: str
+    ) -> None:
+        """Create *finding*'s full-text record (#922); a failure only warns."""
+        try:
+            await self._async_create_record(finding, title, message)
+        except HomeAssistantError as err:
+            LOGGER.warning(
+                "Sentinel could not keep the full-text record of %s (%s); "
+                "sending the push anyway.",
+                finding.anomaly_id,
+                type(err).__name__,
+            )
+
+    async def _async_create_record(
+        self, finding: AnomalyFinding, title: str, message: str
+    ) -> None:
+        """
+        Create *finding*'s persistent notification.
+
+        This is the alert itself when no notify service is configured, and the
+        full-text record next to a capped mobile push otherwise. One id per
+        anomaly id, so a repeat of the same anomaly replaces its record; a rule
+        whose evidence changes between runs gets a new id, and a new record.
+        """
+        await self._hass.services.async_call(
+            "persistent_notification",
+            "create",
+            {
+                "title": title,
+                "message": message,
+                "notification_id": f"hga_sentinel_{finding.anomaly_id}",
+            },
+            blocking=False,
+        )
 
     # ---------------------------------------------------------------------- #
     # Action event handling
@@ -567,6 +634,19 @@ class SentinelNotifier:
             self._hass.async_create_task(
                 self._hass.services.async_call(domain, service, data, blocking=False)
             )
+            # The summary names each alert in a line; keep each one's full
+            # text too, as an alert pushed on its own would (#922). Each one
+            # is judged by its own target: the area map can send held alerts
+            # to different services.
+            for finding, explanation, svc in held:
+                if self._keeps_record(_service_key(svc or target_service), finding):
+                    self._hass.async_create_task(
+                        self._async_keep_record(
+                            finding,
+                            _severity_title(finding, self._hass),
+                            _persistent_message(explanation, finding, self._hass),
+                        )
+                    )
         else:
             self._hass.async_create_task(
                 self._hass.services.async_call(
@@ -574,7 +654,9 @@ class SentinelNotifier:
                     "create",
                     {
                         "title": batch_title,
-                        "message": message,
+                        # The bodies carry device names and model text; the
+                        # panel renders Markdown, so it is escaped here.
+                        "message": escape_markdown(message),
                         "notification_id": "hga_sentinel_batch_summary",
                     },
                     blocking=False,
@@ -1064,7 +1146,9 @@ def _is_power_class_evidence(ev: dict[str, Any]) -> bool:
 
 
 def _appliance_power_duration_mobile_message(
-    finding: AnomalyFinding, hass: HomeAssistant | None = None
+    finding: AnomalyFinding,
+    hass: HomeAssistant | None = None,
+    cap: int | None = MAX_MOBILE_MESSAGE_CHARS,
 ) -> str:
     """Deterministic mobile copy for appliance_power_duration."""
     ev = finding.evidence
@@ -1098,15 +1182,57 @@ def _appliance_power_duration_mobile_message(
         else notif_msg(hass, "body_threshold_unknown")
     )
 
+    note = _hvac_note(ev, hass)
     msg = notif_msg(
         hass,
-        "body_appliance_power",
+        "body_appliance_power_explained" if note else "body_appliance_power",
         appliance=appliance,
         power=power_str,
         duration=dur_str,
         threshold=thr_str,
+        note=note or "",
     )
-    return msg[:MAX_MOBILE_MESSAGE_CHARS].rstrip()
+    return _cap_keeping_note(msg, note, cap)
+
+
+def _cap_keeping_note(msg: str, note: str | None, cap: int | None) -> str:
+    """
+    Cut *msg* to *cap* characters, keeping the heating note it ends with (#922).
+
+    The note is why the alert is likely expected; a long device name must not
+    cut it off mid-sentence. No cap (the full-text record) keeps everything.
+    """
+    if cap is None or len(msg) <= cap:
+        return msg.rstrip()
+    if note and msg.endswith(note) and len(note) < cap - 1:
+        head = msg[: len(msg) - len(note)].rstrip()
+        return f"{head[: cap - len(note) - 1].rstrip()} {note}"
+    return msg[:cap].rstrip()
+
+
+def _hvac_note(ev: dict[str, Any], hass: HomeAssistant | None = None) -> str | None:
+    """
+    Return "Likely from heating, 2 °C outside." for an explained finding (#922).
+
+    None when heating or cooling does not explain the finding. The unit is
+    one of two fixed strings (see hvac_context.outdoor_reading), never text
+    taken from an entity.
+    """
+    explained = hvac_explained_by(ev)
+    if explained is None:
+        return None
+    reading = outdoor_reading(ev)
+    outdoor = (
+        notif_msg(hass, "hvac_outdoor", temp=f"{reading[0]} {reading[1]}")
+        if reading is not None
+        else ""
+    )
+    return notif_msg(
+        hass,
+        "body_hvac_expected",
+        demand=notif_msg(hass, f"hvac_demand_{explained}"),
+        outdoor=outdoor,
+    )
 
 
 def _build_subtitle(
@@ -1527,7 +1653,9 @@ def _alarm_disarmed_open_entry_mobile_message(
 
 
 def _baseline_deviation_mobile_message(
-    finding: AnomalyFinding, hass: HomeAssistant | None = None
+    finding: AnomalyFinding,
+    hass: HomeAssistant | None = None,
+    cap: int | None = MAX_MOBILE_MESSAGE_CHARS,
 ) -> str:
     """Deterministic mobile copy for baseline_deviation and time_of_day_anomaly."""
     ev = finding.evidence
@@ -1561,7 +1689,10 @@ def _baseline_deviation_mobile_message(
         # ABSENCE is the legacy signal — a present-but-empty unit means a
         # genuinely unitless sensor, where fabricating a unit would be wrong.
         unit = "kWh" if "energy" in str(ev.get("entity_id") or "") else "W"
-    cta = notif_msg(hass, "body_cta_appliance" if is_power else "body_cta_worth")
+    note = _hvac_note(ev, hass)
+    cta = note or notif_msg(
+        hass, "body_cta_appliance" if is_power else "body_cta_worth"
+    )
 
     is_below = direction == "below"
     direction_word = notif_msg(hass, "body_dir_below" if is_below else "body_dir_above")
@@ -1614,7 +1745,7 @@ def _baseline_deviation_mobile_message(
             direction=direction_word,
             cta=cta,
         )
-    return msg[:MAX_MOBILE_MESSAGE_CHARS].rstrip()
+    return _cap_keeping_note(msg, note, cap)
 
 
 def _age_phrase(hass: HomeAssistant | None, noun: str, count: int) -> str:
@@ -1777,6 +1908,18 @@ def _security_device_summary(
     return printable(text)
 
 
+def _service_key(target: str) -> str:
+    """Return *target* as ``domain.service``; a bare name is a notify service."""
+    domain, _, service = target.partition(".")
+    return f"{domain}.{service}" if service else f"notify.{target}"
+
+
+def _is_network_finding(finding: AnomalyFinding) -> bool:
+    """Return True for a network / HA-security rule or template finding."""
+    template_id = str(finding.evidence.get("template_id") or "")
+    return finding.type in NETWORK_RULE_TYPES or template_id in NETWORK_TEMPLATES
+
+
 def _network_summary(
     finding: AnomalyFinding, hass: HomeAssistant | None = None
 ) -> str | None:
@@ -1787,8 +1930,7 @@ def _network_summary(
     entity, so the generic fallback would name nothing. None for every other
     finding type or when the summary is empty.
     """
-    template_id = str(finding.evidence.get("template_id") or "")
-    if finding.type not in NETWORK_RULE_TYPES and template_id not in NETWORK_TEMPLATES:
+    if not _is_network_finding(finding):
         return None
     if finding.type == "security_device_unavailable" and (
         localized := _security_device_summary(finding, hass)
@@ -2377,6 +2519,8 @@ def _mobile_message(
     ):
         return deterministic
     if explanation:
+        # The explanation is in the response language and is told about
+        # heating already: no fixed note in another language here (#922).
         text = _normalize_text(explanation)
         if text and len(text) <= MAX_MOBILE_MESSAGE_CHARS:
             return text
@@ -2404,13 +2548,29 @@ def _persistent_message(
         # these (see is_security_copy), and the generic fallback below would
         # drop the camera, the animal or the alarm time it carries.
         return escape_markdown(fixed)
+    # Everything below is rendered as Markdown and can carry text from the
+    # home (device names) or the model, so it is escaped: a name such as
+    # "[Check](https://...)" must not become a link in the panel.
     if explanation:
         text = _normalize_text(explanation)
         if text:
-            return text
+            if (note := _hvac_note(finding.evidence, hass)) and note not in text:
+                # The model's prose (or its compact fallback) may not say why
+                # the draw is likely expected; the fixed note does (#922).
+                text = f"{text}\n\n{note}"
+            return escape_markdown(text)
 
+    # The record is the full text: no push length cap.
     if finding.type == "appliance_power_duration":
-        return _appliance_power_duration_mobile_message(finding, hass)
+        return escape_markdown(
+            _appliance_power_duration_mobile_message(finding, hass, cap=None)
+        )
+    if hvac_explained_by(finding.evidence) is not None:
+        # A power deviation heating or cooling explains: the same body as the
+        # push, so the record says why too (#922).
+        return escape_markdown(
+            _baseline_deviation_mobile_message(finding, hass, cap=None)
+        )
 
     # The device the finding is about first; the context it also carries
     # (an alarm panel, the presence entities) after it (#731).
@@ -2423,14 +2583,25 @@ def _persistent_message(
     entities = entities or notif_msg(hass, "fallback_unknown_entity")
     severity_key = _SEVERITY_WORD_KEYS.get(finding.severity)
     severity_word = notif_msg(hass, severity_key) if severity_key else finding.severity
-    return notif_msg(
-        hass,
-        "persistent_fallback",
-        summary=_display_type(finding, hass),
-        severity=severity_word,
-        entities=entities,
-        hint=_severity_action_hint(finding.severity, hass),
+    return escape_markdown(
+        notif_msg(
+            hass,
+            "persistent_fallback",
+            summary=_display_type(finding, hass),
+            severity=severity_word,
+            entities=entities,
+            hint=_severity_action_hint(finding.severity, hass),
+        )
     )
+
+
+def _severity_title(finding: AnomalyFinding, hass: HomeAssistant | None) -> str:
+    """Return the notification title for *finding*'s severity."""
+    title_key = {
+        "high": "severity_title_high",
+        "low": "severity_title_low",
+    }.get(finding.severity, "severity_title_medium")
+    return notif_msg(hass, title_key)
 
 
 def _severity_action_hint(severity: str, hass: HomeAssistant | None = None) -> str:

@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
+import ipaddress
 import logging
 import re
 import secrets
@@ -22,6 +23,7 @@ from homeassistant.helpers.httpx_client import get_async_client
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
 from ..const import (  # noqa: TID252
+    ANTHROPIC_DEFAULT_MAX_TOKENS,
     ANTHROPIC_THINKING_MAX_BUDGET,
     ANTHROPIC_THINKING_MIN_BUDGET,
     ANTHROPIC_THINKING_RESPONSE_TOKENS,
@@ -41,6 +43,7 @@ from ..const import (  # noqa: TID252
     OPENAI_CHAT_COMPLETIONS_PATH,
     RECOMMENDED_OLLAMA_URL,
 )
+from .anthropic_client import model_is_adaptive_only
 from .face_api import face_api_request, face_api_url
 from .fallback import (
     ainvoke_dropping_unsupported_params,
@@ -58,6 +61,7 @@ if TYPE_CHECKING:
         AsyncIterator,
         Awaitable,
         Callable,
+        Collection,
         Coroutine,
         Mapping,
         MutableMapping,
@@ -236,6 +240,11 @@ def configured_ollama_urls(
 
 # CONF_MODEL_PROVIDER_UNCONTENDED, as set by the last config-entry setup.
 _uncontended: bool = False
+# Whether Sentinel's model chain reaches no server a chat, camera,
+# summarization or embedding model can reach (#877), as set by the last config-entry
+# setup: then no chat or video work can contend with it, and none of the
+# gates hold it back.
+_sentinel_isolated: bool = False
 # Bumped by every config-entry setup: a chat or video session that entered
 # before a reload must not touch the counters the reload reset.
 _gate_generation: int = 0
@@ -303,6 +312,61 @@ def set_model_provider_uncontended(value: bool) -> None:  # noqa: FBT001
     _uncontended = value
 
 
+_LOOPBACK = "localhost"
+
+
+def gate_server_for_url(url: object) -> str | None:
+    """
+    Return the server a local model URL runs on, for the GPU gates (#877).
+
+    The host name, lower-cased; IP literals in canonical form, and every
+    loopback or unspecified address as ``localhost``. Ports are ignored: two
+    Ollama instances on one machine are taken to share its GPU. None when the
+    URL names no host: a server not known.
+    """
+    text = url.strip() if isinstance(url, str) else ""
+    if text and "://" not in text:
+        text = f"http://{text}"
+    try:
+        host = (urlsplit(text).hostname or "").lower().rstrip(".")
+    except ValueError:
+        host = ""
+    if not host or host == _LOOPBACK:
+        return host or None
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    if address.is_loopback or address.is_unspecified:
+        return _LOOPBACK
+    return str(address)
+
+
+def servers_isolated(
+    sentinel: Collection[str | None], foreground: Collection[str | None]
+) -> bool:
+    """
+    Return True when no server in *sentinel* can be one in *foreground* (#877).
+
+    *sentinel* holds the local servers Sentinel's model chain can reach;
+    *foreground* those the chat, camera, summarization and embedding chains
+    can reach,
+    fallbacks included. A server not known (None) may be any server, and an
+    empty *sentinel* is not known either.
+    """
+    if not sentinel or None in sentinel or None in foreground:
+        return False
+    return not set(sentinel) & set(foreground)
+
+
+def set_sentinel_isolated(value: bool) -> None:  # noqa: FBT001
+    """Record whether Sentinel's model has servers of its own (#877)."""
+    global _sentinel_isolated  # noqa: PLW0603
+    _sentinel_isolated = value
+
+
 def _gated(deployment: str | None) -> bool:
     """Return True when calls on *deployment* go through the local gates."""
     return is_edge_deployment(deployment) and not _uncontended
@@ -312,11 +376,12 @@ def sentinel_calls_gated(deployment: str | None) -> bool:
     """
     Return True when Sentinel calls on *deployment* share a local GPU (#866).
 
-    The per-run call limit and the gap between calls exist for a local model
-    shared with chat; a cloud provider, or a local server marked
-    ``model_provider_uncontended``, is never limited.
+    Such calls yield to chat and video (admission, the chat grace,
+    cancellation by chat) and are limited per run and spaced by a gap. A
+    cloud provider, a local server marked ``model_provider_uncontended``, or
+    a Sentinel model on servers no foreground model can reach (#877) is not.
     """
-    return _gated(deployment)
+    return _gated(deployment) and not _sentinel_isolated
 
 
 @contextlib.asynccontextmanager
@@ -437,6 +502,7 @@ def chat_grace_remaining_s() -> float:
 
 def make_gated_probe_runner(
     deployment_of: Callable[[str], str | None],
+    isolated_of: Callable[[str], bool] | None = None,
 ) -> Callable[[str, Callable[[], Awaitable[Any]]], Awaitable[Any]]:
     """
     Return the ``run_probe`` callable for ``ProviderStallTracker`` (#866).
@@ -449,11 +515,16 @@ def make_gated_probe_runner(
     off for good. Once sent, the probe is not cancelled for chat or video
     (it is not a tracked Sentinel task): cancelling a request on a runner
     that just recovered can wedge it again. Cloud and uncontended providers
-    are probed directly.
+    are probed directly, and so is a provider *isolated_of* says no chat,
+    camera, summarization or embedding model can reach (#877).
     """
 
     async def _run_probe(provider_id: str, probe: Callable[[], Awaitable[Any]]) -> Any:
-        if _gated(deployment_of(provider_id)) and foreground_is_active():
+        if (
+            _gated(deployment_of(provider_id))
+            and not (isolated_of is not None and isolated_of(provider_id))
+            and foreground_is_active()
+        ):
             raise StallProbeDeferredError(PROBE_GATE_CLOSED)
         return await probe()
 
@@ -498,6 +569,18 @@ async def _cancel_active_sentinel_llm_tasks(category: str) -> None:
         )
 
 
+def _own_cancellation() -> bool:
+    """
+    Return True when the calling task itself is being cancelled.
+
+    Only a chat turn cancelling the Sentinel call is a deferral: a reload or
+    shutdown cancelling the caller must reach it as a cancellation, or the
+    engine's stop() sees a deferral and returns before it unsubscribes.
+    """
+    current = asyncio.current_task()
+    return current is not None and current.cancelling() > 0
+
+
 def _record_admission(health_stats: MutableMapping[str, Any] | None) -> None:
     """Note an admitted Sentinel call: the starvation clock and stats reset."""
     global _sentinel_first_defer, _sentinel_last_defer  # noqa: PLW0603
@@ -531,14 +614,15 @@ async def sentinel_admission(
     counts as a chat deferral. The grace yields once Sentinel has been
     deferred for the degraded threshold in a row, so chat turns arriving
     every few seconds cannot hold Sentinel off for good.
-    Cloud, and ``model_provider_uncontended``: always admitted.
+    Cloud, ``model_provider_uncontended``, and a Sentinel model on servers of
+    its own (#877): always admitted; "Edge" above is a shared local server.
     Tracks last-admitted timestamp and consecutive deferral count for health
     monitoring; logs a WARNING when Sentinel has been starved beyond the
     starvation threshold.
     """
     global _sentinel_first_defer, _sentinel_last_defer, _sentinel_defer_count  # noqa: PLW0603
     global _sentinel_admissions_deferred_chat, _sentinel_admissions_deferred_video  # noqa: PLW0603
-    if not _gated(deployment):
+    if not sentinel_calls_gated(deployment):
         _record_admission(health_stats)
         return True
 
@@ -662,11 +746,13 @@ async def run_sentinel_llm_call(  # noqa: PLR0913
         task = asyncio.create_task(call_factory())
     # Only a call on the shared local GPU yields to chat: a cloud Sentinel
     # model beside a local chat model is not in its way (#866).
-    if _gated(deployment):
+    if sentinel_calls_gated(deployment):
         _sentinel_llm_tasks.add(task)
     try:
         return await asyncio.wait_for(task, timeout=call_timeout_s)
     except asyncio.CancelledError as err:
+        if _own_cancellation():
+            raise
         raise SentinelLLMDeferredError(
             category, "interrupted by foreground chat", started=True
         ) from err
@@ -696,11 +782,13 @@ async def run_sentinel_llm_call_in_executor(  # noqa: PLR0913
         )
 
     task = asyncio.create_task(asyncio.to_thread(call_factory))
-    if _gated(deployment):
+    if sentinel_calls_gated(deployment):
         _sentinel_llm_tasks.add(task)
     try:
         return await asyncio.wait_for(task, timeout=call_timeout_s)
     except asyncio.CancelledError as err:
+        if _own_cancellation():
+            raise
         raise SentinelLLMDeferredError(
             category, "interrupted by foreground chat", started=True
         ) from err
@@ -1690,8 +1778,23 @@ def _thinking_gemini(
     return {"thinking_budget": budget or -1}
 
 
+# The thinking budget a user set, read as an effort level for a model that
+# only takes adaptive thinking (#932): there is no exact mapping, so the
+# budget's three ranges pick the nearest level.
+_ANTHROPIC_EFFORT_BY_BUDGET = ((2048, "low"), (8192, "medium"))
+_ANTHROPIC_DEFAULT_EFFORT = "high"
+
+
+def _anthropic_effort(budget: int | None) -> str:
+    if budget:
+        for ceiling, level in _ANTHROPIC_EFFORT_BY_BUDGET:
+            if budget <= ceiling:
+                return level
+    return _ANTHROPIC_DEFAULT_EFFORT
+
+
 def _thinking_anthropic(
-    reasoning: Any, _effort: str | None, budget: int | None, _model: str
+    reasoning: Any, _effort: str | None, budget: int | None, model: str
 ) -> dict[str, Any]:
     # Only an explicit On enables extended thinking; effort strings can only
     # arrive as stale data from another provider type and must not enable it.
@@ -1701,8 +1804,23 @@ def _thinking_anthropic(
         max(budget or 0, ANTHROPIC_THINKING_MIN_BUDGET),
         ANTHROPIC_THINKING_MAX_BUDGET,
     )
+    if model_is_adaptive_only(model):
+        # Opus 4.7 and later reject budget_tokens and temperature: adaptive
+        # thinking, its depth set by an effort level (#932). Thinking counts
+        # against max_tokens, so it keeps the room the budget gave, and at
+        # least the default.
+        return {
+            "thinking": {"type": "adaptive"},
+            "reasoning_effort": _anthropic_effort(budget),
+            "max_tokens": max(
+                budget_tokens + ANTHROPIC_THINKING_RESPONSE_TOKENS,
+                ANTHROPIC_DEFAULT_MAX_TOKENS,
+            ),
+        }
     # Extended thinking requires max_tokens > budget_tokens and
     # temperature=1; these override the feature-level temperature.
+    # core/anthropic_client.py drops temperature again under anthropic>=2,
+    # whose API version rejects it (#929).
     return {
         "thinking": {"type": "enabled", "budget_tokens": budget_tokens},
         "max_tokens": budget_tokens + ANTHROPIC_THINKING_RESPONSE_TOKENS,
