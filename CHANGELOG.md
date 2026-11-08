@@ -7,6 +7,10 @@ their own. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+## [3.45.0-alab.6] - 2026-11-08
+
+Fork release: 3.45.0-alab.5 plus automatic loading of the dashboard cards.
+
 ### Changed
 
 - **Dashboard cards load automatically.** The enroll, memory and proposals cards no longer need a manual entry under **Settings → Dashboards → Resources**. Add the card to a dashboard directly. An existing entry still works and can be removed.
