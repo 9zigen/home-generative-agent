@@ -1544,6 +1544,9 @@ async def _append_security_audit_tool(  # noqa: PLR0913
 
 
 _HISTORY_TOOL = "get_entity_history"
+# Tool search misses "remember this" requests, above all in languages other than
+# English, and a memory the model cannot save is simply lost.
+_ALWAYS_OFFERED_LOCAL_TOOLS = (("hga_local", "upsert_memory"),)
 
 
 def _is_local_history_tool(tool: RawTool) -> bool:
@@ -3080,7 +3083,7 @@ async def _append_included_tools(
             len(inclusions),
         )
         inclusions = inclusions[:TOOL_INCLUSIONS_MAX_PER_TURN]
-    for api_id, name in inclusions:
+    for api_id, name in [*_ALWAYS_OFFERED_LOCAL_TOOLS, *inclusions]:
         if api_id not in allowed_api_ids or is_tool_excluded(
             name, excluded_names.get(api_id, ())
         ):
