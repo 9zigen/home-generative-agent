@@ -7,6 +7,15 @@ their own. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+## [3.45.0-alab.5] - 2026-11-08
+
+Fork release: 3.45.0-alab.4 plus memory management.
+
+### Added
+
+- **Manage long-term memories.** A new dashboard card (`custom:hga-memory-card`) lists each person's memories and lets an administrator search, edit, move and delete them. By voice, a person can ask what the assistant remembers and tell it to forget something.
+- **Max memories per person** in **Configure**. `0`, the default, means unlimited. At the limit the assistant says memory is full and saves nothing new; updating an existing memory still works.
+
 ## [3.45.0-alab.4] - 2026-11-08
 
 Fork release: 3.45.0-alab.3 plus the memory tool on every turn.
