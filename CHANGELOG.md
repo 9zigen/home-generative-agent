@@ -7,6 +7,14 @@ their own. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+## [3.45.0-alab.3] - 2026-11-08
+
+Fork release: 3.45.0-alab.2 plus the speaker sensor option from the upstream pull request.
+
+### Changed
+
+- **Speaker recognition is set up in the options.** It no longer looks for a sensor named "Speaker": pick the sensors under **Speaker recognition sensors** in **Configure**, from any integration. Each applies to requests from the device it belongs to. Nothing picked means the feature is off, so after upgrading pick the Midi's Speaker sensor to keep it working.
+
 ## [3.45.0-alab.2] - 2026-11-08
 
 Fork release: 3.45.0-alab.1 plus the person link from the upstream pull request.
