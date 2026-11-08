@@ -11,6 +11,7 @@ The configuration UI is available in English, Czech, Simplified Chinese, and Tur
 - [Control Home Assistant (LLM API)](#control-home-assistant-llm-api)
 - [Speech-to-Text (STT)](#speech-to-text-stt)
 - [Text-to-Speech (TTS)](#text-to-speech-tts)
+- [Managing Long-term Memories](#managing-long-term-memories)
 - [Schema-first YAML Mode](#schema-first-yaml-mode)
 - [Critical Action PIN](#critical-action-pin)
 - [Global Options](#global-options)
@@ -412,6 +413,24 @@ Two things to know about the local backend:
 
 - **Kokoro needs a reasonably modern machine.** On a modern CPU (AVX2) or a recent GPU it is fast and sounds good. On an old CPU without AVX2 it can take several times the audio duration to synthesize a sentence, and ONNX Runtime's CUDA path does not help it on Pascal-class GPUs. In that case use a piper voice instead — `speaches-ai/piper-en_US-hfc_female-medium` (voice `hfc_female`) or a `-low` variant — which synthesizes a sentence in about a second on CPU and needs no GPU. Browse the available models with `GET /v1/registry?task=text-to-speech`.
 - **Speaches does not produce opus or aac.** HGA never asks it to; a pipeline that wants those gets mp3 converted by Home Assistant.
+
+---
+
+## Managing Long-term Memories
+
+The agent saves a fact when you ask it to ("remember that I drink tea without sugar"). Each person with a Home Assistant login has their own memories. Requests without a known user, such as an unrecognized voice on a satellite, share one store.
+
+**By voice:** ask what it remembers about you, or tell it to forget something. A voice only reaches its own memories.
+
+**On a dashboard:** add the resource `/hga-card/hga-memory-card.js` (JavaScript Module), then the card:
+
+```yaml
+type: custom:hga-memory-card
+```
+
+The card lists each person with their count, and lets an administrator search, edit, move and delete memories. The services behind it (`get_memories`, `update_memory`, `delete_memory`, `move_memory`) refuse non-administrators.
+
+**Limit:** set **Max memories per person** under **Configure**. `0`, the default, means unlimited. At the limit the agent says memory is full and saves nothing new, and nothing is deleted for you. Updating an existing memory still works. A move from the card is not limited.
 
 ---
 
