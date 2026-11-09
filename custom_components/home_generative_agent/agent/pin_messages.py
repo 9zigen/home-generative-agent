@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001
 """
 Localized user-facing strings for the critical-action PIN flow.
 
@@ -456,6 +457,140 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "kind_valve": "所有阀门",
         "kind_domain": "所有 {domain} 设备",
         "kind_device": "所有设备",
+    },
+    "ru": {
+        "automation_pin_unset": (
+            "Эта автоматизация выполняет важное действие, но ПИН-код ещё не задан, "
+            "поэтому подтвердить её нельзя. Задайте ПИН-код в настройках интеграции "
+            "и попробуйте снова."
+        ),
+        "automation_pending_store_unavailable": (
+            "Сейчас не получается подтвердить эту автоматизацию. Попробуйте ещё раз."
+        ),
+        "automation_requires_pin_reason": (
+            "Эту автоматизацию нужно подтвердить ПИН-кодом, потому что {reason}: "
+            "{calls}."
+        ),
+        "direct_requires_pin_reason": "Это действие нужно подтвердить ПИН-кодом.",
+        "pending_action_not_found_or_expired": "Запрос не найден или уже устарел.",
+        "pending_action_not_found": "Запрос не найден.",
+        "pending_action_wrong_user": (
+            "Этот запрос сделал другой пользователь. Повторите свой запрос."
+        ),
+        "pending_action_invalid": "С запросом что-то не так. Попробуйте ещё раз.",
+        "pending_action_expired": "Запрос устарел. Повторите его.",
+        "pin_not_configured": "ПИН-код не задан, поэтому подтвердить действие нельзя.",
+        "pin_invalid_format": (
+            "ПИН-код не подходит: нужно от {min_len} до {max_len} цифр."
+        ),
+        "pin_too_many_attempts": "Слишком много неверных попыток. Повторите запрос.",
+        "pin_incorrect": "ПИН-код неверный. Действие не выполнено.",
+        "confirmation_unable_to_process": "Не получилось обработать подтверждение.",
+        "pending_action_missing_tool_name": (
+            "С запросом что-то не так: не указан инструмент."
+        ),
+        "ha_llm_api_unavailable": "API Home Assistant для модели сейчас недоступен.",
+        "pin_awaiting_user_reply": (
+            "Не подтверждено: ПИН-код должен быть в текущем сообщении пользователя."
+        ),
+        "pin_retry_next_message": (
+            "Пользователь может назвать ПИН-код ещё раз в следующем сообщении."
+        ),
+        "pin_say_digits": (
+            "Попроси пользователя назвать цифры ПИН-кода по одной в следующем "
+            "сообщении."
+        ),
+        "pin_request_again": (
+            "Это был последний ответ на запрос ПИН-кода, пользователю нужно "
+            "повторить просьбу."
+        ),
+        "pin_reply_used": (
+            "Не подтверждено: ПИН-код из текущего сообщения уже использован. "
+            "Скажи пользователю, что произошло, он может попросить ещё раз."
+        ),
+        "action_execute_failed": (
+            "Не удалось выполнить действие: {err}. "
+            "Подтверждение израсходовано. Скажи пользователю, что действие не "
+            "выполнено и он может попросить ещё раз."
+        ),
+        "pending_automation_invalid": (
+            "Ожидающая автоматизация недействительна, повторите запрос."
+        ),
+        "action_outcome_unknown": (
+            "Действие могло выполниться, но завершилось неожиданной ошибкой: "
+            "{err}. Подтверждение израсходовано. Не повторяй действие. Скажи "
+            "пользователю проверить устройство, прежде чем просить снова."
+        ),
+        "automation_outcome_unknown": (
+            "Автоматизация могла установиться, но установка завершилась "
+            "неожиданной ошибкой: {err}. Подтверждение израсходовано. Не повторяй "
+            "её. Скажи пользователю сначала проверить свои автоматизации."
+        ),
+        "pin_reply_next_message": (
+            "Не подтверждено: ПИН-код принимается только в ответе пользователя "
+            "на запрос ПИН-кода для этого действия. Сейчас пользователя просят "
+            "назвать ПИН-код, его следующее сообщение и будет ответом. "
+            "Подтверди действие ПИН-кодом из него."
+        ),
+        "pin_reply_to_prompt_only": (
+            "Не подтверждено: ПИН-код принимается только в ответе пользователя "
+            "на запрос ПИН-кода для этого действия. Попроси пользователя назвать "
+            "ПИН-код сейчас."
+        ),
+        "pin_one_action_at_a_time": (
+            "Не запрошено: другое защищённое действие уже ожидает ПИН-код. "
+            "Сначала попроси этот ПИН-код, затем пользователь сможет запросить "
+            "новое действие."
+        ),
+        "pin_confirm_line": "Нужен ПИН-код, чтобы {action}.",
+        "pin_incorrect_line": "ПИН-код неверный.",
+        "pin_request_again_line": "Попросите ещё раз.",
+        "pin_done_line": "ПИН-код принят. Выполнено: {action}.",
+        "pin_failed_line": "ПИН-код принят, но не получилось {action}.",
+        "pin_unknown_line": (
+            "ПИН-код принят, но неизвестно, получилось ли {action}. Проверьте "
+            "устройство."
+        ),
+        "pin_ask_line": "Назовите ПИН-код.",
+        "action_lock": "закрыть {target}",
+        "action_unlock": "открыть {target}",
+        "action_open": "открыть {target}",
+        "action_relay_controls": "управляет {target}",
+        "action_close": "закрыть {target}",
+        "action_turn_on": "включить {target}",
+        "action_turn_off": "выключить {target}",
+        "action_set_position": "открыть {target} на {position}%",
+        "action_press": "нажать кнопку {target}",
+        "action_intent_script": "запустить голосовую команду {target}",
+        "action_starts_automation": "запускает автоматизацию {automations}",
+        "action_stop": "остановить {target}",
+        "action_service": "{service} {target}",
+        "action_automation": "добавить автоматизацию {target}",
+        "action_unnamed_automation": "добавить автоматизацию без названия",
+        "action_automation_runs": "{action}, а она выполнит {calls}",
+        "action_calls_more": "{calls} и ещё {count}",
+        "action_set_state": "перевести {target} в состояние {state}",
+        "action_change": "изменить {target}",
+        "action_create_scene": "создать сцену {scene}, которая переведёт {states}",
+        "target_to_state": "{target} в состояние {state}",
+        "target_and_others": "{targets} и другие устройства",
+        "target_unnamed_devices": "другие устройства",
+        "action_remote": "запустить {tool} на «{api}»",
+        "action_remote_args": "запустить {tool} ({args}) на «{api}»",
+        "action_script_targets": "{action} ({targets})",
+        "action_unnamed_target": "устройство без названия",
+        "target_named": "«{name}»",
+        "target_entity": "«{name}» ({entity_id})",
+        "target_every": "{kind}",
+        "target_every_in_area": "{kind} ({area})",
+        "target_every_on_floor": "{kind} (этаж {floor})",
+        "target_in_area": "{target} ({area})",
+        "target_on_floor": "{target} (этаж {floor})",
+        "kind_lock": "все замки",
+        "kind_cover": "все шторы, ворота и двери",
+        "kind_valve": "все клапаны",
+        "kind_domain": "все устройства {domain}",
+        "kind_device": "все устройства",
     },
 }
 

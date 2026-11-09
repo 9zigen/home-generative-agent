@@ -504,7 +504,7 @@ Protects sensitive actions (unlocking doors, opening covers) behind a second ver
 
 Alarm control panels use their own alarm code, which is separate from the critical-action PIN. A script or scene that disarms a panel without asking for that code (a script with the code written into it, or a panel that needs no code) is not held for the PIN unless you add a rule for it, such as domain `alarm_control_panel`, service `alarm_disarm`.
 
-**Language.** The PIN prompts and confirmation messages the agent returns in chat are fixed strings, not model output. They follow the Home Assistant server language (**Settings → System → General**) and are currently available in English and Czech; any other language falls back to English. Diagnostic log lines stay in English.
+**Language.** The PIN prompts and confirmation messages the agent returns in chat are fixed strings, not model output. They follow the Home Assistant server language (**Settings → System → General**) and are currently available in English, Czech, Simplified Chinese and Russian; any other language falls back to English. Diagnostic log lines stay in English.
 
 **Automation screening.** Automations are screened after Home Assistant validates them, so blueprint inputs are resolved and every nested branch (`choose`, `if`/`then`/`else`, `repeat`, `parallel`, `sequence`) is inspected. Nothing is written to `automations.yaml` and no reload happens until the PIN is confirmed.
 

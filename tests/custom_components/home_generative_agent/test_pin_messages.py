@@ -100,6 +100,15 @@ def test_czech_language_resolves_czech_string():
     assert pin_msg(hass, "pin_incorrect").startswith("Nesprávný PIN.")
 
 
+def test_russian_language_resolves_russian_string():
+    hass = _fake_hass("ru")
+    assert pin_msg(hass, "pin_ask_line") == "Назовите ПИН-код."
+    action = pin_msg(hass, "action_unlock", target="«Замок»")
+    assert pin_msg(hass, "pin_confirm_line", action=action) == (
+        "Нужен ПИН-код, чтобы открыть «Замок»."
+    )
+
+
 def test_region_suffix_resolves_base_language():
     hass = _fake_hass("cs-CZ")
     assert pin_msg(hass, "pin_incorrect").startswith("Nesprávný PIN.")
