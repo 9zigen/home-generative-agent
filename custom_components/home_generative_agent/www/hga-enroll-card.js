@@ -3,6 +3,14 @@ const DEFAULT_TITLE = "Enroll Person";
 const DEFAULT_ENDPOINT = "/api/home_generative_agent/enroll";
 
 class HgaEnrollCard extends HTMLElement {
+  static getConfigElement() {
+    return document.createElement("hga-enroll-card-editor");
+  }
+
+  static getStubConfig() {
+    return {};
+  }
+
   setConfig(config) {
     if (!config) {
       throw new Error("Invalid configuration");
@@ -181,9 +189,56 @@ class HgaEnrollCard extends HTMLElement {
   }
 }
 
+class HgaEnrollCardEditor extends HTMLElement {
+  setConfig(config) {
+    this._config = config || {};
+    this._render();
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    this._render();
+  }
+
+  _render() {
+    if (!this._hass || !this._config) {
+      return;
+    }
+    if (!this._form) {
+      this._form = document.createElement("ha-form");
+      this._form.schema = [{ name: "title", selector: { text: {} } }];
+      this._form.computeLabel = () =>
+        this._hass.localize("ui.panel.lovelace.editor.card.generic.title") || "Title";
+      this._form.addEventListener("value-changed", (event) =>
+        this._changed(event.detail.value.title),
+      );
+      this.append(this._form);
+    }
+    this._form.hass = this._hass;
+    this._form.data = { title: this._config.title ?? DEFAULT_TITLE };
+  }
+
+  _changed(title) {
+    // Only a title of the user's own is kept, so the YAML stays short.
+    const { title: _unused, ...config } = this._config;
+    if (title && title !== DEFAULT_TITLE) {
+      config.title = title;
+    }
+    this._config = config;
+    this.dispatchEvent(
+      new CustomEvent("config-changed", {
+        detail: { config },
+        bubbles: true,
+        composed: true,
+      }),
+    );
+  }
+}
+
 // HGA loads this file itself; a hand-added Resources entry would load it again.
 if (!customElements.get("hga-enroll-card")) {
   customElements.define("hga-enroll-card", HgaEnrollCard);
+  customElements.define("hga-enroll-card-editor", HgaEnrollCardEditor);
   window.customCards = window.customCards || [];
   window.customCards.push({
     type: "hga-enroll-card",

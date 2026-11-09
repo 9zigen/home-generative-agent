@@ -770,7 +770,6 @@ HGA loads the card itself. Add it to a dashboard:
 
 ```yaml
 type: custom:hga-proposals-card
-title: Sentinel Proposals
 ```
 
 > If the card shows as unknown, hard-refresh the browser. A Resources entry added by hand for an HGA card, including a legacy `/hga-enroll-card/...` URL, still works and can be removed.

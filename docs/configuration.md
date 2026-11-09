@@ -447,6 +447,8 @@ The agent saves a fact when you ask it to ("remember that I drink tea without su
 type: custom:hga-memory-card
 ```
 
+Its visual editor sets a `title` (none by default), the `person` to start with, `show_empty` to also list people with no memories, and `show_search` (`false` hides the search box). People with no memories are hidden by default but stay available as targets when moving a memory.
+
 The card lists each person with their count, and lets an administrator search, edit, move and delete memories. The services behind it (`get_memories`, `update_memory`, `delete_memory`, `move_memory`) refuse non-administrators.
 
 **Limit:** set **Max memories per person** under **Configure**. `0`, the default, means unlimited. At the limit the agent says memory is full and saves nothing new, and nothing is deleted for you. Updating an existing memory still works. A move from the card is not limited.

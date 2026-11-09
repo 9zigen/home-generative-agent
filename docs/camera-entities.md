@@ -533,6 +533,8 @@ title: Enroll Person
 endpoint: /api/home_generative_agent/enroll
 ```
 
+The card's visual editor sets the title. `endpoint` is available in YAML only and rarely needs changing.
+
 Use the file picker or drag-and-drop to upload one or more images. The card enrolls images that contain a detectable face and skips those that do not. Each image may be at most 10 MiB and a single request may carry at most 25 images; either limit is answered with HTTP 413.
 
 Both enrollment paths refuse reserved identity labels — "Unknown Person", "Indeterminate", "None", or an empty name, in any casing — because the recognition pipeline uses those labels for non-matches (see Batch Identity Consolidation below).
