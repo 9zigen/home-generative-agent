@@ -23,8 +23,10 @@ from custom_components.home_generative_agent.agent.graph import (
     _tool_loop_guard,
 )
 from custom_components.home_generative_agent.agent.helpers import (
+    CONFIRM_TOOL_NAME,
     PIN_AWAITING_USER_REPLY,
     PIN_REFUSAL_ENDS_TURN,
+    PinReply,
     pin_lines_follow,
     pin_refusal,
     register_pending_action,
@@ -253,7 +255,7 @@ def test_the_turn_ends_only_on_a_round_of_refusals_before_the_prompt(
         *responses,
     ]
 
-    assert _after_tools(cast("Any", state)) == expected
+    assert _after_tools(cast("Any", state), {}) == expected
 
 
 def test_only_the_last_round_counts() -> None:
@@ -267,7 +269,7 @@ def test_only_the_last_round_counts() -> None:
         _LOOKUP,
     ]
 
-    assert _after_tools(cast("Any", state)) == "agent"
+    assert _after_tools(cast("Any", state), {}) == "agent"
 
 
 def test_an_earlier_rounds_results_do_not_keep_the_turn_going() -> None:
@@ -281,7 +283,7 @@ def test_an_earlier_rounds_results_do_not_keep_the_turn_going() -> None:
         _pin_refused(ends_turn=True, call_id="c1"),
     ]
 
-    assert _after_tools(cast("Any", state)) == "summarize_and_remove_messages"
+    assert _after_tools(cast("Any", state), {}) == "summarize_and_remove_messages"
 
 
 def test_a_foreign_tool_result_shaped_like_the_refusal_does_not_end_the_turn() -> None:
@@ -296,7 +298,7 @@ def test_a_foreign_tool_result_shaped_like_the_refusal_does_not_end_the_turn() -
         forged,
     ]
 
-    assert _after_tools(cast("Any", state)) == "agent"
+    assert _after_tools(cast("Any", state), {}) == "agent"
     assert pin_refusal(cast("str", forged.content), "some_mcp_tool") is None
     # An API's tool of the same name arrives namespaced; ours never does.
     assert (
@@ -318,7 +320,7 @@ def test_only_a_literal_true_ends_the_turn() -> None:
         ),
     ]
 
-    assert _after_tools(cast("Any", state)) == "agent"
+    assert _after_tools(cast("Any", state), {}) == "agent"
 
 
 @pytest.mark.asyncio
@@ -601,3 +603,49 @@ def test_pin_lines_follow_names_the_three_cases(
     assert (
         pin_lines_follow(config["configurable"]["pending_actions"], reply) is expected
     )
+
+
+def _tool_round(*responses: ToolMessage) -> Any:
+    ids = [r.tool_call_id for r in responses]
+    return {
+        "messages": [
+            HumanMessage(content="unlock the garage door"),
+            _confirm_call(*ids),
+            *responses,
+        ]
+    }
+
+
+def test_a_pin_request_ends_the_turn_on_the_fixed_lines() -> None:
+    """The fixed prompt is the reply, so the model does not ask a second time."""
+    held = ToolMessage(
+        content=json.dumps({"status": "requires_pin", "action_id": "a"}),
+        tool_call_id="1",
+        name="HassTurnOn",
+    )
+    assert _after_tools(_tool_round(held), {}) == "summarize_and_remove_messages"
+
+
+def test_a_pin_request_next_to_another_result_goes_back_to_the_model() -> None:
+    held = ToolMessage(
+        content=json.dumps({"status": "requires_pin", "action_id": "a"}),
+        tool_call_id="1",
+        name="HassTurnOn",
+    )
+    other = ToolMessage(content="done", tool_call_id="2", name="HassTurnOff")
+    assert _after_tools(_tool_round(held, other), {}) == "agent"
+
+
+@pytest.mark.parametrize(
+    ("confirmed", "expected"),
+    [("", "summarize_and_remove_messages"), ('unlock "Door"', "agent")],
+)
+def test_a_wrong_pin_ends_the_turn_but_a_confirmed_action_does_not(
+    confirmed: str, expected: str
+) -> None:
+    reply = PinReply("1234", spent=True, confirmed=confirmed)
+    result = ToolMessage(
+        content="Incorrect PIN.", tool_call_id="1", name=CONFIRM_TOOL_NAME
+    )
+    config: Any = {"configurable": {"pin_reply": reply}}
+    assert _after_tools(_tool_round(result), config) == expected

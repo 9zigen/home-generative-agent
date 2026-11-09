@@ -36,6 +36,9 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.messages.utils import trim_messages
+
+# Imported at runtime: LangGraph reads the conditional edge's annotations.
+from langchain_core.runnables import RunnableConfig  # noqa: TC002
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.store.base import InvalidNamespaceError
 from pydantic import ValidationError
@@ -98,6 +101,7 @@ from .helpers import (
     INTENT_NAME_ALL,
     PIN_REFUSAL_ENDS_TURN,
     REMOTE_TOOL,
+    PinReply,
     active_llm_api_ids,
     base_tool_name,
     declared_domains,
@@ -180,7 +184,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     from homeassistant.core import HomeAssistant
-    from langchain_core.runnables import RunnableConfig
     from langgraph.store.base import BaseStore
 
 LOGGER = logging.getLogger(__name__)
@@ -4559,21 +4562,45 @@ def _refusal_ends_turn(msg: BaseMessage) -> bool:
     return refusal is not None and refusal.get(PIN_REFUSAL_ENDS_TURN) is True
 
 
-def _after_tools(state: State) -> Literal["agent", "summarize_and_remove_messages"]:
+def _requests_pin(msg: BaseMessage) -> bool:
+    """Return True for a held action's result, which asks the user for the PIN."""
+    try:
+        data = json.loads(str(msg.content))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get("status") == "requires_pin"
+
+
+def _pin_line_ends_turn(msg: BaseMessage, pin_reply: PinReply | None) -> bool:
+    """Return True for a result the fixed PIN lines answer without the model."""
+    failed_check = (
+        pin_reply is not None
+        and pin_reply.spent
+        and not pin_reply.confirmed
+        and getattr(msg, "name", None) == CONFIRM_TOOL_NAME
+    )
+    return failed_check or _refusal_ends_turn(msg) or _requests_pin(msg)
+
+
+def _after_tools(
+    state: State, config: RunnableConfig
+) -> Literal["agent", "summarize_and_remove_messages"]:
     """
     Return the next node after a tool round.
 
     The model gets the results back, except when every call in the round was
     a confirmation refused because the user has not been asked for the PIN
-    yet (the message is not the prompt's reply). The reply asks for the PIN in
-    fixed words (conversation.py), and the model's next move would be to ask
-    again, or to try another PIN of its own: in a field test (2026-10-16) a
-    local model guessed a PIN three times, spoke its prompt three times, and
-    the turn ended in the round-limit apology. The turn ends here instead, and
-    the user's next message is the prompt's reply.
+    yet (the message is not the prompt's reply), a held action asking for the
+    PIN, or a wrong PIN. The reply asks for the PIN in fixed words
+    (conversation.py), and the model's next move would be to ask again, or to
+    try another PIN of its own: in a field test (2026-10-16) a local model
+    guessed a PIN three times, spoke its prompt three times, and the turn ended
+    in the round-limit apology. The turn ends here instead, and the user's next
+    message is the prompt's reply.
     """
     responses = _last_round_responses(state["messages"])
-    if responses and all(_refusal_ends_turn(msg) for msg in responses):
+    pin_reply = config.get("configurable", {}).get("pin_reply")
+    if responses and all(_pin_line_ends_turn(msg, pin_reply) for msg in responses):
         return "summarize_and_remove_messages"
     return "agent"
 

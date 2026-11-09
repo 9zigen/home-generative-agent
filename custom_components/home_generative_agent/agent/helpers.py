@@ -32,6 +32,8 @@ from custom_components.home_generative_agent.const import (
     CONF_CRITICAL_ACTIONS,
     CONF_TOOL_EXCLUSIONS,
     CONF_TOOL_INCLUSIONS,
+    CRITICAL_PIN_MAX_LEN,
+    CRITICAL_PIN_MIN_LEN,
     RECOMMENDED_CRITICAL_ACTIONS,
 )
 
@@ -495,6 +497,9 @@ class PinReply:
     # in words the model did not choose, and how it ended (`outcome`).
     confirmed: str = ""
     outcome: str = ""
+    # The message was only a number too short or too long to be a PIN, which
+    # is how speech-to-text losing a digit looks. It is not an attempt.
+    unreadable: bool = False
 
 
 # How a PIN-confirmed action ended, for `PinReply.outcome`.
@@ -1134,6 +1139,25 @@ def waiting_pin_prompt(
     return None
 
 
+def unreadable_pin_reply(
+    pending_actions: Mapping[str, dict[str, Any]], reply: PinReply
+) -> bool:
+    """
+    Return True when this message answers a prompt with a number no PIN can be.
+
+    Only a message that is nothing but the number counts, so a request with a
+    number in it ("turn it on for 5 minutes") is not taken for a misheard PIN.
+    """
+    if not any(a.get("reply_turn") == reply.turn_id for a in pending_actions.values()):
+        return False
+    if any(kind not in {"digits", "sep"} for kind, _, _ in _number_items(reply.text)):
+        return False
+    digits = pin_digits(reply.text)
+    return digits is not None and not (
+        CRITICAL_PIN_MIN_LEN <= len(digits) <= CRITICAL_PIN_MAX_LEN
+    )
+
+
 def keep_pin_prompt(action: dict[str, Any], reply: PinReply | None) -> bool:
     """
     Keep the action's prompt for the user's next message, if this turn answers it.
@@ -1201,7 +1225,10 @@ def pin_lines_follow(
     be the reply.
     """
     return bool(
-        reply.confirmed or reply.spent or prompts_awaiting_reply(pending_actions, reply)
+        reply.confirmed
+        or reply.spent
+        or reply.unreadable
+        or prompts_awaiting_reply(pending_actions, reply)
     )
 
 

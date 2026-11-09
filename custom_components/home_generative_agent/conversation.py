@@ -67,6 +67,7 @@ from .agent.helpers import (
     start_pin_turn,
     tool_exclusions,
     tool_index_key,
+    unreadable_pin_reply,
     waiting_pin_prompt,
 )
 from .agent.indirect_pin import (
@@ -2027,14 +2028,15 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
                 PIN_OUTCOME_UNKNOWN: "pin_unknown_line",
             }.get(pin_reply.outcome, "pin_done_line")
             lines.append(pin_msg(self.hass, key, action=pin_reply.confirmed))
-        elif pin_reply.spent:
+        elif pin_reply.spent or pin_reply.unreadable:
             # A PIN from this message failed the check. Said in fixed words,
             # because a model that then loops on the refusals leaves no reply
             # of its own (the round-limit guard adds none when a PIN line
             # follows), and "What is your PIN?" alone would have the user
             # repeat the wrong one (red team, 2026-10-16). `pin_lines_follow`
             # (helpers.py) mirrors these three cases.
-            lines.append(pin_msg(self.hass, "pin_incorrect_line"))
+            key = "pin_incorrect_line" if pin_reply.spent else "pin_unreadable_line"
+            lines.append(pin_msg(self.hass, key))
             if not prompts_awaiting_reply(pending_actions, pin_reply):
                 # The prompt took its last reply, or the request its last
                 # attempt: no question follows, so say what comes next.
@@ -2046,8 +2048,31 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
                 action=describe_pending_action(self.hass, action),
             )
             for action in prompts_awaiting_reply(pending_actions, pin_reply)
+            # A retry needs no second telling: the user just heard what it is for.
+            if action.get("turn_id") == pin_reply.turn_id
+            or not (pin_reply.spent or pin_reply.unreadable)
         )
         return lines
+
+    async def _async_ask_for_unread_pin(
+        self,
+        user_input: conversation.ConversationInput,
+        chat_log: conversation.ChatLog,
+        pending_actions: dict[str, dict[str, Any]],
+        pin_reply: PinReply,
+    ) -> conversation.ConversationResult:
+        """
+        Ask again in fixed words when a reply cannot be a PIN.
+
+        The model would only argue with the number, and leaving it out of the
+        turn keeps the misheard digits out of the thread.
+        """
+        pin_reply.unreadable = True
+        keep_pin_prompts(pending_actions, pin_reply)
+        await self._async_add_pin_lines(
+            chat_log, pending_actions, pin_reply, streamed=False
+        )
+        return conversation.async_get_result_from_chat_log(user_input, chat_log)
 
     async def _async_add_pin_lines(
         self,
@@ -2190,7 +2215,7 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
                 conversation_id,
             )
 
-    async def _async_handle_message_active(  # noqa: PLR0913, PLR0915
+    async def _async_handle_message_active(  # noqa: PLR0911, PLR0913, PLR0915
         self,
         user_input: conversation.ConversationInput,
         chat_log: conversation.ChatLog,
@@ -2230,6 +2255,10 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
         pin_reply = start_pin_turn(
             runtime_data.pending_actions, thread_id, user_input.text
         )
+        if unreadable_pin_reply(runtime_data.pending_actions, pin_reply):
+            return await self._async_ask_for_unread_pin(
+                user_input, chat_log, runtime_data.pending_actions, pin_reply
+            )
 
         # Multi-API initialization
         try:

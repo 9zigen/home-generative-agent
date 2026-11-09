@@ -170,6 +170,10 @@ from homeassistant.components import conversation as ha_conversation  # noqa: E4
 from homeassistant.util import dt as dt_util  # noqa: E402
 
 from custom_components.home_generative_agent.agent.helpers import (  # noqa: E402
+    PinReply,
+    keep_pin_prompts,
+    start_pin_turn,
+    unreadable_pin_reply,
     waiting_pin_prompt,
 )
 from custom_components.home_generative_agent.conversation import (  # noqa: E402
@@ -3873,3 +3877,73 @@ async def test_sensor_on_another_device_is_not_logged(
     entity = _speaker_entity(monkeypatch, "Пётр")
     assert await entity._async_speaker("other") is None
     assert "sensor.voice" not in caplog.text
+
+
+def _answer_prompt(pending: dict[str, Any], text: str) -> PinReply:
+    """Open the turn that answers a delivered prompt."""
+    action = next(iter(pending.values()))
+    action["disclosed"] = True
+    return start_pin_turn(pending, action["thread_id"], text)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("1 2 3", True),
+        ("123.", True),
+        ("один, два, три", True),
+        ("12345678901", True),
+        ("1234", False),
+        ("turn it on for 5 minutes", False),
+        ("never mind", False),
+    ],
+)
+def test_unreadable_pin_reply(text: str, expected: bool) -> None:  # noqa: FBT001
+    pending: dict[str, Any] = {}
+    _pin_prompt(pending, "Block the playroom, block.")
+    assert unreadable_pin_reply(pending, _answer_prompt(pending, text)) is expected
+
+
+def test_a_number_with_no_prompt_is_not_an_unreadable_pin() -> None:
+    assert unreadable_pin_reply({}, PinReply("123")) is False
+
+
+async def test_an_unread_pin_is_asked_again_in_one_short_line(
+    frozen_assistant_content: None,  # noqa: ARG001
+) -> None:
+    """The first prompt already named the action, so a retry does not repeat it."""
+    pending: dict[str, Any] = {}
+    _pin_prompt(pending, "Block the playroom, block.")
+    reply = _answer_prompt(pending, "1 2 3")
+    reply.unreadable = True
+    keep_pin_prompts(pending, reply)
+    chat_log = _DeltaChatLog([])
+
+    await HGAConversationEntity._async_add_pin_lines(
+        _pin_entity(), cast("Any", chat_log), pending, reply, streamed=False
+    )
+
+    assert chat_log.content[-1].content == (
+        "I couldn't make out that PIN. What is your PIN?"
+    )
+
+
+async def test_a_last_unread_pin_says_to_ask_again(
+    frozen_assistant_content: None,  # noqa: ARG001
+) -> None:
+    """With no replies left there is no question, so the microphone closes."""
+    pending: dict[str, Any] = {}
+    _pin_prompt(pending, "Block the playroom, block.")
+    reply = _answer_prompt(pending, "1 2 3")
+    next(iter(pending.values()))["replies"] = 3
+    reply.unreadable = True
+    keep_pin_prompts(pending, reply)
+    chat_log = _DeltaChatLog([])
+
+    await HGAConversationEntity._async_add_pin_lines(
+        _pin_entity(), cast("Any", chat_log), pending, reply, streamed=False
+    )
+
+    assert chat_log.content[-1].content == (
+        "I couldn't make out that PIN. Make the request again."
+    )
