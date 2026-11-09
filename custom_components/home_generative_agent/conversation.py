@@ -61,6 +61,7 @@ from .agent.helpers import (
     llm_api_is_supported,
     prompts_awaiting_reply,
     remote_house_words,
+    repeated_pin_request,
     resolve_critical_action_policy,
     safe_convert,
     sanitize_tool_text,
@@ -2066,20 +2067,23 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
         )
         return lines
 
-    async def _async_ask_for_unread_pin(
+    async def _async_ask_for_pin_again(
         self,
         user_input: conversation.ConversationInput,
         chat_log: conversation.ChatLog,
         pending_actions: dict[str, dict[str, Any]],
         pin_reply: PinReply,
+        *,
+        unreadable: bool,
     ) -> conversation.ConversationResult:
         """
-        Ask again in fixed words when a reply cannot be a PIN.
+        Ask again in fixed words when a reply cannot answer the prompt.
 
-        The model would only argue with the number, and leaving it out of the
-        turn keeps the misheard digits out of the thread.
+        The reply is a number no PIN can be, or the held request said again. The
+        model would only argue with the number, and leaving it out of the turn
+        keeps the misheard digits out of the thread.
         """
-        pin_reply.unreadable = True
+        pin_reply.unreadable = unreadable
         keep_pin_prompts(pending_actions, pin_reply)
         await self._async_add_pin_lines(
             chat_log, pending_actions, pin_reply, streamed=False
@@ -2267,9 +2271,14 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
         pin_reply = start_pin_turn(
             runtime_data.pending_actions, thread_id, user_input.text
         )
-        if unreadable_pin_reply(runtime_data.pending_actions, pin_reply):
-            return await self._async_ask_for_unread_pin(
-                user_input, chat_log, runtime_data.pending_actions, pin_reply
+        unreadable = unreadable_pin_reply(runtime_data.pending_actions, pin_reply)
+        if unreadable or repeated_pin_request(runtime_data.pending_actions, pin_reply):
+            return await self._async_ask_for_pin_again(
+                user_input,
+                chat_log,
+                runtime_data.pending_actions,
+                pin_reply,
+                unreadable=unreadable,
             )
 
         # Multi-API initialization

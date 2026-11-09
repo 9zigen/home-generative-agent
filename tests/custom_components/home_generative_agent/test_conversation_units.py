@@ -171,8 +171,10 @@ from homeassistant.util import dt as dt_util  # noqa: E402
 
 from custom_components.home_generative_agent.agent.helpers import (  # noqa: E402
     PinReply,
+    disclose_pin_prompts,
     keep_pin_prompts,
     register_pending_action,
+    repeated_pin_request,
     start_pin_turn,
     unreadable_pin_reply,
     waiting_pin_prompt,
@@ -4069,6 +4071,65 @@ def test_unreadable_pin_reply(text: str, expected: bool) -> None:  # noqa: FBT00
     pending: dict[str, Any] = {}
     _pin_prompt(pending, "Block the playroom, block.")
     assert unreadable_pin_reply(pending, _answer_prompt(pending, text)) is expected
+
+
+def _repeat_prompt(pending: dict[str, Any], request: str, text: str) -> PinReply:
+    """Deliver a prompt for the request, then open the turn that answers it."""
+    disclose_pin_prompts(pending, _pin_prompt(pending, request))
+    return start_pin_turn(pending, "conv1", text)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Открой замок", True),
+        ("открой, замок!", True),
+        ("Закрой замок", False),
+        ("Спасибо", False),
+        ("1234", False),
+    ],
+)
+def test_repeated_pin_request(text: str, expected: bool) -> None:  # noqa: FBT001
+    pending: dict[str, Any] = {}
+    reply = _repeat_prompt(pending, "Открой замок.", text)
+    assert repeated_pin_request(pending, reply) is expected
+
+
+def test_request_with_a_number_is_never_taken_for_a_repeat() -> None:
+    """A number may be a PIN, so it has to reach the normal PIN path."""
+    pending: dict[str, Any] = {}
+    reply = _repeat_prompt(pending, "open lock 1234", "open lock 1234")
+    assert repeated_pin_request(pending, reply) is False
+
+
+def test_repeat_past_the_reply_limit_is_not_asked_again() -> None:
+    pending: dict[str, Any] = {}
+    reply = _repeat_prompt(pending, "Открой замок", "Открой замок")
+    next(iter(pending.values()))["replies"] = 3
+    assert repeated_pin_request(pending, reply) is False
+
+
+async def test_a_repeated_request_is_asked_again_in_fixed_words(
+    frozen_assistant_content: None,  # noqa: ARG001
+) -> None:
+    """The prompt stays open and the reply ends with the question."""
+    pending: dict[str, Any] = {}
+    reply = _repeat_prompt(pending, "Открой замок", "Открой замок")
+    keep_pin_prompts(pending, reply)
+    chat_log = _DeltaChatLog([])
+
+    await HGAConversationEntity._async_add_pin_lines(
+        _pin_entity(), cast("Any", chat_log), pending, reply, streamed=False
+    )
+
+    assert chat_log.content[-1].content.endswith("What is your PIN?")
+    assert "couldn't make out" not in chat_log.content[-1].content
+    assert next(iter(pending.values()))["renew"] is True
+
+
+def test_handler_asks_again_for_a_repeated_request() -> None:
+    src = inspect.getsource(HGAConversationEntity._async_handle_message_active)
+    assert "repeated_pin_request(runtime_data.pending_actions, pin_reply)" in src
 
 
 def test_a_number_with_no_prompt_is_not_an_unreadable_pin() -> None:

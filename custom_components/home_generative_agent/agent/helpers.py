@@ -861,6 +861,13 @@ def pin_digits(text: str) -> str | None:
     return runs[0] if len(runs) == 1 else None
 
 
+def _spoken_request_key(text: str) -> str | None:
+    """Return a request folded for comparing, or None if it holds a number."""
+    if _number_runs(text):
+        return None
+    return " ".join(re.findall(r"\w+", text.casefold())) or None
+
+
 def _only_a_number(text: str) -> bool:
     """Return True when the text says nothing but digits and separators."""
     return all(kind in {"digits", "sep"} for kind, _, _ in _number_items(text))
@@ -1215,6 +1222,25 @@ def keep_pin_prompt(action: dict[str, Any], reply: PinReply | None) -> bool:
     return True
 
 
+def repeated_pin_request(
+    pending_actions: Mapping[str, dict[str, Any]], reply: PinReply
+) -> bool:
+    """
+    Return True when this message repeats the request its prompt is holding.
+
+    The user is still asking for the same thing, usually because the microphone
+    closed before they answered. The model tends to answer in its own words
+    without calling a tool, which ends the conversation and drops the prompt.
+    """
+    key = _spoken_request_key(reply.text)
+    return key is not None and any(
+        action.get("reply_turn") == reply.turn_id
+        and action.get("request_key") == key
+        and prompt_renewable(action)
+        for action in pending_actions.values()
+    )
+
+
 def prompt_renewable(action: Mapping[str, Any]) -> bool:
     """Return True while the prompt has not taken all its MAX_PIN_REPLIES replies."""
     return int(action.get("replies", 0) or 0) < MAX_PIN_REPLIES
@@ -1287,6 +1313,8 @@ def disclose_pin_prompts(
     actions = prompts_awaiting_reply(pending_actions, reply)
     for action in actions:
         action["disclosed"] = True
+        if action.get("turn_id") == reply.turn_id:
+            action["request_key"] = _spoken_request_key(reply.text)
     return actions
 
 
