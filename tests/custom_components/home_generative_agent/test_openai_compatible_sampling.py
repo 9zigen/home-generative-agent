@@ -1,5 +1,5 @@
 # ruff: noqa: S101
-"""An OpenAI-compatible server keeps the model's own top_p default."""
+"""An OpenAI-compatible server keeps the model's own top_p unless one is set."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import inspect
 import pytest
 
 import custom_components.home_generative_agent as hga
+from custom_components.home_generative_agent.const import MODEL_CATEGORY_SPECS
 
 
 @pytest.mark.parametrize(
@@ -20,9 +21,28 @@ def test_openai_compatible_primary_sends_no_top_p(provider: str) -> None:
     branch = source[start : source.index("elif ", start + 10)]
     assert '"model_name"' in branch
     assert '"top_p"' not in branch
+    assert "**_top_p_if_set(" in branch
 
 
-def test_openai_compatible_fallback_sends_no_top_p() -> None:
+def test_openai_compatible_fallback_sends_only_a_configured_top_p() -> None:
     """A fallback on such a server is configured the same way."""
     source = inspect.getsource(hga.async_setup_entry)
-    assert 'provider.provider_type != "openai_compatible" and top_p' in source
+    assert "config.update(_top_p_if_set(options.get(top_p_key)))" in source
+
+
+def test_top_p_is_sent_only_when_set() -> None:
+    assert hga._top_p_if_set(None) == {}
+    assert hga._top_p_if_set(0.9) == {"top_p": 0.9}
+
+
+@pytest.mark.parametrize(
+    ("category", "key"),
+    [
+        ("chat", "chat_model_top_p"),
+        ("vlm", "vlm_top_p"),
+        ("summarization", "summarization_model_top_p"),
+        ("sentinel", "sentinel_model_top_p"),
+    ],
+)
+def test_every_chat_like_category_has_a_top_p_option(category: str, key: str) -> None:
+    assert MODEL_CATEGORY_SPECS[category]["top_p_key"] == key

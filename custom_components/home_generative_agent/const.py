@@ -501,6 +501,7 @@ FEATURE_CATEGORY_MAP: dict[str, str] = {
 CONF_FEATURE_MODEL = "model"
 CONF_FEATURE_MODEL_NAME = "model_name"
 CONF_FEATURE_MODEL_TEMPERATURE = "temperature"
+CONF_FEATURE_MODEL_TOP_P = "top_p"
 CONF_FEATURE_MODEL_REASONING = "reasoning"
 CONF_FEATURE_MODEL_REASONING_BUDGET = "reasoning_budget"
 # Per-model-name memory of thinking settings so switching the chat model back
@@ -706,6 +707,7 @@ CONF_ANTHROPIC_CHAT_MODEL = "anthropic_chat_model"
 RECOMMENDED_ANTHROPIC_CHAT_MODEL: CHAT_MODEL_ANTHROPIC_SUPPORTED = "claude-sonnet-4-6"
 
 CONF_CHAT_MODEL_TEMPERATURE = "chat_model_temperature"
+CONF_CHAT_MODEL_TOP_P = "chat_model_top_p"
 RECOMMENDED_CHAT_MODEL_TEMPERATURE = 0.2
 
 ## Context management (for trimming chat history) ##
@@ -774,6 +776,7 @@ CONF_ANTHROPIC_VLM = "anthropic_vlm"
 RECOMMENDED_ANTHROPIC_VLM: VLM_ANTHROPIC_SUPPORTED = "claude-sonnet-4-6"
 
 CONF_VLM_TEMPERATURE = "vlm_temperature"
+CONF_VLM_TOP_P = "vlm_top_p"
 RECOMMENDED_VLM_TEMPERATURE = 0.2
 
 # Prompts + input image size
@@ -910,6 +913,7 @@ RECOMMENDED_ANTHROPIC_SUMMARIZATION_MODEL: SUMMARIZATION_MODEL_ANTHROPIC_SUPPORT
 )
 
 CONF_SUMMARIZATION_MODEL_TEMPERATURE = "summarization_model_temperature"
+CONF_SUMMARIZATION_MODEL_TOP_P = "summarization_model_top_p"
 RECOMMENDED_SUMMARIZATION_MODEL_TEMPERATURE = 0.2
 
 # ---------------- Sentinel model (#866) ----------------
@@ -957,6 +961,7 @@ RECOMMENDED_ANTHROPIC_SENTINEL_MODEL: SENTINEL_MODEL_ANTHROPIC_SUPPORTED = (
 )
 
 CONF_SENTINEL_MODEL_TEMPERATURE = "sentinel_model_temperature"
+CONF_SENTINEL_MODEL_TOP_P = "sentinel_model_top_p"
 RECOMMENDED_SENTINEL_MODEL_TEMPERATURE = 0.2
 
 # Prompts for summarization (used in graph/tools flows)
@@ -1416,6 +1421,7 @@ MODEL_CATEGORY_SPECS: dict[str, dict[str, Any]] = {
     "chat": {
         "provider_key": CONF_CHAT_MODEL_PROVIDER,
         "temperature_key": CONF_CHAT_MODEL_TEMPERATURE,
+        "top_p_key": CONF_CHAT_MODEL_TOP_P,
         "recommended_provider": RECOMMENDED_CHAT_MODEL_PROVIDER,
         "recommended_temperature": RECOMMENDED_CHAT_MODEL_TEMPERATURE,
         "providers": {
@@ -1443,6 +1449,7 @@ MODEL_CATEGORY_SPECS: dict[str, dict[str, Any]] = {
     "vlm": {
         "provider_key": CONF_VLM_PROVIDER,
         "temperature_key": CONF_VLM_TEMPERATURE,
+        "top_p_key": CONF_VLM_TOP_P,
         "recommended_provider": RECOMMENDED_VLM_PROVIDER,
         "recommended_temperature": RECOMMENDED_VLM_TEMPERATURE,
         "providers": {
@@ -1470,6 +1477,7 @@ MODEL_CATEGORY_SPECS: dict[str, dict[str, Any]] = {
     "summarization": {
         "provider_key": CONF_SUMMARIZATION_MODEL_PROVIDER,
         "temperature_key": CONF_SUMMARIZATION_MODEL_TEMPERATURE,
+        "top_p_key": CONF_SUMMARIZATION_MODEL_TOP_P,
         "recommended_provider": RECOMMENDED_SUMMARIZATION_MODEL_PROVIDER,
         "recommended_temperature": RECOMMENDED_SUMMARIZATION_MODEL_TEMPERATURE,
         "providers": {
@@ -1497,6 +1505,7 @@ MODEL_CATEGORY_SPECS: dict[str, dict[str, Any]] = {
     "sentinel": {
         "provider_key": CONF_SENTINEL_MODEL_PROVIDER,
         "temperature_key": CONF_SENTINEL_MODEL_TEMPERATURE,
+        "top_p_key": CONF_SENTINEL_MODEL_TOP_P,
         "recommended_provider": RECOMMENDED_SENTINEL_MODEL_PROVIDER,
         "recommended_temperature": RECOMMENDED_SENTINEL_MODEL_TEMPERATURE,
         "providers": {
