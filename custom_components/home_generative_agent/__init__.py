@@ -3454,7 +3454,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
                 "configurable": {
                     "model_name": openai_compatible_chat_model,
                     "temperature": chat_temp,
-                    "top_p": CHAT_MODEL_TOP_P,
+                    # No top_p: the server applies the model's own default.
                     **_chat_thinking_for_model(
                         "openai_compatible", openai_compatible_chat_model
                     ),
@@ -3534,7 +3534,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
                         CONF_OPENAI_COMPATIBLE_VLM, RECOMMENDED_OPENAI_COMPATIBLE_VLM
                     ),
                     "temperature": vlm_temp,
-                    "top_p": VLM_TOP_P,
+                    # No top_p: the server applies the model's own default.
                 }
             }
         )
@@ -3615,7 +3615,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
                         RECOMMENDED_OPENAI_COMPATIBLE_SUMMARIZATION_MODEL,
                     ),
                     "temperature": sum_temp,
-                    "top_p": SUMMARIZATION_MODEL_TOP_P,
+                    # No top_p: the server applies the model's own default.
                 }
             }
         )
@@ -3710,7 +3710,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
                         RECOMMENDED_OPENAI_COMPATIBLE_SENTINEL_MODEL,
                     ),
                     "temperature": sentinel_temp,
-                    "top_p": SENTINEL_MODEL_TOP_P,
+                    # No top_p: the server applies the model's own default.
                 }
             }
         )
@@ -3805,7 +3805,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
             else "model"
         )
         config = {model_key: model_name, "temperature": temperature}
-        if (top_p := _category_top_p(category)) is not None:
+        # An OpenAI-compatible server applies the model's own top_p default.
+        top_p = _category_top_p(category)
+        if provider.provider_type != "openai_compatible" and top_p is not None:
             config["top_p"] = top_p
         if provider.provider_type == "gemini":
             spec = MODEL_CATEGORY_SPECS.get(category, {})
