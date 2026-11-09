@@ -1,4 +1,4 @@
-# ruff: noqa: S101
+# ruff: noqa: S101, RUF001
 """Tests for the localized critical-action PIN flow messages."""
 
 from string import Formatter
@@ -102,11 +102,17 @@ def test_czech_language_resolves_czech_string():
 
 def test_russian_language_resolves_russian_string():
     hass = _fake_hass("ru")
-    assert pin_msg(hass, "pin_ask_line") == "Назовите ПИН-код."
+    assert pin_msg(hass, "pin_ask_line") == "Какой у вас ПИН-код?"
     action = pin_msg(hass, "action_unlock", target="«Замок»")
     assert pin_msg(hass, "pin_confirm_line", action=action) == (
         "Нужен ПИН-код, чтобы открыть «Замок»."
     )
+
+
+@pytest.mark.parametrize("language", sorted(_MESSAGES))
+def test_pin_question_keeps_a_satellite_listening(language: str) -> None:
+    """Home Assistant closes the microphone unless the reply ends as a question."""
+    assert _MESSAGES[language]["pin_ask_line"].endswith(("?", "\uff1f"))
 
 
 def test_region_suffix_resolves_base_language():

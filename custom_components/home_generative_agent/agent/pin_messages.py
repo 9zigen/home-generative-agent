@@ -551,7 +551,7 @@ _MESSAGES: dict[str, dict[str, str]] = {
             "ПИН-код принят, но неизвестно, получилось ли {action}. Проверьте "
             "устройство."
         ),
-        "pin_ask_line": "Назовите ПИН-код.",
+        "pin_ask_line": "Какой у вас ПИН-код?",
         "action_lock": "закрыть {target}",
         "action_unlock": "открыть {target}",
         "action_open": "открыть {target}",
