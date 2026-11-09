@@ -450,6 +450,11 @@ async def test_an_unexpected_error_still_uses_up_the_confirmation() -> None:
         ("One, two, three, four.", True),
         ("jedna dva tři čtyři", True),
         ("jedna dve tři ctyri", True),
+        ("один два три четыре", True),
+        ("Один, два, три и четыре.", True),
+        ("пин один две три четыре", True),
+        ("один два три", False),
+        ("один два три пять", False),
         ("unlock 2 doors, PIN 1234", True),
         ("door 1, 1234", True),
         ("My PIN is one two three four. One door only.", True),
@@ -571,6 +576,17 @@ def test_oh_after_the_pin_makes_a_longer_number() -> None:
     ],
 )
 def test_pin_digits(text: str, expected: str | None) -> None:
+    assert pin_digits(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("ноль пять шесть семь", "0567"),
+        ("нуль восемь девять одна", "0891"),
+    ],
+)
+def test_pin_digits_russian_words(text: str, expected: str) -> None:
     assert pin_digits(text) == expected
 
 
