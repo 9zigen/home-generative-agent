@@ -23,6 +23,18 @@ their own. See [RELEASING.md](RELEASING.md).
 - **Sentinel's Home Assistant notifications no longer turn device names or model text into links or images.** A device named like a Markdown link (`[Check](https://…)`), or an explanation carrying an image, rendered as a live link or picture in the persistent notifications Sentinel posts when no notify service is set, burst-batch summaries included (and in the new full-text records). That text is now escaped and shown as written ([#922](https://github.com/goruck/home-generative-agent/issues/922)).
 - **A Sentinel Model on a second Ollama server is no longer held back by chat on the first** ([#877](https://github.com/goruck/home-generative-agent/issues/877)). The local GPU gates decided by deployment alone, so with the Sentinel Model on its own Ollama server, Sentinel still waited for every chat and camera turn on the Conversation server (and its 30 s grace), had its calls cancelled by chat there, and kept the per-run triage limit and the gap between calls: during a conversation, findings went out untriaged and without explanations. Now, when no server in the Sentinel Model's chain (its fallbacks included) is one a Conversation, camera, summarization or embedding model or any of their fallbacks can reach, none of those gates hold Sentinel back, and the log says so at startup. A stalled-provider probe to such a server is also sent during chat. Any shared server, or one whose address is not known, keeps every gate exactly as before. A server is its host name: two Ollama instances on one machine count as one, and every loopback address (`localhost`, `127.0.0.1`, `::1`) is the same. Also fixed: a reload during a Sentinel model call could leave the old Sentinel engine subscribed to state changes.
 
+## [3.45.0-alab.9] - 2026-11-09
+
+Fork release: 3.45.0-alab.8 plus a redesigned memory card and card editors.
+
+### Added
+
+- **Visual editors for the memory and enroll cards.** The memory card sets its title, the person to start with, whether to list people with no memories, and whether to show search. The enroll card sets its title.
+
+### Changed
+
+- **The memory card is redesigned.** People with no memories are hidden by default but stay available as targets when moving a memory. Each memory has compact edit, move and delete controls, delete asks inside the card, and times are shown as relative. It shows no title unless one is set.
+
 ## [3.45.0-alab.8] - 2026-11-08
 
 Fork release: 3.45.0-alab.7 plus speaker recognition hardening.
