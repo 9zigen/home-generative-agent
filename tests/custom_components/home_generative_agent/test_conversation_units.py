@@ -172,9 +172,13 @@ from homeassistant.util import dt as dt_util  # noqa: E402
 from custom_components.home_generative_agent.agent.helpers import (  # noqa: E402
     PinReply,
     keep_pin_prompts,
+    register_pending_action,
     start_pin_turn,
     unreadable_pin_reply,
     waiting_pin_prompt,
+)
+from custom_components.home_generative_agent.agent.tools import (  # noqa: E402
+    _is_wrong_user,
 )
 from custom_components.home_generative_agent.conversation import (  # noqa: E402
     _STREAM_ERROR_REASON_MAX_CHARS,
@@ -488,6 +492,33 @@ async def test_index_tools_skips_an_admin_only_api() -> None:
 # ---------------------------------------------------------------------------
 # _run_tool_index_background failure path
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adopted", [False, True])
+async def test_tool_index_delta_hashes_skip_a_build_adopted_meanwhile(
+    *, adopted: bool
+) -> None:
+    """Vectors of the old build must not look current to the rebuild (#942)."""
+    rd = MagicMock()
+    rd.embedding_fingerprint = before = types.SimpleNamespace(digest="w:a1")
+    rd.tool_content_hashes = {}
+
+    async def _write(_tasks: Any) -> None:
+        if adopted:
+            rd.embedding_fingerprint = types.SimpleNamespace(digest="w:b2")
+
+    self_stub = MagicMock()
+    with patch(
+        "custom_components.home_generative_agent.conversation.gather_store_puts_in_chunks",
+        new=_write,
+    ):
+        await HGAConversationEntity._async_write_tool_index_delta(
+            self_stub, rd, [AsyncMock()], {"key": "hash"}
+        )
+
+    assert (rd.embedding_fingerprint is before) is not adopted
+    assert rd.tool_content_hashes == ({} if adopted else {"key": "hash"})
 
 
 @pytest.mark.asyncio
@@ -961,6 +992,7 @@ def _index_entity() -> Any:
 def _index_runtime_data(**overrides: Any) -> Any:
     rd = types.SimpleNamespace(
         tool_index_ready=True,
+        embedding_fingerprint=None,
         tool_indexing_in_progress=False,
         tool_index_failed=False,
         tool_content_hashes={},
@@ -2245,8 +2277,8 @@ def _render_entity(options: dict[str, Any], *, sentinel: Any = None) -> Any:
 
 
 _PERSON = types.SimpleNamespace(
-    entity_id="person.aleksey",
-    attributes={"id": "aleksey", "friendly_name": "Алексей", "user_id": "u1"},
+    entity_id="person.ivan",
+    attributes={"id": "ivan", "friendly_name": "Иван", "user_id": "u1"},
 )
 
 
@@ -2276,7 +2308,7 @@ def _speaker_entity(
     entity.hass.states.async_all.return_value = persons or []
     entity._warned_speaker_sensors = set()
     entity.hass.auth.async_get_user = AsyncMock(
-        return_value=types.SimpleNamespace(name="Aleksey")
+        return_value=types.SimpleNamespace(name="Ivan")
     )
     return entity
 
@@ -2285,11 +2317,11 @@ async def test_speaker_prompt_names_the_recognized_voice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A recognized voice from a picked sensor on the device is named."""
-    entity = _speaker_entity(monkeypatch, "Платон")
+    entity = _speaker_entity(monkeypatch, "Пётр")
     speaker = await entity._async_speaker("device")
-    assert speaker == Speaker(name="Платон")
+    assert speaker == Speaker(name="Пётр")
     prompt = entity._speaker_prompt(speaker)
-    assert '"Платон"' in prompt
+    assert '"Пётр"' in prompt
     assert "never to authorize" in prompt
     assert "Home Assistant person" not in prompt
 
@@ -2300,35 +2332,35 @@ async def test_speaker_uses_the_sensor_on_the_requesting_device(
     """With a sensor per satellite, each request reads its own satellite's."""
     entity = _speaker_entity(
         monkeypatch,
-        "Платон",
+        "Пётр",
         devices={"sensor.kitchen_voice": "kitchen", "sensor.hall_voice": "hall"},
     )
     await entity._async_speaker("hall")
     entity.hass.states.get.assert_called_once_with("sensor.hall_voice")
 
 
-@pytest.mark.parametrize("value", ["Алексей", "алексей", "aleksey", "person.aleksey"])
+@pytest.mark.parametrize("value", ["Иван", "иван", "ivan", "person.ivan"])
 async def test_speaker_is_the_matching_person(
     monkeypatch: pytest.MonkeyPatch, value: str
 ) -> None:
     """A voice taught as a person's name, id or entity id becomes that person."""
     entity = _speaker_entity(monkeypatch, value, persons=[_PERSON])
     speaker = await entity._async_speaker("device")
-    assert speaker == Speaker(name="Алексей", person="person.aleksey", user="Aleksey")
-    assert speaker.key == "person.aleksey"
+    assert speaker == Speaker(name="Иван", person="person.ivan", user="Ivan")
+    assert speaker.key == "person.ivan"
     prompt = entity._speaker_prompt(speaker)
-    assert '"Алексей"' in prompt
-    assert "person.aleksey" in prompt
+    assert '"Иван"' in prompt
+    assert "person.ivan" in prompt
 
 
 async def test_speaker_person_without_a_user(monkeypatch: pytest.MonkeyPatch) -> None:
     """A person without a login still names the voice, but has no memories."""
     person = types.SimpleNamespace(
-        entity_id="person.platon", attributes={"friendly_name": "Платон"}
+        entity_id="person.petr", attributes={"friendly_name": "Пётр"}
     )
-    entity = _speaker_entity(monkeypatch, "Платон", persons=[person])
+    entity = _speaker_entity(monkeypatch, "Пётр", persons=[person])
     speaker = await entity._async_speaker("device")
-    assert speaker == Speaker(name="Платон", person="person.platon")
+    assert speaker == Speaker(name="Пётр", person="person.petr")
     entity.hass.auth.async_get_user.assert_not_called()
 
 
@@ -2358,14 +2390,14 @@ async def test_speaker_needs_a_picked_sensor_on_the_device(
     monkeypatch: pytest.MonkeyPatch, sensors: list[str], devices: dict[str, str]
 ) -> None:
     """Without a picked sensor on the requesting device, nothing is said."""
-    entity = _speaker_entity(monkeypatch, "Алексей", sensors=sensors, devices=devices)
+    entity = _speaker_entity(monkeypatch, "Иван", sensors=sensors, devices=devices)
     assert await entity._async_speaker("device") is None
     assert entity._speaker_prompt(None) == ""
 
 
 async def test_speaker_prompt_needs_a_device(monkeypatch: pytest.MonkeyPatch) -> None:
     """A request from no device says nothing about who is speaking."""
-    assert await _speaker_entity(monkeypatch, "Алексей")._async_speaker(None) is None
+    assert await _speaker_entity(monkeypatch, "Иван")._async_speaker(None) is None
 
 
 def test_render_system_prompt_audit_instruction_follows_sentinel_availability(
@@ -3625,10 +3657,10 @@ async def test_a_renamed_remote_server_is_indexed_again() -> None:
 def test_memory_user_follows_a_recognized_person() -> None:
     """A voice linked to a login reads its memories; a logged-in user wins."""
     memory = HGAConversationEntity._memory_user
-    person = Speaker(name="Алексей", person="person.aleksey", user="Aleksey")
-    assert memory(None, person) == "Aleksey"
+    person = Speaker(name="Иван", person="person.ivan", user="Ivan")
+    assert memory(None, person) == "Ivan"
     assert memory("Platon", person) == "Platon"
-    assert memory(None, Speaker(name="Платон")) is None
+    assert memory(None, Speaker(name="Пётр")) is None
     assert memory(None, Speaker(name=None)) is None
     assert memory(None, None) is None
 
@@ -3636,10 +3668,10 @@ def test_memory_user_follows_a_recognized_person() -> None:
 def test_thread_is_per_speaker_only_on_devices_that_recognize_voices() -> None:
     """Each voice gets its own history; other requests keep the conversation's."""
     thread = HGAConversationEntity._thread_id
-    assert thread("conv", Speaker(name="Платон")) == "conv:Платон"
-    assert thread("conv", Speaker(name="Платон")) != thread("conv", Speaker("Алеся"))
-    person = Speaker(name="Алексей", person="person.aleksey")
-    assert thread("conv", person) == "conv:person.aleksey"
+    assert thread("conv", Speaker(name="Пётр")) == "conv:Пётр"
+    assert thread("conv", Speaker(name="Пётр")) != thread("conv", Speaker("Мария"))
+    person = Speaker(name="Иван", person="person.ivan")
+    assert thread("conv", person) == "conv:person.ivan"
     assert thread("conv", Speaker(name=None)) == "conv:unknown"
     assert thread("conv", None) == "conv"
 
@@ -3766,9 +3798,141 @@ def test_number_from_another_voice_joins_the_waiting_prompt() -> None:
     entity = _turn_entity(action)
     turn = entity._turn_thread("conv", Speaker(name=None), "1 2 3 4")
     assert turn == ("conv:Пётр", action)
-    memory = HGAConversationEntity._memory_user
-    assert memory(None, Speaker(name=None), action) == "ivan"
-    assert memory("Logged", Speaker(name=None), action) == "Logged"
+    assert HGAConversationEntity._pin_owner(None, action) == "ivan"
+    assert HGAConversationEntity._pin_owner("Logged", action) is None
+    assert HGAConversationEntity._pin_owner(None, None) is None
+
+
+@pytest.mark.parametrize("text", ["1234", "one two three four"])
+def test_pin_from_another_voice_still_reaches_the_prompt(text: str) -> None:
+    """A real PIN joins the prompt, and keeps the speaker's memories."""
+    action = _waiting_action("conv:Пётр")
+    entity = _turn_entity(action)
+    guest = Speaker(name="Мария", user="Mary")
+    assert entity._turn_thread("conv", guest, text) == ("conv:Пётр", action)
+    assert HGAConversationEntity._memory_user(None, guest) == "Mary"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "remember that I like the blue one",
+        "remember that I take 2 sugars",
+        "set a timer for 10 minutes",
+    ],
+)
+def test_sentence_with_a_short_number_stays_with_its_speaker(text: str) -> None:
+    """A number too short to be a PIN must not reach the prompt owner's thread."""
+    action = _waiting_action("conv:Пётр")
+    entity = _turn_entity(action)
+    guest = Speaker(name="Мария", user="Mary")
+    assert entity._turn_thread("conv", guest, text) == ("conv:Мария", None)
+
+
+def test_sentence_with_a_pin_length_number_keeps_the_speakers_memories() -> None:
+    """Even when a sentence joins the prompt, the owner's memories stay closed."""
+    action = _waiting_action("conv:Пётр")
+    entity = _turn_entity(action)
+    guest = Speaker(name="Мария", user="Mary")
+    text = "remember my phone number is 5551234"
+    thread, prompt = entity._turn_thread("conv", guest, text)
+    assert (thread, prompt) == ("conv:Пётр", action)
+    assert HGAConversationEntity._memory_user(None, guest) == "Mary"
+
+
+def test_pin_owner_decides_the_owner_check_for_a_followed_prompt() -> None:
+    """The speaker's own memory user must not refuse the PIN it was following."""
+    action = {"user": "ivan"}
+    assert _is_wrong_user({"user_id": "Mary", "pin_owner": "ivan"}, action) is False
+    assert _is_wrong_user({"user_id": "Mary", "pin_owner": None}, action) is True
+    assert _is_wrong_user({"user_id": "Mary"}, action) is True
+
+
+def _held_request(**fields: Any) -> dict[str, Any]:
+    return {
+        "tool_name": "HassTurnOn",
+        "tool_args": {"name": "Front door"},
+        "thread_id": "conv:ivan",
+        "created_at": dt_util.utcnow().isoformat(),
+        **fields,
+    }
+
+
+def test_followed_reply_reissuing_the_request_keeps_the_owners_action() -> None:
+    """The model repeats the held request; the owner's PIN must still confirm it."""
+    pending: dict[str, dict[str, Any]] = {
+        "a": _held_request(user="ivan", turn_id="t0", attempts=2, disclosed=True)
+    }
+    action_id = register_pending_action(
+        pending, _held_request(user="Mary", turn_id="t1"), pin_owner="ivan"
+    )
+    assert action_id is not None
+    assert list(pending) == [action_id]
+    action = pending[action_id]
+    assert action["user"] == "ivan"
+    assert action["attempts"] == 2
+    assert action["disclosed"] is True
+    assert _is_wrong_user({"user_id": "Mary", "pin_owner": "ivan"}, action) is False
+
+
+def test_followed_reply_making_a_new_request_stays_the_speakers() -> None:
+    """Only the same request is the owner's; a new one is whoever asked for it."""
+    pending: dict[str, dict[str, Any]] = {
+        "a": _held_request(user="ivan", turn_id="t0", attempts=2, disclosed=True)
+    }
+    new = _held_request(user="Mary", turn_id="t1", tool_args={"name": "Garage"})
+    action_id = register_pending_action(pending, new, pin_owner="ivan")
+    assert action_id is not None
+    assert pending[action_id]["user"] == "Mary"
+    assert pending[action_id]["attempts"] == 0
+    assert pending["a"]["user"] == "ivan"
+
+
+def test_another_users_same_request_is_not_the_owners_without_a_followed_prompt() -> (
+    None
+):
+    """With no prompt followed, two users' requests stay apart as before."""
+    pending: dict[str, dict[str, Any]] = {
+        "a": _held_request(user="ivan", turn_id="t0", attempts=2)
+    }
+    action_id = register_pending_action(
+        pending, _held_request(user="Mary", turn_id="t1")
+    )
+    assert action_id is not None
+    assert len(pending) == 2
+    assert pending[action_id]["user"] == "Mary"
+
+
+@pytest.mark.parametrize(
+    ("text", "follows"),
+    [
+        ("123", True),
+        ("1234", True),
+        ("1234567890", True),
+        ("12345678901", True),
+        ("call 123", False),
+        ("call 12345678901", False),
+        ("between 1234 and 5678", False),
+    ],
+)
+def test_only_one_number_of_pin_length_follows_a_prompt(
+    *, text: str, follows: bool
+) -> None:
+    """A sentence needs a PIN-length number; a bare number may be misheard."""
+    action = _waiting_action("conv:Пётр")
+    found = waiting_pin_prompt({"a": action}, "conv", text)
+    assert (found is action) is follows
+
+
+def test_misheard_pin_from_another_voice_is_asked_again() -> None:
+    """A short reply attributed to the wrong voice must reach the prompt's retry."""
+    action = _waiting_action("conv:Пётр")
+    entity = _turn_entity(action)
+    pending = entity.entry.runtime_data.pending_actions
+    thread, prompt = entity._turn_thread("conv", Speaker(name=None), "1 2 3")
+    assert (thread, prompt) == ("conv:Пётр", action)
+    reply = start_pin_turn(pending, thread, "1 2 3")
+    assert unreadable_pin_reply(pending, reply) is True
 
 
 def test_other_message_from_another_voice_stays_with_its_speaker() -> None:
@@ -3779,8 +3943,10 @@ def test_other_message_from_another_voice_stays_with_its_speaker() -> None:
     text = "remember my address is on Main street"
     thread, prompt = entity._turn_thread("conv", guest, text)
     assert (thread, prompt) == ("conv:Мария", None)
-    assert HGAConversationEntity._memory_user(None, guest, prompt) == "Mary"
-    assert action.get("reply_turn") is None
+    assert HGAConversationEntity._memory_user(None, guest) == "Mary"
+    pending = entity.entry.runtime_data.pending_actions
+    start_pin_turn(pending, thread, text)
+    assert waiting_pin_prompt(pending, "conv", "1234") is action
 
 
 def test_recognized_voice_with_no_waiting_prompt_keeps_its_thread() -> None:
@@ -3802,7 +3968,8 @@ def test_handler_passes_the_speaker_to_thread_memory_and_prompt() -> None:
     """The resolved speaker has to reach everything it is meant to change."""
     src = inspect.getsource(HGAConversationEntity._async_handle_message_active)
     assert "conversation_id, speaker, user_input.text" in src
-    assert "self._memory_user(user_name, speaker, waiting_prompt)" in src
+    assert "self._memory_user(user_name, speaker)" in src
+    assert "self._pin_owner(user_name, waiting_prompt)" in src
     assert "self._speaker_prompt(speaker)" in src
 
 

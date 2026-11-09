@@ -285,7 +285,7 @@ from .core.database_guard import (
     database_unreachable,
     is_connection_failure,
 )
-from .core.db_utils import parse_postgres_uri
+from .core.db_utils import db_client_keepalives, parse_postgres_uri
 from .core.embedding_model_guard import (
     async_clear_ollama_embedding_model_issue,
     async_sync_ollama_embedding_model_issue,
@@ -303,6 +303,7 @@ from .core.embedding_record import (
     async_sync_embedding_record,
     async_sync_other_build_fallback_issue,
     async_verify_embedding_fallback,
+    async_watch_embedding_builds,
     embedding_fingerprint,
 )
 from .core.embedding_store import (
@@ -378,6 +379,7 @@ from .core.utils import (
     generate_embeddings,
     is_edge_deployment,
     make_gated_probe_runner,
+    mark_tool_index_stale,
     normalize_openai_compatible_base_url,
     normalized_ollama_url,
     ollama_healthy,
@@ -1467,12 +1469,13 @@ def _retry_failed_tool_index(
     async_dispatcher_send(hass, SIGNAL_TOOL_INDEX_UPDATED, "stale", 0)
 
 
-def _hold_unchecked_embedding_fallbacks(
+def _hold_unchecked_embedding_fallbacks(  # noqa: PLR0913
     hass: HomeAssistant,
     entry: ConfigEntry,
     chain: FallbackEmbeddings,
     unchecked: Sequence[FallbackBuild],
     *,
+    kept: Sequence[FallbackBuild] = (),
     on_admitted: Callable[[str], None] | None = None,
 ) -> None:
     """
@@ -1482,9 +1485,12 @@ def _hold_unchecked_embedding_fallbacks(
     with nothing to say so (#857): each answers only once its build is read
     and matches, checked when the chain first needs it or by the record check
     at the end of setup, whichever comes first. `on_admitted` runs too when
-    one is first admitted.
+    one is first admitted. The check knows every one in `kept` too, so the
+    build watch can hold one again when the primary's build changes (#857):
+    with `kept` set it runs even when nothing is unchecked, since
+    `hold_again` does nothing on a chain with no check installed.
     """
-    if not unchecked:
+    if not unchecked and not kept:
         return
 
     @callback
@@ -1499,7 +1505,7 @@ def _hold_unchecked_embedding_fallbacks(
             async_verify_embedding_fallback,
             hass,
             entry,
-            {fb.provider_id: fb for fb in unchecked},
+            {fb.provider_id: fb for fb in (*kept, *unchecked)},
             chain=chain,
             warned=set(),
         ),
@@ -3014,6 +3020,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
     # Kept Ollama fallbacks not compared with the primary's live build (theirs
     # unread, or the primary's): checked again after setup (#860).
     embedding_fallback_unchecked: list[FallbackBuild] = []
+    # Every Ollama fallback kept, checked or not: the build watch reads each
+    # admitted one's build again while Home Assistant runs (#857).
+    embedding_fallback_kept: list[FallbackBuild] = []
     if embedding_provider == "openai":
         embedding_model = openai_embeddings
     elif embedding_provider == "openai_compatible":
@@ -3117,12 +3126,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
                 continue
             # Without a database no build was read and there is no store to
             # protect, so there is nothing to check later either.
-            if db_uri is not None and (
-                digest is None or primary_embedding_digest is None
-            ):
-                embedding_fallback_unchecked.append(
-                    FallbackBuild(p.entry_id, p.name, _ollama_provider_url(p), digest)
+            if db_uri is not None:
+                kept_build = FallbackBuild(
+                    p.entry_id, p.name, _ollama_provider_url(p), digest
                 )
+                embedding_fallback_kept.append(kept_build)
+                if digest is None or primary_embedding_digest is None:
+                    embedding_fallback_unchecked.append(kept_build)
             _emb_chain.append((m, p.deployment, p.entry_id))
         if embedding_other_build:
             LOGGER.warning(
@@ -3149,14 +3159,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
                 runtime_data = getattr(entry, "runtime_data", None)
                 if runtime_data is None:
                     return
-                runtime_data.tool_content_hashes.clear()
-                runtime_data.tool_index_ready = False
-                runtime_data.tool_index_failed = False
-                # A build in flight embedded with the previous provider: let
-                # it finish and it would declare that index ready.
-                task = runtime_data.tool_index_task
-                if task is not None and not task.done():
-                    task.cancel()
+                mark_tool_index_stale(hass, runtime_data)
                 LOGGER.warning(
                     "Tool index marked stale after embedding provider %s %s to "
                     "%s; it will be rebuilt on the next indexing pass.",
@@ -3164,7 +3167,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
                     "switched" if notify else "was removed, handing the chain",
                     provider_id,
                 )
-                async_dispatcher_send(hass, SIGNAL_TOOL_INDEX_UPDATED, "stale", 0)
                 if not notify:
                     return
                 provider = providers.get(provider_id)
@@ -3186,6 +3188,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
                 entry,
                 embedding_model,
                 embedding_fallback_unchecked,
+                kept=embedding_fallback_kept,
                 on_admitted=_announce_admitted_embedding_fallback,
             )
         elif _emb_chain:
@@ -3254,19 +3257,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
         )
 
     # Open Postgres
-    connection_kwargs = {
+    connection_kwargs: dict[str, Any] = {
         "autocommit": True,
         "prepare_threshold": 0,
         "row_factory": dict_row,
     }
 
     if db_uri is not None:
+        connection_kwargs.update(db_client_keepalives(db_uri))
         pool: AsyncConnectionPool[AsyncConnection[DictRow]] | None = (
             AsyncConnectionPool(
                 conninfo=db_uri,
                 min_size=5,
                 max_size=20,
                 kwargs=connection_kwargs,
+                # Validate each connection on checkout and replace it if the
+                # server dropped it (e.g. Postgres restarted during an HA
+                # backup), instead of handing out a dead one. check_connection
+                # is a staticmethod typed for AsyncConnection[Any]; the cast
+                # only narrows it to this pool's DictRow connections.
+                check=cast(
+                    "Callable[[AsyncConnection[DictRow]], Awaitable[None]]",
+                    psycopg_pool.AsyncConnectionPool.check_connection,
+                ),
                 open=False,
             )
         )
@@ -4421,6 +4434,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
             model=ollama_embedding_model,
             left_out=tuple(embedding_other_build),
             unchecked=tuple(embedding_fallback_unchecked),
+            kept=tuple(embedding_fallback_kept),
         ),
     )
 
@@ -5249,6 +5263,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
         async_sync_embedding_record(hass, entry),
         name="hga_embedding_record_check",
     )
+    # A build pulled while Home Assistant runs is noted within minutes, not
+    # at the next start (#857). Kept to be cancelled before the pool closes.
+    if pool is not None and entry.runtime_data.embedding_digest_source is not None:
+        entry.runtime_data.build_watch_task = entry.async_create_background_task(
+            hass,
+            async_watch_embedding_builds(hass, entry),
+            name="hga_embedding_build_watch",
+        )
     # Same placement: captions stored before they named their camera get it,
     # in batches, so each camera's reads find them again (#706). Kept to be
     # cancelled at unload before the pool it writes on is closed.
@@ -5365,6 +5387,14 @@ async def _cancel_and_wait(task: object, what: str) -> None:
     )
 
 
+async def _cancel_build_watch(rd: HGAData) -> None:
+    """End the embedding build watch and the writer notes it started (#857)."""
+    await _cancel_and_wait(rd.build_watch_task, "embedding build watch")
+    rd.build_watch_task = None
+    for note in tuple(rd.embedding_note_tasks):
+        await _cancel_and_wait(note, "embedding writer note")
+
+
 async def async_unload_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
     """Unload the config entry."""
     # Platforms come down FIRST, and a refusal aborts before anything is torn
@@ -5434,6 +5464,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool
     await _teardown("tool_index.cancel", _cancel_tool_index)
 
     async def _cancel_reembed() -> None:
+        # The build watch writes the record on the same pool and can start a
+        # resume, so it goes first (#857).
+        await _cancel_build_watch(rd)
         # Writes on the pool closed next; it resumes at the next setup (#855).
         await _cancel_and_wait(rd.reembed_task, "memory store re-embed")
         rd.reembed_task = None
