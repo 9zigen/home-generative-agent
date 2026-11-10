@@ -618,6 +618,33 @@ _SPOKEN_ZERO = "oh"
 # Words that may join digits read out one by one ("1, 2, 3 and 4"; Czech "a",
 # Russian "и").
 _DIGIT_JOINERS = frozenset({"and", "a", "и"})
+# Words that may stand around a PIN said in reply to another voice's prompt
+# ("my PIN is 1234", "the code is 1234"; Czech "můj PIN je 1234", "PIN kód
+# 1234"; Russian "мой пин-код 1234", "код 1234"), casefolded. Anything else
+# makes the message a request of its own.
+_PIN_LABEL_WORDS = frozenset(
+    {
+        "my",
+        "pin",
+        "code",
+        "passcode",
+        "number",
+        "is",
+        "the",
+        "it",
+        "s",
+        "můj",
+        "muj",
+        "kód",
+        "kod",
+        "je",
+        "мой",
+        "пин",
+        "пинкод",
+        "код",
+        "это",
+    }
+)
 # A token of the message: a word or number, a run of whitespace, or one other
 # character.
 _TOKEN_RE = re.compile(r"\w+|\s+|.", re.DOTALL)
@@ -868,9 +895,26 @@ def _spoken_request_key(text: str) -> str | None:
     return " ".join(re.findall(r"\w+", text.casefold())) or None
 
 
-def _only_a_number(text: str) -> bool:
-    """Return True when the text says nothing but digits and separators."""
-    return all(kind in {"digits", "sep"} for kind, _, _ in _number_items(text))
+def _only_a_pin_reply(text: str) -> bool:
+    """
+    Return True when every word of the text is a digit, a joiner or a PIN label.
+
+    Punctuation and spacing do not count, so "PIN-code: 1, 2, 3, 4." qualifies;
+    whether the digits make one number is pin_digits' call.
+    """
+    for token in _TOKEN_RE.findall(_ascii_digits(text)):
+        if not re.match(r"\w", token):
+            continue
+        lowered = token.casefold()
+        if not (
+            _is_number(token)
+            or lowered in _SPOKEN_DIGITS
+            or lowered in _DIGIT_JOINERS
+            or lowered == _SPOKEN_ZERO
+            or lowered in _PIN_LABEL_WORDS
+        ):
+            return False
+    return True
 
 
 def normalize_pin(pin: str) -> str:
@@ -1161,19 +1205,17 @@ def waiting_pin_prompt(
 
     On a device that recognizes voices each voice has its own thread, and a short
     spoken PIN is the utterance most likely to be attributed to the wrong one. A
-    message holding one number of PIN length is looked up across the conversation's
-    voices so it reaches the prompt instead of going to the model as an ordinary
-    message; the PIN still decides. A message that is only a number of another
-    length is looked up too: it is a misheard PIN, and it is answered without the
-    model (unreadable_pin_reply). Any other message stays with whoever said it, and
-    only a prompt a voice created is followed, so a typed request keeps its owner
-    check.
+    message that says nothing but one number and PIN labels ("my PIN is 1234") is
+    looked up across the conversation's voices so it reaches the prompt instead of
+    going to the model as an ordinary message; the PIN still decides. A number of
+    another length is a misheard PIN, answered without the model
+    (unreadable_pin_reply). A request that happens to hold a number ("compare
+    options one and two, three and four") stays with whoever said it, as does any
+    other message, and only a prompt a voice created is followed, so a typed
+    request keeps its owner check.
     """
     digits = pin_digits(text)
-    if digits is None or not (
-        CRITICAL_PIN_MIN_LEN <= len(digits) <= CRITICAL_PIN_MAX_LEN
-        or _only_a_number(text)
-    ):
+    if digits is None or not _only_a_pin_reply(text):
         return None
     now = dt_util.utcnow()
     prefix = f"{conversation_id}:"
@@ -1194,12 +1236,13 @@ def unreadable_pin_reply(
     """
     Return True when this message answers a prompt with a number no PIN can be.
 
-    Only a message that is nothing but the number counts, so a request with a
-    number in it ("turn it on for 5 minutes") is not taken for a misheard PIN.
+    Only a message that is nothing but the number and PIN labels counts ("PIN
+    12"), so a request with a number in it ("turn it on for 5 minutes") is not
+    taken for a misheard PIN.
     """
     if not any(a.get("reply_turn") == reply.turn_id for a in pending_actions.values()):
         return False
-    if not _only_a_number(reply.text):
+    if not _only_a_pin_reply(reply.text):
         return False
     digits = pin_digits(reply.text)
     return digits is not None and not (
