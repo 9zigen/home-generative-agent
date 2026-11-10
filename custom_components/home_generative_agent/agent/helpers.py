@@ -520,6 +520,31 @@ PENDING_ACTION_TTL = timedelta(minutes=10)
 # plus a retry after a wrong or unreadable PIN or a failed turn.
 MAX_PIN_REPLIES = 3
 
+# Wrong PINs allowed for one pending action, carried over to a request that
+# replaces it or reopens its prompt.
+MAX_PIN_ATTEMPTS = 5
+
+# How long after a prompt expired or took its last reply the user can reopen it
+# by saying the same request again (`reopen_ended_prompt`).
+ENDED_PROMPT_REOPEN_WINDOW = timedelta(minutes=10)
+
+# What a reopened prompt starts afresh: the reply state of the prompt that
+# ended. Failed attempts are carried over separately.
+_PROMPT_STATE = frozenset(
+    {
+        "turn_id",
+        "reply_turn",
+        "replies",
+        "renew",
+        "disclosed",
+        "request_key",
+        "limit_reached",
+        "ended_at",
+        "created_at",
+        "attempts",
+    }
+)
+
 # Hard cap on concurrently pending confirmations, so an unconfirmed challenge
 # loop cannot grow the store without bound.
 MAX_PENDING_ACTIONS = 16
@@ -1155,8 +1180,85 @@ def register_pending_action(
     return action_id
 
 
+def _note_ended_prompt(
+    ended_prompts: dict[str, dict[str, Any]] | None,
+    action: Mapping[str, Any],
+    now: datetime,
+) -> None:
+    """Keep a delivered prompt that expired or took its last reply, to reopen."""
+    thread_id = action.get("thread_id")
+    if (
+        ended_prompts is None
+        or not isinstance(thread_id, str)
+        or not action.get("disclosed")
+        or not action.get("request_key")
+        # Out of attempts: a reopened prompt could only refuse the PIN.
+        or int(action.get("attempts", 0) or 0) >= MAX_PIN_ATTEMPTS
+    ):
+        return
+    ended_prompts[thread_id] = {**action, "ended_at": now.isoformat()}
+
+
+def _ended_long_ago(record: Mapping[str, Any], now: datetime) -> bool:
+    """Return True when an ended prompt can no longer be reopened."""
+    ended_at = record.get("ended_at")
+    if not isinstance(ended_at, str):
+        return True
+    try:
+        return now - datetime.fromisoformat(ended_at) > ENDED_PROMPT_REOPEN_WINDOW
+    except (ValueError, TypeError):
+        return True
+
+
+def reopen_ended_prompt(
+    pending_actions: dict[str, dict[str, Any]],
+    ended_prompts: dict[str, dict[str, Any]],
+    thread_id: str,
+    reply: PinReply,
+) -> str | None:
+    """
+    Reopen this voice's ended prompt when the message repeats its request.
+
+    A prompt that expired or took its last reply is gone, and the model, seeing
+    the earlier prompt in the history, tends to answer the same request in its
+    own words without calling the tool: the microphone closes and a PIN said
+    next has nothing to confirm. Said again within ENDED_PROMPT_REOPEN_WINDOW,
+    in the same words on the same thread, the request gets the held action back
+    as a new prompt, with its failed attempts, so this never resets the limit.
+    A prompt the user moved on from is not kept, so it is never reopened.
+
+    Returns the new action's ID, or None when nothing was reopened.
+    """
+    now = dt_util.utcnow()
+    for key, record in list(ended_prompts.items()):
+        if _ended_long_ago(record, now):
+            ended_prompts.pop(key, None)
+    record = ended_prompts.get(thread_id)
+    request_key = _spoken_request_key(reply.text)
+    if (
+        record is None
+        or request_key is None
+        or record.get("request_key") != request_key
+    ):
+        return None
+    ended_prompts.pop(thread_id, None)
+    action = {key: value for key, value in record.items() if key not in _PROMPT_STATE}
+    action["turn_id"] = reply.turn_id
+    action_id = register_pending_action(pending_actions, action)
+    if action_id is not None:
+        reopened = pending_actions[action_id]
+        reopened["attempts"] = max(
+            int(reopened.get("attempts", 0) or 0),
+            int(record.get("attempts", 0) or 0),
+        )
+    return action_id
+
+
 def start_pin_turn(
-    pending_actions: dict[str, dict[str, Any]], thread_id: str, text: str
+    pending_actions: dict[str, dict[str, Any]],
+    thread_id: str,
+    text: str,
+    ended_prompts: dict[str, dict[str, Any]] | None = None,
 ) -> PinReply:
     """
     Open a user turn in a conversation and return its message as a PinReply.
@@ -1174,6 +1276,10 @@ def start_pin_turn(
     (`disclose_pin_prompts`) was never delivered: the turn that made it was
     cancelled or failed before its reply, so the user was never told, in
     words the model did not choose, what their PIN would run.
+
+    A delivered prompt that expired, or that ended because it took its last
+    reply, is noted in `ended_prompts` so the request said again can reopen it
+    (`reopen_ended_prompt`).
     """
     reply = PinReply(text)
     turn_id = reply.turn_id
@@ -1181,6 +1287,7 @@ def start_pin_turn(
     for key, action in list(pending_actions.items()):
         if pending_action_expired(action, now):
             pending_actions.pop(key, None)
+            _note_ended_prompt(ended_prompts, action, now)
             continue
         if action.get("thread_id") != thread_id or action.get("turn_id") == turn_id:
             continue
@@ -1194,6 +1301,8 @@ def start_pin_turn(
             action["replies"] = replies + 1
         else:
             pending_actions.pop(key, None)
+            if action.get("limit_reached"):
+                _note_ended_prompt(ended_prompts, action, now)
     return reply
 
 
@@ -1260,6 +1369,9 @@ def keep_pin_prompt(action: dict[str, Any], reply: PinReply | None) -> bool:
     if reply is None or action.get("reply_turn") != reply.turn_id:
         return False
     if not prompt_renewable(action):
+        # The user was still answering, so the prompt ends at its retry
+        # limit, not because they moved on: the request said again reopens it.
+        action["limit_reached"] = True
         return False
     action["renew"] = True
     return True

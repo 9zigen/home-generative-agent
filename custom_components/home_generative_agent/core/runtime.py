@@ -90,6 +90,9 @@ class HGAData:
     openai_http_client: httpx.Client | None = None
     # Per-provider stall state shared by the model chains (#828).
     stall_tracker: ProviderStallTracker | None = None
+    # A voice's last PIN prompt that expired or took its last reply, by thread,
+    # so the request said again reopens it (`reopen_ended_prompt`).
+    ended_pin_prompts: dict[str, dict[str, Any]] = field(default_factory=dict)
     model_deployments: dict[str, str] = field(default_factory=dict)
     tool_content_hashes: dict[str, str] = field(default_factory=dict)
     # The house words each API's tools were indexed with (#848).

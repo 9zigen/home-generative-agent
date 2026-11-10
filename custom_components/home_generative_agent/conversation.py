@@ -61,6 +61,7 @@ from .agent.helpers import (
     llm_api_is_supported,
     prompts_awaiting_reply,
     remote_house_words,
+    reopen_ended_prompt,
     repeated_pin_request,
     resolve_critical_action_policy,
     safe_convert,
@@ -2079,7 +2080,8 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
         """
         Ask again in fixed words when a reply cannot answer the prompt.
 
-        The reply is a number no PIN can be, or the held request said again. The
+        The reply is a number no PIN can be, or the held request said again,
+        while its prompt waits or after it ended (`reopen_ended_prompt`). The
         model would only argue with the number, and leaving it out of the turn
         keeps the misheard digits out of the thread.
         """
@@ -2269,10 +2271,22 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
         # so this runs before any other early return. A turn that fails keeps
         # the prompt for the user's next message (keep_pin_prompts).
         pin_reply = start_pin_turn(
-            runtime_data.pending_actions, thread_id, user_input.text
+            runtime_data.pending_actions,
+            thread_id,
+            user_input.text,
+            runtime_data.ended_pin_prompts,
         )
         unreadable = unreadable_pin_reply(runtime_data.pending_actions, pin_reply)
-        if unreadable or repeated_pin_request(runtime_data.pending_actions, pin_reply):
+        if (
+            unreadable
+            or repeated_pin_request(runtime_data.pending_actions, pin_reply)
+            or reopen_ended_prompt(
+                runtime_data.pending_actions,
+                runtime_data.ended_pin_prompts,
+                thread_id,
+                pin_reply,
+            )
+        ):
             return await self._async_ask_for_pin_again(
                 user_input,
                 chat_log,

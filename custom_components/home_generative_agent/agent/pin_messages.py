@@ -547,7 +547,7 @@ _MESSAGES: dict[str, dict[str, str]] = {
         ),
         "pin_confirm_line": "Нужен ПИН-код, чтобы {action}.",
         "pin_incorrect_line": "ПИН-код неверный.",
-        "pin_unreadable_line": "Не расслышал ПИН-код.",
+        "pin_unreadable_line": "Не расслышала ПИН-код.",
         "pin_request_again_line": "Попросите ещё раз.",
         "pin_done_line": "ПИН-код принят. Выполнено: {action}.",
         "pin_failed_line": "ПИН-код принят, но не получилось {action}.",

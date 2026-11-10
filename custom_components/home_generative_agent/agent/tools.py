@@ -116,6 +116,7 @@ from .automation_targets import (
 from .camera_activity import get_camera_last_events_from_states
 from .critical_push import CriticalPushResult, apply_critical_push
 from .helpers import (
+    MAX_PIN_ATTEMPTS,
     PENDING_ACTION_TTL,
     PIN_AWAITING_USER_REPLY,
     PIN_OUTCOME_DONE,
@@ -163,10 +164,6 @@ LOGGER = logging.getLogger(__name__)
 # the graph's per-tool timeout (graph.py, 30 s), so an action that is slow
 # after its claim is answered as "may have run" here.
 POST_CLAIM_TIMEOUT_S = 25
-
-# Wrong PINs allowed for one pending action, carried over to a request that
-# replaces it.
-MAX_PIN_ATTEMPTS = 5
 
 
 @tool(parse_docstring=True)

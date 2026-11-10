@@ -17,6 +17,7 @@ import logging
 import re
 import sys
 import types
+from datetime import timedelta
 from enum import IntFlag
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -170,10 +171,13 @@ from homeassistant.components import conversation as ha_conversation  # noqa: E4
 from homeassistant.util import dt as dt_util  # noqa: E402
 
 from custom_components.home_generative_agent.agent.helpers import (  # noqa: E402
+    ENDED_PROMPT_REOPEN_WINDOW,
+    PENDING_ACTION_TTL,
     PinReply,
     disclose_pin_prompts,
     keep_pin_prompts,
     register_pending_action,
+    reopen_ended_prompt,
     repeated_pin_request,
     start_pin_turn,
     unreadable_pin_reply,
@@ -2560,7 +2564,12 @@ def test_each_turn_gets_its_own_pin_reply() -> None:
     """
     src = inspect.getsource(HGAConversationEntity._async_handle_message_active)
     assert "start_pin_turn(" in src
-    assert "runtime_data.pending_actions, thread_id, user_input.text" in src
+    assert re.search(
+        r"start_pin_turn\(\s*runtime_data\.pending_actions,\s*thread_id,"
+        r"\s*user_input\.text,\s*runtime_data\.ended_pin_prompts,",
+        src,
+    )
+    assert "reopen_ended_prompt(" in src
     assert '"thread_id": thread_id,' in src
 
 
@@ -4175,6 +4184,135 @@ async def test_a_repeated_request_is_asked_again_in_fixed_words(
     assert chat_log.content[-1].content.endswith("What is your PIN?")
     assert "couldn't make out" not in chat_log.content[-1].content
     assert next(iter(pending.values()))["renew"] is True
+
+
+def _ended_at_limit(pending: dict[str, Any], *, attempts: int = 0) -> dict[str, Any]:
+    """Deliver a prompt, use up its replies, and return the held action."""
+    reply = _repeat_prompt(pending, "Открой замок", "1 2")
+    action = next(iter(pending.values()))
+    action["replies"] = 3
+    action["attempts"] = attempts
+    keep_pin_prompts(pending, reply)
+    assert action["limit_reached"] is True
+    return dict(action)
+
+
+def test_a_request_said_again_after_the_retry_limit_reopens_its_prompt() -> None:
+    """The model answered from history without a tool call (field test 2026-11-10)."""
+    pending: dict[str, Any] = {}
+    ended: dict[str, Any] = {}
+    held = _ended_at_limit(pending, attempts=2)
+
+    reply = start_pin_turn(pending, "conv1", "Открой замок.", ended)
+    assert pending == {}
+    action_id = reopen_ended_prompt(pending, ended, "conv1", reply)
+
+    assert action_id is not None
+    assert ended == {}
+    action = pending[action_id]
+    assert action["tool_name"] == held["tool_name"]
+    assert action["tool_args"] == held["tool_args"]
+    assert action["user"] == held["user"]
+    assert action["turn_id"] == reply.turn_id
+    assert action["attempts"] == 2
+    assert "reply_turn" not in action
+    assert "replies" not in action
+    assert "disclosed" not in action
+
+
+def test_an_expired_prompt_is_reopened_by_its_request() -> None:
+    pending: dict[str, Any] = {}
+    ended: dict[str, Any] = {}
+    disclose_pin_prompts(pending, _pin_prompt(pending, "Открой замок"))
+    old = dt_util.utcnow() - PENDING_ACTION_TTL - timedelta(seconds=1)
+    next(iter(pending.values()))["created_at"] = old.isoformat()
+
+    reply = start_pin_turn(pending, "conv1", "открой замок", ended)
+    assert pending == {}
+    assert reopen_ended_prompt(pending, ended, "conv1", reply) is not None
+
+
+def test_a_prompt_the_user_moved_on_from_is_not_reopened() -> None:
+    """Another command drops the prompt for good, as before."""
+    pending: dict[str, Any] = {}
+    ended: dict[str, Any] = {}
+    _repeat_prompt(pending, "Открой замок", "Включи свет")
+    reply = start_pin_turn(pending, "conv1", "Открой замок", ended)
+    assert pending == {}
+    assert ended == {}
+    assert reopen_ended_prompt(pending, ended, "conv1", reply) is None
+
+
+@pytest.mark.parametrize(
+    ("thread", "text"),
+    [
+        ("conv1", "Закрой замок"),
+        ("conv1", "Открой замок 1234"),
+        ("conv2", "Открой замок"),
+    ],
+)
+def test_an_ended_prompt_reopens_only_for_its_voice_and_words(
+    thread: str, text: str
+) -> None:
+    pending: dict[str, Any] = {}
+    ended: dict[str, Any] = {}
+    _ended_at_limit(pending)
+    start_pin_turn(pending, "conv1", "Спасибо", ended)
+    assert "conv1" in ended
+
+    reply = start_pin_turn(pending, thread, text, ended)
+    assert reopen_ended_prompt(pending, ended, thread, reply) is None
+    assert pending == {}
+
+
+def test_a_prompt_out_of_attempts_is_not_reopened() -> None:
+    """Reopened, it could only refuse the PIN."""
+    pending: dict[str, Any] = {}
+    ended: dict[str, Any] = {}
+    _ended_at_limit(pending, attempts=5)
+    reply = start_pin_turn(pending, "conv1", "Открой замок", ended)
+    assert ended == {}
+    assert reopen_ended_prompt(pending, ended, "conv1", reply) is None
+
+
+def test_an_ended_prompt_is_not_reopened_after_the_window() -> None:
+    pending: dict[str, Any] = {}
+    ended: dict[str, Any] = {}
+    _ended_at_limit(pending)
+    start_pin_turn(pending, "conv1", "Спасибо", ended)
+    late = dt_util.utcnow() - ENDED_PROMPT_REOPEN_WINDOW - timedelta(seconds=1)
+    ended["conv1"]["ended_at"] = late.isoformat()
+
+    reply = start_pin_turn(pending, "conv1", "Открой замок", ended)
+    assert reopen_ended_prompt(pending, ended, "conv1", reply) is None
+    assert ended == {}
+
+
+async def test_a_reopened_prompt_asks_for_the_pin_in_fixed_words(
+    frozen_assistant_content: None,  # noqa: ARG001
+) -> None:
+    """The reply names the action and ends with the question, so the mic stays open."""
+    pending: dict[str, Any] = {}
+    ended: dict[str, Any] = {}
+    _ended_at_limit(pending)
+    reply = start_pin_turn(pending, "conv1", "Открой замок", ended)
+    action_id = reopen_ended_prompt(pending, ended, "conv1", reply)
+    assert action_id is not None
+    chat_log = _DeltaChatLog([])
+
+    await HGAConversationEntity._async_add_pin_lines(
+        _pin_entity(), cast("Any", chat_log), pending, reply, streamed=False
+    )
+
+    assert chat_log.content[-1].content.endswith("What is your PIN?")
+    assert "couldn't make out" not in chat_log.content[-1].content
+    action = pending[action_id]
+    assert action["disclosed"] is True
+    assert action["request_key"] == "открой замок"
+    # The next message answers it as a first reply.
+    answer = start_pin_turn(pending, "conv1", "1234", ended)
+    assert action["reply_turn"] == answer.turn_id
+    assert action["replies"] == 1
 
 
 def test_handler_asks_again_for_a_repeated_request() -> None:
