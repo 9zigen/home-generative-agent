@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import ssl
 from pathlib import Path
@@ -463,6 +464,170 @@ async def test_call_model_injects_done_fallback_after_empty_tool_response(
     assert isinstance(ai_msg, AIMessage)
     assert ai_msg.content == "Done.", f"expected 'Done.' but got {ai_msg.content!r}"
     assert not ai_msg.tool_calls
+
+
+@pytest.mark.asyncio
+async def test_call_model_shows_an_ended_pin_request_as_ended(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A held action's result whose prompt is gone reads as ended to the model.
+
+    Field test 2026-11-10: the history held a "requires_pin" result whose
+    prompt had ended, and the model answered the same request again by asking
+    for the PIN in its own words, with no tool call. A result still waiting
+    is passed as it is, and the stored messages are never changed.
+    """
+    seen: list[list[object]] = []
+
+    async def _fake_recovery(*args: object, **_kwargs: object) -> AIMessage:
+        seen.append(list(cast("list[object]", args[3])))
+        return AIMessage(content="ok")
+
+    async def _fake_trim(
+        messages: list[object], *_args: object, **_kwargs: object
+    ) -> list[object]:
+        return messages
+
+    mock_store = MagicMock()
+    mock_store.asearch = AsyncMock(return_value=[])
+    monkeypatch.setattr(
+        agent_graph, "_invoke_chat_model_with_schema_recovery", _fake_recovery
+    )
+    monkeypatch.setattr(agent_graph, "_trim_messages_for_model", _fake_trim)
+
+    def held(action_id: str) -> str:
+        return json.dumps(
+            {
+                "status": "requires_pin",
+                "action_id": action_id,
+                "action": "открыть «Замок»",
+            },
+            ensure_ascii=False,
+        )
+
+    ended = ToolMessage(content=held("old"), tool_call_id="call-1", name="HassTurnOff")
+    waiting = ToolMessage(
+        content=held("new"), tool_call_id="call-2", name="HassTurnOff"
+    )
+    other = ToolMessage(content="action_done", tool_call_id="call-3")
+    state: dict[str, object] = {
+        "messages": [HumanMessage(content="Открой замок"), ended, waiting, other],
+        "selected_tools": [],
+        "summary": "",
+        "tool_routing_map": {},
+        "messages_to_remove": [],
+        "chat_model_usage_metadata": {},
+    }
+    config: dict[str, object] = {
+        "configurable": {
+            "chat_model": MagicMock(),
+            "user_id": "user-test",
+            "hass": hass,
+            "options": {},
+            "chat_model_options": {},
+            "prompt": "You are a helpful assistant.",
+            "langchain_tools": {},
+            "ha_llm_api": None,
+            "pending_actions": {"new": {}},
+        }
+    }
+
+    result = await agent_graph._call_model(state, config, store=mock_store)  # type: ignore[arg-type]
+
+    sent = [m for m in seen[0] if isinstance(m, ToolMessage)]
+    first = json.loads(str(sent[0].content))
+    assert first["status"] == "ended"
+    assert first["action"] == "открыть «Замок»"
+    assert "call the tool again" in first["note"]
+    assert sent[0].tool_call_id == "call-1"
+    assert sent[1].content == waiting.content
+    assert sent[2].content == "action_done"
+    # The next message is a tool result, not the user's: no reply goes between.
+    assert not any(isinstance(m, AIMessage) for m in seen[0])
+    # The stored thread keeps the original result.
+    assert ended.content == held("old")
+    assert result["messages_to_remove"] == []
+
+
+@pytest.mark.asyncio
+async def test_an_ended_pin_request_is_followed_by_a_reply_before_the_user(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The turn that held an action ended on its result, with no reply in the thread.
+
+    Rewriting the result alone, the model still asked for the PIN itself in
+    every live try (field test 2026-11-10); with a reply saying the request
+    ended, it called the tool again every time.
+    """
+    seen: list[list[object]] = []
+
+    async def _fake_recovery(*args: object, **_kwargs: object) -> AIMessage:
+        seen.append(list(cast("list[object]", args[3])))
+        return AIMessage(content="ok")
+
+    async def _fake_trim(
+        messages: list[object], *_args: object, **_kwargs: object
+    ) -> list[object]:
+        return messages
+
+    mock_store = MagicMock()
+    mock_store.asearch = AsyncMock(return_value=[])
+    monkeypatch.setattr(
+        agent_graph, "_invoke_chat_model_with_schema_recovery", _fake_recovery
+    )
+    monkeypatch.setattr(agent_graph, "_trim_messages_for_model", _fake_trim)
+
+    call = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "HassTurnOff", "args": {}, "id": "call-1", "type": "tool_call"}
+        ],
+    )
+    result = ToolMessage(
+        content=json.dumps({"status": "requires_pin", "action_id": "old"}),
+        tool_call_id="call-1",
+        name="HassTurnOff",
+    )
+    stored = [HumanMessage(content="Открой замок"), call, result]
+    stored.append(HumanMessage(content="Открой замок"))
+    state: dict[str, object] = {
+        "messages": list(stored),
+        "selected_tools": [],
+        "summary": "",
+        "tool_routing_map": {},
+        "messages_to_remove": [],
+        "chat_model_usage_metadata": {},
+    }
+    config: dict[str, object] = {
+        "configurable": {
+            "chat_model": MagicMock(),
+            "user_id": "user-test",
+            "hass": hass,
+            "options": {},
+            "chat_model_options": {},
+            "prompt": "You are a helpful assistant.",
+            "langchain_tools": {},
+            "ha_llm_api": None,
+            "pending_actions": {},
+        }
+    }
+
+    await agent_graph._call_model(state, config, store=mock_store)  # type: ignore[arg-type]
+
+    sent = [m for m in seen[0] if not isinstance(m, SystemMessage)]
+    assert [type(m).__name__ for m in sent] == [
+        "HumanMessage",
+        "AIMessage",
+        "ToolMessage",
+        "AIMessage",
+        "HumanMessage",
+    ]
+    assert "ended without confirmation" in str(sent[3].content)
+    assert state["messages"] == stored
 
 
 @pytest.mark.asyncio

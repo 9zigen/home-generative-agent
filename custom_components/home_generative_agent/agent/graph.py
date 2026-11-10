@@ -3769,6 +3769,59 @@ async def _search_memories(store: BaseStore, user_id: str, query: str | None) ->
     return await _recent_memories(store, user_id)
 
 
+# What the model reads in place of a held action's result once its PIN prompt
+# is gone (confirmed, expired, at its reply limit, or abandoned).
+_ENDED_PIN_REQUEST_NOTE = (
+    "This PIN request has ended and can no longer be confirmed. If the user asks "
+    "for this action again, call the tool again; do not ask for the PIN yourself."
+)
+# The reply the model reads after such a result. The turn that held the
+# action ended on the result, its PIN prompt said in fixed words outside the
+# thread, so the model would otherwise see the user's next message right after
+# the result.
+_ENDED_PIN_REQUEST_REPLY = "The PIN request for this action ended without confirmation."
+
+
+def _mark_ended_pin_requests(
+    messages: Sequence[AnyMessage], pending_actions: Mapping[str, Any]
+) -> list[AnyMessage]:
+    """
+    Return the model's input with results of PIN requests that ended rewritten.
+
+    A held action's result ("requires_pin") stays in the thread after its
+    prompt is gone, and the misheard-PIN retries never reach the model, so the
+    history reads as a prompt still waiting. Asked for the same action again,
+    a local model then asked for the PIN in its own words without calling the
+    tool (field test 2026-11-10): nothing was held, its reply closed the
+    satellite's microphone, and the PIN said next had nothing to confirm. For
+    the model's input only, such a result says the request ended, followed by a
+    reply saying so when the user's message comes next; the stored thread is
+    unchanged. Gemma 4 then called the tool again 10 times out of 10, against
+    none with the result alone rewritten.
+    """
+    marked: list[AnyMessage] = []
+    for index, msg in enumerate(messages):
+        if not (isinstance(msg, ToolMessage) and _requests_pin(msg)):
+            marked.append(msg)
+            continue
+        data = json.loads(str(msg.content))
+        if data.get("action_id") in pending_actions:
+            marked.append(msg)
+            continue
+        ended = {
+            "status": "ended",
+            "action": data.get("action"),
+            "note": _ENDED_PIN_REQUEST_NOTE,
+        }
+        marked.append(
+            msg.model_copy(update={"content": json.dumps(ended, ensure_ascii=False)})
+        )
+        following = messages[index + 1] if index + 1 < len(messages) else None
+        if isinstance(following, HumanMessage):
+            marked.append(AIMessage(content=_ENDED_PIN_REQUEST_REPLY))
+    return marked
+
+
 async def _call_model(
     state: State, config: RunnableConfig, *, store: BaseStore
 ) -> dict[str, Any]:
@@ -3859,7 +3912,7 @@ async def _call_model(
         hass,
         base_model,
         model,
-        trimmed_messages,
+        _mark_ended_pin_requests(trimmed_messages, conf.get("pending_actions", {})),
         config,
         selected_tools,
         disable_reasoning=disable_reasoning,
