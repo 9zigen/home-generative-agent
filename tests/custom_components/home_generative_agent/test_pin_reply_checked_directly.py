@@ -356,3 +356,41 @@ async def test_the_hash_runs_off_the_event_loop() -> None:
 
     assert len(jobs) == 1
     assert pending[action_id]["attempts"] == 1
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "три, восемь. пять один.",  # the field test's shape (made-up digits)
+        "Пин-код три, восемь. пять один.",
+        "three, eight. five one.",
+    ],
+)
+def test_a_full_stop_between_spoken_digits_does_not_split_a_pin_reply(
+    text: str,
+) -> None:
+    """GigaAM put a full stop mid-PIN; the reply then went to the model."""
+    from custom_components.home_generative_agent.agent.helpers import (  # noqa: PLC0415
+        pin_digits,
+        pin_in_text,
+    )
+
+    pending: dict[str, Any] = {}
+    action_id = _held(pending)
+    reply = start_pin_turn(pending, "conv1", text)
+
+    assert pin_digits(text) == PIN
+    assert pin_in_text(PIN, text)
+    assert pin_only_reply_action(pending, reply) == (action_id, PIN)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["unlock door three four. One door only.", "открой три четыре. Один замок."],
+)
+def test_a_full_stop_still_ends_a_number_in_a_sentence(text: str) -> None:
+    from custom_components.home_generative_agent.agent.helpers import (  # noqa: PLC0415
+        _number_runs,
+    )
+
+    assert len(_number_runs(text)) == 2

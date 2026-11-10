@@ -840,9 +840,19 @@ def _number_items(text: str) -> list[tuple[str, str, bool]]:
 
 
 def _joins(
-    previous: tuple[str, str, bool], current: tuple[str, str, bool], seps: set[str]
+    previous: tuple[str, str, bool],
+    current: tuple[str, str, bool],
+    seps: set[str],
+    *,
+    digits_only: bool,
 ) -> bool:
-    """Return True when two digit items separated by seps are one number."""
+    """
+    Return True when two digit items separated by seps are one number.
+
+    ``digits_only``: the message holds nothing but digits, joiners and PIN
+    labels (`_only_a_pin_reply`), so a full stop between spoken digits is
+    speech-to-text punctuation, not the end of a sentence.
+    """
     if not seps:
         # Whitespace only: "12 34", "one two three four", "555 one two three
         # four" (one longer number, never its last four digits).
@@ -851,8 +861,10 @@ def _joins(
         return False
     if len(previous[1]) != 1 or len(current[1]) != 1:
         return False
-    # "1. 2. 3. 4." but not "...three four. One door only."
-    return "." not in seps or (previous[2] and current[2])
+    # "1. 2. 3. 4." but not "...three four. One door only." Spoken digits
+    # alone join across it: GigaAM wrote a PIN said evenly as "три, восемь.
+    # пять один." (field test 2026-11-10).
+    return "." not in seps or digits_only or (previous[2] and current[2])
 
 
 def _number_runs(text: str) -> list[str]:
@@ -861,8 +873,9 @@ def _number_runs(text: str) -> list[str]:
 
     A number is written ("1234", "1,234"), said in groups separated by spaces
     ("12 34"), or read out digit by digit with spaces, commas, dashes, ". " or
-    "and" between the digits ("1, 2, 3 and 4", "one two three four"). Anything
-    else ends it. A compound ("12:34", "12,5", "1.1.1.1", "1234.56kWh", "21°",
+    "and" between the digits ("1, 2, 3 and 4", "one two three four"); ". "
+    joins spoken digits only in a message of digits alone. Anything else ends
+    it. A compound ("12:34", "12,5", "1.1.1.1", "1234.56kWh", "21°",
     "50%") or a range ("555 - 1234", "2026 / 10 / 15") is not a number at all,
     and neither is a number next to one with only spaces between ("1234
     56.78").
@@ -873,6 +886,7 @@ def _number_runs(text: str) -> list[str]:
     in_compound = False
     previous: tuple[str, str, bool] | None = None
     seps: set[str] = set()
+    digits_only = _only_a_pin_reply(text)
     for item in _number_items(text):
         kind, value, _ = item
         if kind == "sep":
@@ -884,7 +898,7 @@ def _number_runs(text: str) -> list[str]:
             if (
                 kind == "digits"
                 and previous[0] == "digits"
-                and _joins(previous, item, seps)
+                and _joins(previous, item, seps, digits_only=digits_only)
             ):
                 if not in_compound:
                     digits += value
