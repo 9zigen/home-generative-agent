@@ -33,6 +33,14 @@ their own. See [RELEASING.md](RELEASING.md).
 - **Sentinel's Home Assistant notifications no longer turn device names or model text into links or images.** A device named like a Markdown link (`[Check](https://…)`), or an explanation carrying an image, rendered as a live link or picture in the persistent notifications Sentinel posts when no notify service is set, burst-batch summaries included (and in the new full-text records). That text is now escaped and shown as written ([#922](https://github.com/goruck/home-generative-agent/issues/922)).
 - **A Sentinel Model on a second Ollama server is no longer held back by chat on the first** ([#877](https://github.com/goruck/home-generative-agent/issues/877)). The local GPU gates decided by deployment alone, so with the Sentinel Model on its own Ollama server, Sentinel still waited for every chat and camera turn on the Conversation server (and its 30 s grace), had its calls cancelled by chat there, and kept the per-run triage limit and the gap between calls: during a conversation, findings went out untriaged and without explanations. Now, when no server in the Sentinel Model's chain (its fallbacks included) is one a Conversation, camera, summarization or embedding model or any of their fallbacks can reach, none of those gates hold Sentinel back, and the log says so at startup. A stalled-provider probe to such a server is also sent during chat. Any shared server, or one whose address is not known, keeps every gate exactly as before. A server is its host name: two Ollama instances on one machine count as one, and every loopback address (`localhost`, `127.0.0.1`, `::1`) is the same. Also fixed: a reload during a Sentinel model call could leave the old Sentinel engine subscribed to state changes.
 
+## [3.45.2-alab.5] - 2026-11-10
+
+Fork release: 3.45.2-alab.4 plus upstream main (Sentinel stop and power-history fixes, a stopped model call no longer retried on the fallback) and the #981 review fix.
+
+### Fixed
+
+- **A PIN said with a yes, an okay or a please is still a PIN reply; a phone number or an amount is not.** "да, 1234", "пароль 1234", "yes, PIN number 1234 please" and their Czech forms are read as only the PIN, so they reach a prompt another voice was asked and are checked without the model. "my number is 5551234" and "$1234" are ordinary messages and no longer use up a PIN attempt.
+
 ## [3.45.2-alab.4] - 2026-11-10
 
 Fork release: 3.45.2-alab.3 plus one PIN prompt per satellite conversation.
