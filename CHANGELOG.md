@@ -27,6 +27,14 @@ their own. See [RELEASING.md](RELEASING.md).
 - **Sentinel's Home Assistant notifications no longer turn device names or model text into links or images.** A device named like a Markdown link (`[Check](https://…)`), or an explanation carrying an image, rendered as a live link or picture in the persistent notifications Sentinel posts when no notify service is set, burst-batch summaries included (and in the new full-text records). That text is now escaped and shown as written ([#922](https://github.com/goruck/home-generative-agent/issues/922)).
 - **A Sentinel Model on a second Ollama server is no longer held back by chat on the first** ([#877](https://github.com/goruck/home-generative-agent/issues/877)). The local GPU gates decided by deployment alone, so with the Sentinel Model on its own Ollama server, Sentinel still waited for every chat and camera turn on the Conversation server (and its 30 s grace), had its calls cancelled by chat there, and kept the per-run triage limit and the gap between calls: during a conversation, findings went out untriaged and without explanations. Now, when no server in the Sentinel Model's chain (its fallbacks included) is one a Conversation, camera, summarization or embedding model or any of their fallbacks can reach, none of those gates hold Sentinel back, and the log says so at startup. A stalled-provider probe to such a server is also sent during chat. Any shared server, or one whose address is not known, keeps every gate exactly as before. A server is its host name: two Ollama instances on one machine count as one, and every loopback address (`localhost`, `127.0.0.1`, `::1`) is the same. Also fixed: a reload during a Sentinel model call could leave the old Sentinel engine subscribed to state changes.
 
+## [3.45.2-alab.4] - 2026-11-10
+
+Fork release: 3.45.2-alab.3 plus one PIN prompt per satellite conversation.
+
+### Fixed
+
+- **A PIN can no longer confirm another voice's request it was not meant for** ([#974](https://github.com/goruck/home-generative-agent/issues/974)). On a satellite that recognizes voices, two turns overlapping could leave a PIN prompt waiting for each of two voices, and a PIN said next went to the newer one, which may not be the request its speaker meant. A satellite conversation now holds one prompt across its voices: a new protected request replaces another voice's waiting prompt, keeping the most failed attempts among those it replaced, so the limit is not reset. A request said again that reopens an ended prompt counts as a new request too.
+
 ## [3.45.2-alab.3] - 2026-11-10
 
 Fork release: 3.45.2-alab.2 plus reading a PIN with a full stop in it.
