@@ -72,6 +72,9 @@ def _held(pending: dict[str, Any], thread_id: str = "conv1") -> str:
         "PIN code 3851.",
         "Пин-код три восемь пять один",
         "три, восемь, пять, один.",
+        "да, 3851",
+        "пароль три восемь пять один",
+        "yes, PIN number 3851 please",
     ],
 )
 def test_a_pin_only_reply_names_its_action_and_pin(text: str) -> None:
@@ -89,6 +92,8 @@ def test_a_pin_only_reply_names_its_action_and_pin(text: str) -> None:
         "open the front door 3851",  # a request with a number in it
         "3851 and 1234",  # two numbers
         "never mind",
+        "$3851",  # an amount
+        "my number is 3851",  # not a PIN label without "PIN" or "code"
     ],
 )
 def test_other_replies_go_to_the_model(text: str) -> None:
