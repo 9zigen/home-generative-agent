@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import fnmatch
 import logging
 import re
@@ -77,6 +76,8 @@ from custom_components.home_generative_agent.const import (
 )
 from custom_components.home_generative_agent.core.utils import (
     EXCLUSION_ENTRY_MAX_LEN,
+    cancel_and_wait,
+    cancel_requested,
     sentinel_calls_gated,
     valid_exclusion_entry,
     verify_pin,
@@ -127,7 +128,7 @@ from .notifier import (
     is_security_copy,
     related_findings_line,
 )
-from .power_enrichment import async_enrich_power_last_changed
+from .power_enrichment import PowerOnSince, async_enrich_power_last_changed
 from .rules.alarm_disarmed_external_threat import AlarmDisarmedDuringExternalThreatRule
 from .rules.appliance_power_duration import AppliancePowerDurationRule
 from .rules.camera_entry_unsecured import CameraEntryUnsecuredRule
@@ -207,6 +208,8 @@ from .triage import (
     TRIAGE_REASON_DEFERRED,
     TRIAGE_SUPPRESS,
     SentinelTriageService,
+    TriageDecision,
+    triage_memo_key,
 )
 from .trigger_scheduler import SentinelTriggerScheduler, TriggerRecord
 
@@ -432,6 +435,13 @@ class SentinelEngine:
         # Findings held (at level 0, or a change alert held back at any level,
         # #801): anomaly_id -> when last audited.
         self._passive_recorded: dict[str, datetime] = {}
+        # Findings triage suppressed, by what the model was shown
+        # (triage_memo_key) -> when to ask it again. Not saved: a restart costs
+        # one more model call per finding.
+        self._triage_suppressed: dict[tuple[str, str], datetime] = {}
+        # Each 'on' power sensor's episode start, so a run reads only the
+        # readings since the last one. Not saved: a restart walks back again.
+        self._power_on_since: dict[str, PowerOnSince] = {}
         # Owed replays: when each kind last skipped its type cooldown, and the
         # ones delivered this run.
         self._replay_cooldown_skipped: dict[str, datetime] = {}
@@ -1367,22 +1377,27 @@ class SentinelEngine:
                     self._entry_id,
                 )
 
-        if self._task is None:
-            return
-        self._stop_event.set()
-        self._task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await self._task
-        self._task = None
-
-        # Stop baseline updater.
-        if self._baseline_updater is not None:
-            await self._baseline_updater.stop()
-
-        # Unsubscribe event listeners.
-        for unsub in self._event_unsubscribers:
-            unsub()
-        self._event_unsubscribers.clear()
+        task = self._task
+        try:
+            if task is not None:
+                self._stop_event.set()
+                # Bounded and repeated: a run that caught the first cancel
+                # and kept working held HA's shutdown for minutes (#985). A
+                # cancel of this caller gets through. The task is kept until
+                # this returns, so a concurrent stop() (removing Sentinel
+                # stops it twice) waits on it too instead of returning early,
+                # and a stop() whose caller was cancelled can be retried.
+                await cancel_and_wait(task, "Sentinel run loop")
+                if self._task is task:
+                    self._task = None
+        finally:
+            # Always, even when this caller is cancelled or the loop died
+            # with an error; a second stop() redoes whatever is left.
+            for unsub in self._event_unsubscribers:
+                unsub()
+            self._event_unsubscribers.clear()
+            if self._baseline_updater is not None:
+                await self._baseline_updater.stop()
 
     # ---------------------------------------------------------------------- #
     # Event-driven triggering
@@ -1491,6 +1506,19 @@ class SentinelEngine:
                 await self._trigger_scheduler.run_polling(
                     lambda: self._timed_run("poll")
                 )
+            # A run that catches this task's cancel somewhere (a library
+            # mid-LLM-call, say) returns normally; without these checks the
+            # loop would then wait out the full interval and hold up HA's
+            # shutdown (#985).
+            if cancel_requested():
+                LOGGER.warning(
+                    "A Sentinel run caught the stop request instead of "
+                    "ending; it was stopped after the run finished. Please "
+                    "report this with a debug log (issue #985)."
+                )
+                raise asyncio.CancelledError
+            if self._stop_event.is_set():
+                break
             try:
                 # Wait for a new trigger or the polling interval — whichever
                 # comes first.  Using wait_for_trigger() means the loop wakes
@@ -1801,12 +1829,18 @@ class SentinelEngine:
                 self._baseline_updater.async_fetch_counter_baselines(hour_metrics(now)),
                 timeout=COUNTER_BASELINE_FETCH_TIMEOUT_S,
             )
-        except (TimeoutError, Exception):  # noqa: BLE001 - the pool, the store
+        except (TimeoutError, Exception) as err:  # broad: the pool, the store
+            # A database driver can turn our cancel into an ordinary error;
+            # it must still stop the run (#985).
+            if cancel_requested():
+                raise asyncio.CancelledError from err
             self._log_limiter.warning(
                 "counter_baselines_fetch",
                 "Sentinel could not read the network counter baselines.",
             )
             return
+        if cancel_requested():  # a driver that ate the cancel and returned
+            raise asyncio.CancelledError
         covered, reporting = usage_coverage(section, baselines, now)
         if reporting and covered < reporting:
             section.setdefault("notes", []).append(
@@ -1961,7 +1995,9 @@ class SentinelEngine:
         try:
             await async_enrich_alarm_last_changed(self._hass, snapshot)
             await async_enrich_lock_last_changed(self._hass, snapshot)
-            await async_enrich_power_last_changed(self._hass, snapshot)
+            await async_enrich_power_last_changed(
+                self._hass, snapshot, self._power_on_since
+            )
         except (ValueError, TypeError, KeyError):
             # Enrichment only corrects last_changed context; a bug here must
             # degrade to un-enriched snapshots, not kill the run loop (an
@@ -2528,6 +2564,75 @@ class SentinelEngine:
             return None
         return self._explainer
 
+    def _triage_still_suppressed(
+        self, finding: AnomalyFinding, snapshot: FullStateSnapshot, now: datetime
+    ) -> bool:
+        """Return True while triage's answer on this unchanged finding holds."""
+        until = self._triage_suppressed.get(triage_memo_key(finding, snapshot))
+        return until is not None and now < until
+
+    def _remember_triage_suppression(
+        self,
+        finding: AnomalyFinding,
+        snapshot: FullStateSnapshot,
+        now: datetime,
+        window: timedelta,
+    ) -> None:
+        """
+        Keep triage's suppression of a finding for its cooldown window.
+
+        Only this exact finding, unlike a cooldown, so the model cannot silence
+        another device it never saw. High severity is asked again every time, so
+        one wrong answer on a serious alert is corrected by the next run. A
+        change alert is too: a new change can repeat an old one's id, and these
+        rules do not re-fire every run once triage has stopped them.
+        """
+        self._triage_suppressed = {
+            key: until for key, until in self._triage_suppressed.items() if until > now
+        }
+        if (
+            finding.severity != "high"
+            and finding.type not in _CHANGE_ALERT_RULES
+            and window > timedelta(0)
+        ):
+            self._triage_suppressed[triage_memo_key(finding, snapshot)] = now + window
+
+    async def _triage_finding(  # noqa: PLR0913
+        self,
+        service: SentinelTriageService,
+        finding: AnomalyFinding,
+        snapshot: FullStateSnapshot,
+        now: datetime,
+        window: timedelta,
+        *,
+        autonomy: int,
+        trigger_source: str,
+    ) -> TriageDecision | None:
+        """Return triage's decision on a finding, or None when it stopped it."""
+        if self._triage_still_suppressed(finding, snapshot, now):
+            # Audited when the model answered; every repeat of a standing
+            # condition would crowd out the audit trail.
+            self._last_dispatch_reason = SUPPRESSION_REASON_TRIAGE_SUPPRESSED
+            return None
+        result = await service.triage(finding, snapshot)
+        if result.decision != TRIAGE_SUPPRESS:
+            return result
+        await _append_finding_audit(
+            self._audit_store,
+            snapshot,
+            finding,
+            None,
+            SUPPRESSION_REASON_TRIAGE_SUPPRESSED,
+            triage_decision=result.decision,
+            triage_reason_code=result.reason_code,
+            triage_confidence=result.triage_confidence,
+            autonomy_level_at_decision=autonomy,
+            trigger_source=trigger_source,
+        )
+        self._remember_triage_suppression(finding, snapshot, now, window)
+        self._last_dispatch_reason = SUPPRESSION_REASON_TRIAGE_SUPPRESSED
+        return None
+
     async def _dispatch_item(  # noqa: PLR0913
         self,
         item: AnomalyFinding | CompoundFinding,
@@ -2626,30 +2731,28 @@ class SentinelEngine:
         )
 
         # LLM triage pass (Level 1+): may suppress the finding.
-        triage_decision_value: str | None = None
-        triage_reason_code_value: str | None = None
-        triage_confidence_value: float | None = None
+        triage_result: TriageDecision | None = None
         # Not a replay: what was owed is not the model's to drop.
         if effective_autonomy >= 1 and self._triage_service is not None and not replay:
-            triage_result = await self._triage_service.triage(finding, snapshot)
-            triage_decision_value = triage_result.decision
-            triage_reason_code_value = triage_result.reason_code
-            triage_confidence_value = triage_result.triage_confidence
-            if triage_result.decision == TRIAGE_SUPPRESS:
-                await _append_finding_audit(
-                    self._audit_store,
-                    snapshot,
-                    finding,
-                    None,
-                    SUPPRESSION_REASON_TRIAGE_SUPPRESSED,
-                    triage_decision=triage_decision_value,
-                    triage_reason_code=triage_reason_code_value,
-                    triage_confidence=triage_confidence_value,
-                    autonomy_level_at_decision=effective_autonomy,
-                    trigger_source=trigger_source,
-                )
-                self._last_dispatch_reason = SUPPRESSION_REASON_TRIAGE_SUPPRESSED
+            triage_result = await self._triage_finding(
+                self._triage_service,
+                finding,
+                snapshot,
+                now,
+                # An entity cooldown never applies to a finding with no device.
+                max(cooldown_type, cooldown_entity)
+                if finding.triggering_entities
+                else cooldown_type,
+                autonomy=effective_autonomy,
+                trigger_source=trigger_source,
+            )
+            if triage_result is None:
                 return False
+        triage_decision_value = triage_result.decision if triage_result else None
+        triage_reason_code_value = triage_result.reason_code if triage_result else None
+        triage_confidence_value = (
+            triage_result.triage_confidence if triage_result else None
+        )
 
         # Execution policy evaluation.
         canary_mode = bool(

@@ -2,6 +2,18 @@
 
 ## Agent
 
+### No test proves the handler passes a followed PIN prompt's owner into the run
+
+**What:** `_async_handle_message_active` (`conversation.py`) sets `user_id` to the speaker's memory user and `pin_owner` to the prompt's owner, but no test runs the handler: the check only searches the source text. Renaming the config key, or setting `user_id` from the prompt's owner (the leak #941's review closed), would still pass every test.
+
+**Why:** Testing specialist, third review of #941 (2026-11-09). The wiring is right today, confirmed by reading it.
+
+**How to apply:** Run the handler with a stub compiled app that captures the config, or extract a helper that builds it. For a guest's `1234` while another voice's prompt waits, assert `user_id` is the guest's, `pin_owner` is the prompt's owner and `thread_id` is the prompt's thread. Add a logged-in case with `pin_owner` None.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** None
+
 ### The PIN line describes the match at hold time; HA matches again when the confirmed call runs
 
 **What:** `describe_pending_action` resolves an intent's targets with `async_match_targets` when the call is held, and the fixed line names that match ("open every cover in Garage"). The confirmed call (`_execute_pending_action`, `agent/tools.py`) sends the held arguments, and HA matches them again at that moment. A device renamed, re-aliased or moved into the area between the prompt and the PIN reply changes what runs without changing the line the user confirmed.
@@ -759,6 +771,48 @@ v3.41.1 rather than deferred; see the TODO above.
 
 ---
 
+### The triage-suppression hold ignores the learned cooldown multiplier
+
+**What:** PR #979 holds a triage-suppressed low or medium finding for `max(cooldown_type, cooldown_entity)` (`sentinel/engine.py` `_dispatch_item`, the window passed to `_triage_finding`). Normal suppression scales the entity cooldown by the learned False Alarm multiplier (`suppression.py` `_check_entity_cooldown`, capped at `MAX_COOLDOWN_MULTIPLIER`). With type 30 min, entity 15 min and a multiplier of 8, the hold ends at 30 min, not 120, so an unchanged finding is asked again early and takes a slot from the per-run budget.
+
+**Why:** Codex adversarial pass of the PR #979 review (2026-11-09). Left as is: the cost is extra model calls, never a missed alert.
+
+**How to apply:** Compute the window with the same capped multiplier, the largest across `finding.triggering_entities`, ideally through a small helper in `suppression.py` that `_check_entity_cooldown` also uses. Add a test that a finding with a learned multiplier stays held for the scaled cooldown.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** None
+
+---
+
+### Expired triage-suppression entries are only pruned on the next suppression
+
+**What:** `_remember_triage_suppression` (`sentinel/engine.py`) drops expired entries from `_triage_suppressed` only when it stores a new one. If findings resolve, or later answers are all notify, timeout or deferred, the expired keys stay in memory. Each key holds the full triage prompt, so a burst of distinct suppressed findings stays resident until the next suppression or a restart. Growth is bounded because every insert prunes.
+
+**Why:** Codex adversarial pass of the PR #979 review (2026-11-09). Low impact, left as is.
+
+**How to apply:** Sweep expired entries once per run (at the start of `_run_once`), and drop a key on lookup in `_triage_still_suppressed` when it has expired.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** None
+
+---
+
+### A suppressed `ha_failed_logins` burst holds later bursts for up to a day
+
+**What:** `ha_failed_logins` has a constant `anomaly_id` and a 24 h posture floor, so when triage suppresses one burst, the PR #979 memory holds a later burst with an identical prompt for up to 24 h with no new triage call and no audit row. Home Assistant's own failed-login notification still shows.
+
+**Why:** Claude adversarial pass of the PR #979 review (2026-11-09). Left as is, since the model would see the same prompt and answer the same way. Lindo has not decided whether it should always be asked.
+
+**How to apply:** If it should always be asked, add `ha_failed_logins` to the never-remembered check in `_remember_triage_suppression` (next to `_CHANGE_ALERT_RULES`), with a test. If the attempt count or source should count as a change, put it in the triage prompt so the memo key changes with it.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** None
+
+---
+
 ## Sentinel Rules
 
 ### Unknown-person rules are inert on installs without face recognition
@@ -1047,20 +1101,6 @@ Since step 6 this also covers `radio_new_device_joined`, and since step 7 `netwo
 
 ---
 
-### Triage-suppressed findings never register a cooldown
-
-**What:** `_dispatch_item` returns at `sentinel/engine.py:1703` on a `TRIAGE_SUPPRESS` decision, before the `register_finding(self._suppression.state, finding, now)` call at line 1743 that updates both the per-type and per-entity cooldown maps. A standing condition -- a phone battery that stays low, a door that stays open -- is therefore re-triaged on every poll *and* every event-driven evaluation for as long as it persists, each one a paid model call plus an audit write, none of which reduce future work. Triage is also sequential in the dispatch loop, so the wasted calls delay every later finding in the cycle.
-
-**Why:** Found by the Codex adversarial pass on the triage-exposure branch (2026-09-22) and confirmed by reading the two line numbers. Latent since #262 because triage was unreachable; it became live the moment the UI switch shipped. Left out of that branch deliberately: where the cooldown should be registered is a behavior decision (a suppressed finding arguably *should* start a cooldown, but "suppressed" and "delivered" have different natural cooldown lengths), and it changes suppression semantics enough to want its own field validation.
-
-**How to apply:** Either call `register_finding` before the suppress-branch return, or give triage its own retry cooldown keyed on the finding's anomaly id so a suppressed finding is not re-triaged until the existing cooldown would have let it through. Prefer the second if a suppressed finding should still alert promptly once its condition *changes*. Pin it with a test that dispatches the same unchanged finding twice and asserts one triage call.
-
-**Effort:** S
-**Priority:** P2
-**Depends on:** None
-
----
-
 ### Level-increase PIN checks run PBKDF2 on the event loop with no attempt limit
 
 **What:** `SentinelEngine.set_autonomy_level` calls `verify_pin` (`core/utils.py`, PBKDF2-HMAC-SHA256, 120,000 iterations) synchronously from the async `sentinel_set_autonomy_level` handler, so every attempt blocks Home Assistant's event loop for the length of one hash. There is no failed-attempt counter or backoff, so the 4-digit minimum PIN can be enumerated by repeated calls.
@@ -1217,14 +1257,16 @@ Since step 6 this also covers `radio_new_device_joined`, and since step 7 `netwo
 
 ---
 
-### Bound the power-enrichment recorder walk
+### A per-run row budget for the power-enrichment walk
 
-**What:** `async_enrich_power_last_changed` fetches up to 30 days of `state_changes_during_period` rows with `limit=None` and `no_attributes=False` for every on-state power sensor, every Sentinel cycle. A high-frequency (~1 Hz) power sensor materializes millions of rows per cycle; several such sensors can exhaust memory or monopolize recorder executor workers. Pre-existing for `device_class: power` sensors; v3.21.3 marginally broadened admission (unit-only sensors). Surfaced by Codex adversarial review.
+**What:** `sentinel/power_enrichment.py` caps the recorder read at `_MAX_ROWS` (20,000) readings per sensor, with no budget shared across the sensors in a run. With nothing remembered yet (the first run after a restart, or after a unit change), every 'on' power sensor whose last off reading is far back reads its newest 1,000 and then its newest 20,000 readings, one sensor after another, in that run: 40 always-on sensors reporting every second read about 840,000 rows with attributes. Later runs read only new readings.
 
-**How to apply:** Walk history in capped descending pages (e.g. `limit=` batches, newest first) and stop at the first off-boundary; or cache the resolved on-since per entity and only re-query when the sensor drops below the off level.
+**Why:** Performance specialist, PR review of the bounded walk (2026-11-10). Lindo chose to keep the per-sensor cap only and record this, since it is a one-run cost after a restart and only for homes with many dense always-on power sensors.
 
-**Effort:** M
-**Priority:** P2
+**How to apply:** Share a run budget (about 100,000 rows) across sensors in `_enrich` and stop reading newest readings back (`_resolve_fresh`) once it is spent. A sensor past the budget gets no walk and no entry in `on_since`, so the next run picks it up; its `last_changed` stays Home Assistant's own for one more run. Test that the rows read in one run stay within the budget with many dense sensors.
+
+**Effort:** S
+**Priority:** P3
 **Depends on:** None
 
 ---
