@@ -1156,12 +1156,25 @@ async def confirm_sensitive_action(  # noqa: D417
     """
     if "configurable" not in config:
         return "Configuration not found. Please check your setup."
+    cfg = cast("ConfigurableData", config.get("configurable", {}))
+    return await confirm_pending_action(cfg, action_id, pin)
 
+
+async def confirm_pending_action(
+    cfg: ConfigurableData, action_id: str, pin: str
+) -> str:
+    """
+    Check the PIN for a pending action and run the action if it is correct.
+
+    The body of `confirm_sensitive_action`, also called by the conversation
+    agent itself for a reply that is only a PIN, so the model cannot answer
+    the PIN in its own words without checking it. Every check applies either
+    way: the reply must be the prompt's, hold the PIN, and be unspent.
+    """
     # The action must finish inside the graph's own tool timeout, counted from
     # here, so a slow device gets the "may have run" reply rather than a
     # timeout that reads as still pending.
     deadline = asyncio.get_running_loop().time() + POST_CLAIM_TIMEOUT_S
-    cfg = cast("ConfigurableData", config.get("configurable", {}))
     hass = cfg.get("hass")
     opts = cfg.get("options", {})
     pin_hash = opts.get(CONF_CRITICAL_ACTION_PIN_HASH, "")
@@ -1193,6 +1206,23 @@ async def confirm_sensitive_action(  # noqa: D417
             await _warn_if_correct_pin_refused(cfg, provided_pin)
         return refusal
 
+    correct = None
+    if (
+        pin_hash
+        and salt
+        and provided_pin.isdigit()
+        and CRITICAL_PIN_MIN_LEN <= len(provided_pin) <= CRITICAL_PIN_MAX_LEN
+    ):
+        # The hash is slow (PBKDF2): keep it off the event loop. Another
+        # confirmation can run meanwhile, so the refusal checks run again
+        # after it: a message it used up is not counted or used twice.
+        check = partial(verify_pin, provided_pin, hashed=pin_hash, salt=salt)
+        correct = await hass.async_add_executor_job(check) if hass else check()
+        refusal, _ = _confirmation_refusal(
+            cfg, action, resolved_action_id, provided_pin
+        )
+        if refusal:
+            return refusal
     attempts_before = action.get("attempts", 0)
     pin_err = _validate_pin_for_action(
         provided_pin=provided_pin,
@@ -1200,6 +1230,7 @@ async def confirm_sensitive_action(  # noqa: D417
         salt=salt,
         action=action,
         hass=hass,
+        correct=correct,
     )
     if pin_err:
         attempts = action.get("attempts", 0)
@@ -1279,15 +1310,21 @@ def _load_pending_action(
     return action, None
 
 
-def _validate_pin_for_action(
+def _validate_pin_for_action(  # noqa: PLR0913
     *,
     provided_pin: str,
     pin_hash: str,
     salt: str,
     action: dict[str, Any],
     hass: HomeAssistant | None = None,
+    correct: bool | None = None,
 ) -> str | None:
-    """Validate PIN format and value against stored hash/salt."""
+    """
+    Validate PIN format and value against stored hash/salt.
+
+    ``correct`` is the hash check's result when the caller already ran it off
+    the event loop; None runs it here.
+    """
     if not pin_hash or not salt:
         return pin_msg(hass, "pin_not_configured")
     if not provided_pin.isdigit() or not (
@@ -1302,7 +1339,9 @@ def _validate_pin_for_action(
     attempts = int(action.get("attempts", 0) or 0)
     if attempts >= MAX_PIN_ATTEMPTS:
         return pin_msg(hass, "pin_too_many_attempts")
-    if not verify_pin(provided_pin, hashed=pin_hash, salt=salt):
+    if correct is None:
+        correct = verify_pin(provided_pin, hashed=pin_hash, salt=salt)
+    if not correct:
         action["attempts"] = attempts + 1
         return pin_msg(hass, "pin_incorrect")
     return None

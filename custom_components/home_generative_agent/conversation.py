@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-    from .agent.helpers import PinReply
+    from .agent.helpers import ConfigurableData, PinReply
 
 import homeassistant.util.dt as dt_util
 import voluptuous as vol
@@ -48,6 +48,7 @@ from langchain_core.messages import (
 from .agent.automation_targets import normalize_notify_service
 from .agent.graph import workflow
 from .agent.helpers import (
+    PIN_ANSWER_KWARG,
     PIN_OUTCOME_FAILED,
     PIN_OUTCOME_UNKNOWN,
     active_llm_api_ids,
@@ -59,6 +60,7 @@ from .agent.helpers import (
     keep_pin_prompts,
     langchain_tool_parameters_json,
     llm_api_is_supported,
+    pin_only_reply_action,
     prompts_awaiting_reply,
     remote_house_words,
     reopen_ended_prompt,
@@ -87,6 +89,7 @@ from .agent.tools import (
     add_automation,
     alarm_control,
     audit_home_security,
+    confirm_pending_action,
     confirm_sensitive_action,
     forget_memory,
     get_and_analyze_camera_image,
@@ -183,6 +186,10 @@ _TOOL_INDEX_PAGE_SIZE = 100
 # What HA's ChatLog.continue_conversation reads as "keep listening": the reply
 # ends with a question mark (Latin, Greek or fullwidth).
 _CONTINUE_MARKS = ("?", ";", "\uff1f")
+
+# The user's message as a PIN turn answered without the model is stored in
+# its thread: the PIN stays out of the conversation history.
+_PIN_REPLY_IN_THREAD = "[PIN]"
 
 
 def _recommit_final_assistant_content(chat_log: conversation.ChatLog) -> None:
@@ -2092,6 +2099,99 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
         )
         return conversation.async_get_result_from_chat_log(user_input, chat_log)
 
+    async def _async_confirm_pin_reply(
+        self,
+        user_input: conversation.ConversationInput,
+        chat_log: conversation.ChatLog,
+        pin_reply: PinReply,
+        cfg: ConfigurableData,
+    ) -> conversation.ConversationResult | None:
+        """
+        Check a reply that is only a PIN without the model, and answer it.
+
+        A local model answered such a reply "wrong PIN" in its own words without
+        calling the check, so a correct PIN was turned away (field test
+        2026-11-10). The check is the model's tool itself, with every condition
+        it applies (`confirm_pending_action`), and the reply is the fixed PIN
+        lines. An action dropped before its PIN was checked (it expired, or can
+        no longer run) is answered in fixed words too: the model would have
+        nothing to confirm and could only answer in its own. Returns None, for
+        the model to answer, when the PIN was refused before the check and the
+        action still waits (another user's action, too many attempts).
+        """
+        pending_actions = cfg.get("pending_actions", {})
+        found = pin_only_reply_action(pending_actions, pin_reply)
+        if found is None:
+            return None
+        action_id, pin = found
+        await confirm_pending_action(cfg, action_id, pin)
+        if pin_reply.confirmed or pin_reply.spent:
+            await self._async_add_pin_lines(
+                chat_log, pending_actions, pin_reply, streamed=False
+            )
+        elif action_id not in pending_actions:
+            await self._async_add_spoken_reply(
+                chat_log,
+                " ".join(
+                    pin_msg(self.hass, key)
+                    for key in (
+                        "pending_action_not_found_or_expired",
+                        "pin_request_again_line",
+                    )
+                ),
+            )
+        else:
+            _LOGGER.debug("PIN reply not checked directly; the model answers it.")
+            return None
+        await self._async_record_pin_turn(
+            cfg.get("thread_id", ""),
+            # Only an accepted PIN answered the request; after a wrong one the
+            # request can still end unconfirmed (`_mark_ended_pin_requests`).
+            action_id if pin_reply.confirmed else None,
+            chat_log,
+        )
+        return conversation.async_get_result_from_chat_log(user_input, chat_log)
+
+    async def _async_record_pin_turn(
+        self, thread_id: str, action_id: str | None, chat_log: conversation.ChatLog
+    ) -> None:
+        """
+        Add a PIN turn answered without the model to its thread, PIN masked.
+
+        The model then reads what happened rather than its own earlier replies,
+        and a request whose PIN was accepted (``action_id``) reads as answered,
+        not ended unconfirmed (`PIN_ANSWER_KWARG`). The PIN itself stays out of
+        the stored thread.
+        """
+        reply = chat_log.content[-1] if chat_log.content else None
+        if not isinstance(reply, conversation.AssistantContent) or not reply.content:
+            return
+        app = workflow.compile(
+            store=self.entry.runtime_data.store,
+            checkpointer=self.entry.runtime_data.checkpointer,
+        )
+        try:
+            await app.aupdate_state(
+                {"configurable": {"thread_id": thread_id}},
+                {
+                    "messages": [
+                        HumanMessage(content=_PIN_REPLY_IN_THREAD),
+                        AIMessage(
+                            content=reply.content,
+                            additional_kwargs=(
+                                {PIN_ANSWER_KWARG: action_id} if action_id else {}
+                            ),
+                        ),
+                    ]
+                },
+                as_node="summarize_and_remove_messages",
+            )
+        except Exception:
+            # The reply is already given; only the history misses the turn.
+            _LOGGER.warning(
+                "Could not add the PIN turn to the conversation thread.", exc_info=True
+            )
+
     async def _async_add_pin_lines(
         self,
         chat_log: conversation.ChatLog,
@@ -2319,6 +2419,39 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
                 response=intent_response, conversation_id=conversation_id
             )
 
+        # Resolve user name (None means automation)
+        user_name = None
+        # A voice satellite or an automation carries no user: not an admin.
+        requester_is_admin = False
+        if (
+            user_input.context
+            and user_input.context.user_id
+            and (user := await hass.auth.async_get_user(user_input.context.user_id))
+        ):
+            user_name = user.name
+            requester_is_admin = bool(user.is_admin)
+        # A user name of None indicates an automation is being run.
+        memory_user = self._memory_user(user_name, speaker)
+        clean_user_name = memory_store_user(memory_user)
+        pin_owner = self._pin_owner(user_name, waiting_prompt)
+
+        if result := await self._async_confirm_pin_reply(
+            user_input,
+            chat_log,
+            pin_reply,
+            {
+                "hass": hass,
+                "options": options,
+                "pending_actions": runtime_data.pending_actions,
+                "thread_id": thread_id,
+                "user_id": clean_user_name,
+                "pin_owner": pin_owner,
+                "pin_reply": pin_reply,
+                "ha_llm_api": llm_api or None,
+            },
+        ):
+            return result
+
         # The schema-first path adds its whole reply at once, which a pipeline
         # already streaming (started by the acknowledgement) would never speak.
         ack = _voice_tool_acknowledgement(options, user_input)
@@ -2336,18 +2469,6 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
         await self._async_index_tools(llm_context, runtime_data, llm_api)
 
         tools, langchain_tools = self._async_get_all_tools(llm_api.apis)
-
-        # Resolve user name (None means automation)
-        user_name = None
-        # A voice satellite or an automation carries no user: not an admin.
-        requester_is_admin = False
-        if (
-            user_input.context
-            and user_input.context.user_id
-            and (user := await hass.auth.async_get_user(user_input.context.user_id))
-        ):
-            user_name = user.name
-            requester_is_admin = bool(user.is_admin)
 
         prompt, volatile_prompt = self._async_render_system_prompt(
             llm_context, user_name, llm_api, has_tools=bool(tools)
@@ -2384,15 +2505,11 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
                 response=intent_response, conversation_id=conversation_id
             )
 
-        # A user name of None indicates an automation is being run.
-        memory_user = self._memory_user(user_name, speaker)
-        clean_user_name = memory_store_user(memory_user)
-
         app_config: RunnableConfig = {
             "configurable": {
                 "thread_id": thread_id,
                 "user_id": clean_user_name,
-                "pin_owner": self._pin_owner(user_name, waiting_prompt),
+                "pin_owner": pin_owner,
                 "pin_reply": pin_reply,
                 "requester_is_admin": requester_is_admin,
                 "chat_model": base_llm,

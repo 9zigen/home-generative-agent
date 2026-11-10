@@ -99,6 +99,7 @@ from .helpers import (
     ALARM_DOMAIN,
     CONFIRM_TOOL_NAME,
     INTENT_NAME_ALL,
+    PIN_ANSWER_KWARG,
     PIN_REFUSAL_ENDS_TURN,
     REMOTE_TOOL,
     PinReply,
@@ -3817,9 +3818,40 @@ def _mark_ended_pin_requests(
             msg.model_copy(update={"content": json.dumps(ended, ensure_ascii=False)})
         )
         following = messages[index + 1] if index + 1 < len(messages) else None
-        if isinstance(following, HumanMessage):
+        if isinstance(following, HumanMessage) and not _pin_answered_later(
+            messages[index + 1 :], data.get("action_id")
+        ):
             marked.append(AIMessage(content=_ENDED_PIN_REQUEST_REPLY))
     return marked
+
+
+def _pin_answered_later(messages: Sequence[AnyMessage], action_id: Any) -> bool:
+    """
+    Return True when a later message records the PIN check for the action.
+
+    The user's next message answered the prompt, so the request did not end
+    unconfirmed: the conversation agent's own check (`PIN_ANSWER_KWARG` on the
+    reply it stored) or the model's confirmation that ran the action.
+    """
+    for msg in messages:
+        if msg.additional_kwargs.get(PIN_ANSWER_KWARG) == action_id:
+            return True
+        if (
+            isinstance(msg, ToolMessage)
+            and base_tool_name(msg.name or "") == CONFIRM_TOOL_NAME
+            and isinstance(msg.content, str)
+        ):
+            try:
+                data = json.loads(msg.content)
+            except ValueError:
+                continue
+            if (
+                isinstance(data, dict)
+                and data.get("status") == "completed"
+                and data.get("action_id") == action_id
+            ):
+                return True
+    return False
 
 
 async def _call_model(

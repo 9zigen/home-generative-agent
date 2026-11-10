@@ -545,6 +545,12 @@ _PROMPT_STATE = frozenset(
     }
 )
 
+# Key in `additional_kwargs` of the reply the conversation agent stores after
+# checking a PIN-only reply itself (`pin_only_reply_action`): the id of the
+# action whose PIN it checked, so the model's input does not call that request
+# ended unconfirmed (graph.py, `_mark_ended_pin_requests`).
+PIN_ANSWER_KWARG = "hga_pin_answer"
+
 # Hard cap on concurrently pending confirmations, so an unconfirmed challenge
 # loop cannot grow the store without bound.
 MAX_PENDING_ACTIONS = 16
@@ -1357,6 +1363,35 @@ def unreadable_pin_reply(
     return digits is not None and not (
         CRITICAL_PIN_MIN_LEN <= len(digits) <= CRITICAL_PIN_MAX_LEN
     )
+
+
+def pin_only_reply_action(
+    pending_actions: Mapping[str, dict[str, Any]], reply: PinReply
+) -> tuple[str, str] | None:
+    """
+    Return the action this message answers with only a PIN, and the PIN.
+
+    The message says nothing but one number of PIN length and PIN labels
+    ("1234", "PIN code 1 2 3 4"), and exactly one prompt waits for this turn's
+    reply. The conversation agent then checks the PIN itself: a local model
+    answered such a reply "wrong PIN" without calling the check, its history
+    holding an earlier wrong one (field test 2026-11-10). Anything else, and a
+    reply that two prompts wait for, goes to the model as before.
+    """
+    if not _only_a_pin_reply(reply.text):
+        return None
+    digits = pin_digits(reply.text)
+    if (
+        digits is None
+        or not CRITICAL_PIN_MIN_LEN <= len(digits) <= CRITICAL_PIN_MAX_LEN
+    ):
+        return None
+    waiting = [
+        key
+        for key, action in pending_actions.items()
+        if action.get("reply_turn") == reply.turn_id
+    ]
+    return (waiting[0], digits) if len(waiting) == 1 else None
 
 
 def keep_pin_prompt(action: dict[str, Any], reply: PinReply | None) -> bool:
