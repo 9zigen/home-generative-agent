@@ -1255,6 +1255,10 @@ def register_pending_action(
             elif existing.get("turn_id") == action.get("turn_id"):
                 return None
             carried["attempts"] = int(existing.get("attempts", 0) or 0)
+            # The PIN checks another voice's sentences took (see the
+            # conversation agent's _async_turn_thread) are kept the same way,
+            # so repeating the request does not give them a fresh budget.
+            carried["sentence_checks"] = int(existing.get("sentence_checks", 0) or 0)
             pending_actions.pop(key, None)
 
     while len(pending_actions) >= MAX_PENDING_ACTIONS:
@@ -1391,6 +1395,42 @@ def start_pin_turn(
             if action.get("limit_reached"):
                 _note_ended_prompt(ended_prompts, action, now)
     return reply
+
+
+def _only_a_pin_reply(text: str) -> bool:
+    """
+    Return True when every word of the text is a digit, a joiner or a PIN label.
+
+    Punctuation and spacing do not count, so "PIN-code: 1, 2, 3, 4." qualifies;
+    whether the digits make one number is pin_digits' call. A currency, math or
+    other symbol that gives a number another meaning ("It's $1234", "50%") does,
+    and so does "number" or "code" unless it follows "PIN".
+    """
+    previous = ""
+    for token in _TOKEN_RE.findall(_ascii_digits(text)):
+        if not re.match(r"\w", token):
+            # A run of whitespace is one token, and category() takes one
+            # character.
+            if token.isspace():
+                continue
+            if token in _NOT_PIN_SYMBOLS or unicodedata.category(token) in {
+                "Sc",
+                "Sm",
+            }:
+                return False
+            continue
+        lowered = token.casefold()
+        if not (
+            _is_number(token)
+            or lowered in _SPOKEN_DIGITS
+            or lowered in _DIGIT_JOINERS
+            or lowered == _SPOKEN_ZERO
+            or lowered in _PIN_LABEL_WORDS
+            or (lowered in _AFTER_PIN_WORDS and previous in _PIN_NUMBER_AFTER)
+        ):
+            return False
+        previous = lowered
+    return True
 
 
 def waiting_pin_prompt(
