@@ -18,6 +18,7 @@ from custom_components.home_generative_agent.agent.helpers import (
     pin_only_reply_action,
     register_pending_action,
     start_pin_turn,
+    waiting_pin_prompt,
 )
 from custom_components.home_generative_agent.const import (
     CONF_CRITICAL_ACTION_PIN_HASH,
@@ -399,3 +400,22 @@ def test_a_full_stop_still_ends_a_number_in_a_sentence(text: str) -> None:
     )
 
     assert len(_number_runs(text)) == 2
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["my PIN is  3851", "3851  please", "PIN:\t\t3851", "3851\r\n", "  3851  "],
+)
+def test_a_pin_reply_with_a_whitespace_run_is_read(text: str) -> None:
+    """A run of whitespace is one token; it must not reach category()."""
+    pending: dict[str, Any] = {}
+    action_id = _held(pending)
+    reply = start_pin_turn(pending, "conv1", text)
+
+    assert pin_only_reply_action(pending, reply) == (action_id, PIN)
+
+
+@pytest.mark.parametrize("text", ["  2026 is the year", "set it to  1500\r\n"])
+def test_a_whitespace_run_with_nothing_pending_reads_safely(text: str) -> None:
+    assert waiting_pin_prompt({}, "conv1", text) is None
+    assert pin_only_reply_action({}, start_pin_turn({}, "conv1", text)) is None

@@ -981,6 +981,10 @@ def _only_a_pin_reply(text: str) -> bool:
     previous = ""
     for token in _TOKEN_RE.findall(_ascii_digits(text)):
         if not re.match(r"\w", token):
+            # A run of whitespace is one token, and category() takes one
+            # character (#981 review).
+            if token.isspace():
+                continue
             if token in _NOT_PIN_SYMBOLS or unicodedata.category(token) in {
                 "Sc",
                 "Sm",
