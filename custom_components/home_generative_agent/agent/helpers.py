@@ -1205,18 +1205,22 @@ def register_pending_action(
     newest prompt in the conversation (`waiting_pin_prompt`), so with two from
     overlapping turns it could confirm the one its speaker did not mean. A
     voice's new request drops another voice's prompt, and the most failed
-    attempts among the dropped carry over, so a request from another voice
-    does not reset the limit.
+    attempts and sentence checks among the dropped carry over, so a request
+    from another voice does not reset either limit.
     """
     now = dt_util.utcnow()
     thread_id = action.get("thread_id")
     carried: dict[str, Any] = {}
     other_attempts = 0
+    other_checks = 0
     for key, existing in list(pending_actions.items()):
         if pending_action_expired(existing, now):
             pending_actions.pop(key, None)
         elif _other_voices_prompt(existing, action):
             other_attempts = max(other_attempts, int(existing.get("attempts", 0) or 0))
+            other_checks = max(
+                other_checks, int(existing.get("sentence_checks", 0) or 0)
+            )
             pending_actions.pop(key, None)
         elif (
             thread_id
@@ -1267,6 +1271,9 @@ def register_pending_action(
     action_id = ulid.ulid_now()
     entry = {**action, "attempts": 0, **carried, "created_at": now.isoformat()}
     entry["attempts"] = max(int(entry["attempts"] or 0), other_attempts)
+    checks = max(int(entry.get("sentence_checks", 0) or 0), other_checks)
+    if checks:
+        entry["sentence_checks"] = checks
     pending_actions[action_id] = entry
     return action_id
 
@@ -1315,7 +1322,8 @@ def reopen_ended_prompt(
     own words without calling the tool: the microphone closes and a PIN said
     next has nothing to confirm. Said again within ENDED_PROMPT_REOPEN_WINDOW,
     in the same words on the same thread, the request gets the held action back
-    as a new prompt, with its failed attempts, so this never resets the limit.
+    as a new prompt, with its failed attempts and the PIN checks another
+    voice's sentences took, so this never resets either limit.
     A prompt the user moved on from is not kept, so it is never reopened.
 
     Returns the new action's ID, or None when nothing was reopened.
@@ -1338,10 +1346,10 @@ def reopen_ended_prompt(
     action_id = register_pending_action(pending_actions, action)
     if action_id is not None:
         reopened = pending_actions[action_id]
-        reopened["attempts"] = max(
-            int(reopened.get("attempts", 0) or 0),
-            int(record.get("attempts", 0) or 0),
-        )
+        for name in ("attempts", "sentence_checks"):
+            count = max(int(reopened.get(name, 0) or 0), int(record.get(name, 0) or 0))
+            if count:
+                reopened[name] = count
     return action_id
 
 
@@ -1395,42 +1403,6 @@ def start_pin_turn(
             if action.get("limit_reached"):
                 _note_ended_prompt(ended_prompts, action, now)
     return reply
-
-
-def _only_a_pin_reply(text: str) -> bool:
-    """
-    Return True when every word of the text is a digit, a joiner or a PIN label.
-
-    Punctuation and spacing do not count, so "PIN-code: 1, 2, 3, 4." qualifies;
-    whether the digits make one number is pin_digits' call. A currency, math or
-    other symbol that gives a number another meaning ("It's $1234", "50%") does,
-    and so does "number" or "code" unless it follows "PIN".
-    """
-    previous = ""
-    for token in _TOKEN_RE.findall(_ascii_digits(text)):
-        if not re.match(r"\w", token):
-            # A run of whitespace is one token, and category() takes one
-            # character.
-            if token.isspace():
-                continue
-            if token in _NOT_PIN_SYMBOLS or unicodedata.category(token) in {
-                "Sc",
-                "Sm",
-            }:
-                return False
-            continue
-        lowered = token.casefold()
-        if not (
-            _is_number(token)
-            or lowered in _SPOKEN_DIGITS
-            or lowered in _DIGIT_JOINERS
-            or lowered == _SPOKEN_ZERO
-            or lowered in _PIN_LABEL_WORDS
-            or (lowered in _AFTER_PIN_WORDS and previous in _PIN_NUMBER_AFTER)
-        ):
-            return False
-        previous = lowered
-    return True
 
 
 def waiting_pin_prompt(

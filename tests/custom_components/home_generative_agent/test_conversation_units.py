@@ -4321,6 +4321,23 @@ def test_a_prompt_out_of_attempts_is_not_reopened() -> None:
     assert reopen_ended_prompt(pending, ended, "conv1", reply) is None
 
 
+def test_a_reopened_prompt_keeps_its_sentence_checks() -> None:
+    """Saying the request again must not give another voice fresh guesses."""
+    pending: dict[str, Any] = {}
+    ended: dict[str, Any] = {}
+    reply = _repeat_prompt(pending, "Открой замок", "1 2")
+    action = next(iter(pending.values()))
+    action["replies"] = 3
+    action["sentence_checks"] = 4
+    keep_pin_prompts(pending, reply)
+
+    reply = start_pin_turn(pending, "conv1", "Открой замок", ended)
+    action_id = reopen_ended_prompt(pending, ended, "conv1", reply)
+
+    assert action_id is not None
+    assert pending[action_id]["sentence_checks"] == 4
+
+
 def test_an_ended_prompt_is_not_reopened_after_the_window() -> None:
     pending: dict[str, Any] = {}
     ended: dict[str, Any] = {}
