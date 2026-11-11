@@ -14,6 +14,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from custom_components.home_generative_agent.agent import graph
 from custom_components.home_generative_agent.agent.helpers import (
     PIN_ANSWER_KWARG,
+    SENTENCE_PIN_KEY,
     disclose_pin_prompts,
     pin_only_reply_action,
     register_pending_action,
@@ -74,7 +75,6 @@ def _held(pending: dict[str, Any], thread_id: str = "conv1") -> str:
         "Пин-код три восемь пять один",
         "три, восемь, пять, один.",
         "да, 3851",
-        "пароль три восемь пять один",
         "yes, PIN number 3851 please",
     ],
 )
@@ -94,7 +94,8 @@ def test_a_pin_only_reply_names_its_action_and_pin(text: str) -> None:
         "3851 and 1234",  # two numbers
         "never mind",
         "$3851",  # an amount
-        "my number is 3851",  # not a PIN label without "PIN" or "code"
+        "my number is 3851",  # not a PIN label without "PIN"
+        "пароль три восемь пять один",  # not a label: the model answers
     ],
 )
 def test_other_replies_go_to_the_model(text: str) -> None:
@@ -419,3 +420,23 @@ def test_a_pin_reply_with_a_whitespace_run_is_read(text: str) -> None:
 def test_a_whitespace_run_with_nothing_pending_reads_safely(text: str) -> None:
     assert waiting_pin_prompt({}, "conv1", text) is None
     assert pin_only_reply_action({}, start_pin_turn({}, "conv1", text)) is None
+
+
+def test_a_sentence_whose_pin_the_agent_matched_is_checked_directly() -> None:
+    """Followed from another voice by its hash, it skips the model too."""
+    pending: dict[str, Any] = {}
+    action_id = _held(pending)
+    text = "sure, 3851, thanks"
+    pending[action_id][SENTENCE_PIN_KEY] = text
+    reply = start_pin_turn(pending, "conv1", text)
+
+    assert pin_only_reply_action(pending, reply) == (action_id, PIN)
+
+
+def test_only_the_matched_sentence_is_checked_directly() -> None:
+    pending: dict[str, Any] = {}
+    action_id = _held(pending)
+    pending[action_id][SENTENCE_PIN_KEY] = "sure, 3851, thanks"
+    reply = start_pin_turn(pending, "conv1", "sure, 3851, please")
+
+    assert pin_only_reply_action(pending, reply) is None
