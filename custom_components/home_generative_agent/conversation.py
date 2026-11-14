@@ -150,6 +150,7 @@ from .core.conversation_helpers import (
 )
 from .core.memories import memory_user as memory_store_user
 from .core.pipeline_guard import async_check_pin_pipeline_conflict
+from .core.spoken_time import spoken_time
 from .core.utils import (
     builds_differ,
     extract_final,
@@ -1584,7 +1585,11 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
         if llm_api:
             stable_parts.append(llm_api.api_prompt)
 
-        return "\n".join(stable_parts), volatile.strip()
+        # Per turn, like the date/time line: it changes every minute.
+        spoken = spoken_time(llm_context.language, dt_util.now())
+        return "\n".join(stable_parts), "\n".join(
+            filter(None, [volatile.strip(), spoken])
+        )
 
     async def _async_speaker(self, device_id: str | None) -> Speaker | None:
         """
