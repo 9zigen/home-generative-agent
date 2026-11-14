@@ -455,6 +455,18 @@ v3.41.1 rather than deferred; see the TODO above.
 
 ---
 
+### Per-credential provider clients branch on provider type in three places
+
+**What:** `async_setup_entry` (`__init__.py`) decides per provider type in three separate places how a provider's own credential becomes a client: the own-client builders (`_build_openai_client`, `_build_gemini_client`, `_async_build_anthropic_client`, `_build_compatible_client`), `_model_instance_for_provider` (which type client to fall back to), and `_embedding_credential` (OpenAI and Gemini only). A new keyed provider type has to be added to all three plus `KEYED_PROVIDER_TYPES` in `core/subentry_resolver.py`.
+
+**Why:** Maintainability and Simplification specialists, #970 review cycle 1 (2026-11-13). Lindo chose to record it rather than refactor in the #970 PR. The behaviour is correct and tested today.
+
+**How to apply:** One table keyed by provider type holding the builder, the type client and whether it embeds; drive the own-client loop, the model lookup and the embedding key from it. Keep `test_fallback_setup.py`'s #970 tests green; they cover each branch.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** None
+
 ### Mixed-provider fallback chains: lossy schema for capable fallbacks, schema 400s do not advance the chain
 
 **What:** `_bind_model_tools` now re-runs the provider-gated schema passes per chain member (`_tools_for_chain_member`, `agent/graph.py`), which fixed the field failure (Ollama primary, Gemini fallback, `any_of[0].required` 400, 2026-10-03). Two leftovers: (1) the passes are subtractive and run on the primary's already-shaped list, so an OpenAI/Anthropic/Gemini primary still hands its lossy flattened or sanitized schema to a union-capable fallback (Ollama); (2) `_is_retryable` (`core/fallback.py`) does not classify an invalid-function-schema 400 as a chain-advance error, so a novel rejected shape on a middle member hard-fails the wrapper and relies on the graph-level drop-and-retry, which re-walks the chain from the primary.
@@ -626,19 +638,6 @@ v3.41.1 rather than deferred; see the TODO above.
 **Why:** Pre-existing: the old per-entity notices had the same exposure. Found by the Claude adversarial pass in review 3 of #791. Left out of #791 to keep that a flood fix.
 
 **How to apply:** Escape `\[]()*_` and backticks in names before they go into any persistent notification (one helper, used by the baseline notices and anywhere else Sentinel puts an entity name in Markdown), or wrap names in code spans. Pin it with a test whose friendly name holds a link.
-
-**Effort:** S
-**Priority:** P3
-
----
-
-### A Sentinel batch held at unload is never sent but is audited as delivered
-
-**What:** `SentinelNotifier.async_notify` (`sentinel/notifier.py`) holds non-high findings past the rate limit in `_held_batch` and returns True, so the engine audits them `not_suppressed`. `stop()` cancels the batch timer without flushing, so findings held when the entry unloads or reloads are never pushed, yet they stay counted in the daily digest and the health sensor's notification KPIs, and are protected from eviction. A batch summary that does go out also carries no per-finding action buttons.
-
-**Why:** Pre-existing; found in the review of the audit store fix (Claude adversarial and Codex both flagged it). Rare: it needs a reload inside the 30-second batch window after a rate-limit burst. The engine also persists the finding's pending prompt before the push, so the lost finding stays held for the prompt TTL (4 h) instead of retrying after its cooldown; since #723 made `entity_state_duration` / `entity_staleness` ids stable within an episode, those standing conditions are held this way too (Codex, #723 review).
-
-**How to apply:** Either flush `_held_batch` from `stop()` (schedule `_async_flush_batch` before clearing the handle), or return a third state for held findings and audit them under a distinct reason code that the batch flush settles; either way, resolve the pending prompt of a finding whose push never left. Pin it with a test that reloads with a held batch.
 
 **Effort:** S
 **Priority:** P3
@@ -1983,6 +1982,32 @@ label pair ("Server URL" vs "Base URL").
 
 ## Model Providers
 
+### The Responses API's assistant phase is not kept between turns
+
+**What:** Newer OpenAI models (codex models from `gpt-5.3-codex`) tag assistant output with a `phase` (`commentary` vs `final_answer`) and expect it replayed. The `v0` output format drops it on a streamed reply, and `agent/graph.py` `_call_model` checkpoints each reply as text plus tool calls, so the next request loses the distinction between intermediate commentary and the final answer.
+
+**Why:** Raised by the Codex pass of the GPT-6 Responses API review (2026-11-11). No GPT-6 model observed needing it; the effect is on answer quality for codex models routed to the Responses API, not a request failure.
+
+**How to apply:** Same prerequisite as the reasoning replay entry below: `responses/v1` output plus a `_call_model` that keeps the reply's blocks, with a strip step for non-OpenAI providers. Verify live on a codex model that a commentary message is replayed with its phase.
+
+**Effort:** M
+**Priority:** P3
+
+---
+
+### GPT-6 reasoning is not replayed across tool turns
+
+**What:** `core/openai_client.py` (`StatelessReasoningChatOpenAI`) drops reasoning items from every OpenAI Responses request and from the reply, so after a tool result a GPT-6 model reasons afresh. OpenAI's guidance is to pass reasoning items back with tool outputs, which saves tokens and keeps the model's plan across a tool loop.
+
+**Why:** The client keeps replies in langchain-openai's `v0` output format so a history checkpointed on OpenAI still converts for an Ollama, Anthropic or Gemini fallback. `v0` holds one reasoning item per message in `additional_kwargs["reasoning"]`, and GPT-6 often returns several per reply (4-8 on a multi-step tool task, live 2026-11-11). Streaming concatenates their `encrypted_content`, and the next tool turn gets 400 `invalid_encrypted_content` (langchain-openai 1.6.7). With `store=False`, OpenAI returns the encrypted copy whether or not `include` asks for it, so leaving `include` out does not avoid it. Note the agent graph never stored the items anyway: `_call_model` (`agent/graph.py`) checkpoints each reply as `AIMessage(content=text, tool_calls=...)`, dropping `additional_kwargs`, so the 400 was reproduced with a standalone langchain loop, not through Home Assistant.
+
+**How to apply:** Either (a) drop the request filter once langchain-openai fixes the `v0` merge (not yet reported upstream: the 2026-11-11 report was auto-closed because it was not filed through the GitHub web form; link the issue here once it is refiled) and a fixed release keeps each item (e.g. a list under `additional_kwargs["reasoning"]`), or (b) switch the client to `output_version="responses/v1"`, which kept every item intact and replayed cleanly over 15 live turns, make `_call_model` keep the reasoning blocks in the checkpointed reply, and add a step that strips `reasoning`/`function_call` blocks before a history reaches a non-OpenAI provider, summarization or any text consumer (the `responses/v1` blocks fail Ollama's converter with "Unsupported message content type"). Prove it live: the scratchpad energy-schedule prompt on `gpt-6-luna` at high effort reproduces the 400 within four conversations.
+
+**Effort:** M
+**Priority:** P2
+
+---
+
 ### Embedding calls and budget-less callers are not covered by stall detection
 
 **What:** #828 gives each chat, VLM and summarization chain member a share of the caller's budget and counts its timeouts toward a stall. `FallbackEmbeddings` (`core/fallback.py`) has neither: embedding calls carry no caller budget (`generate_embeddings` in `core/utils.py` sets no timeout) and the wrapper does not consult `ProviderStallTracker`. Calls made without `model_call_budget` (the startup tool-index build, the per-turn tool-index delta, `analyze_image` called as an agent tool) also get no per-member timeout, and `ChatOllama`/`OllamaEmbeddings` are built with no httpx timeout (`_ollama_httpx_client_kwargs` in `__init__.py`), so a hung Ollama server can still hold those calls indefinitely.
@@ -2148,6 +2173,20 @@ label pair ("Server URL" vs "Base URL").
 
 **Effort:** S
 **Priority:** P2
+**Depends on:** —
+
+---
+
+### A Sentinel write already under way when its stop gives up still lands
+
+**What:** The #988 `StopLatch` (`core/stop_latch.py`) is checked before a write or action starts. A left-behind run's save, database commit or service call that was already in flight when the stop stopped waiting still finishes: a suppression, inventory or discovery `Store.async_save` can then overwrite the reloaded entry's file, or recreate an inventory removing Sentinel has just deleted; a baseline transaction already committing commits; an auto-execute call already running actuates, and its audit row and cooldown are then refused; a notification button handler already running when the notifier stops has its closing saves refused (the latch warning then names a write it did not start). Pushes from a left-behind run are deliberately not latched (a refused push loses an alert whose cooldown was saved earlier).
+
+**Why:** Codex adversarial pass, review cycle 2 of the #988 PR (2026-11-12); reproduced with controlled probes. Lindo chose to ship the latch and record this: a left-behind run is almost always stuck in an LLM call, so its writes start after the close and are refused, and the window is a write in flight at that exact moment.
+
+**How to apply:** Give each per-setup store (suppression, audit, auth and network inventory, discovery, proposal) a pending-write tracker and have `async_unload_entry` and the Sentinel-removal path (`_forget_network_audit`) drain it, bounded, after the engine stops and before the replacement setup or the inventory reset runs. For the baseline, hold the transaction's commit behind the same drain. Track `ActionHandler` tasks in the notifier and wait for them in `stop()`. Record an auto-execute intent before dispatch so a completed action is audited independently of the closed run.
+
+**Effort:** M
+**Priority:** P3
 **Depends on:** —
 
 ---

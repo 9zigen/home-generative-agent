@@ -16,6 +16,7 @@ from custom_components.home_generative_agent.agent.helpers import (
     PIN_ANSWER_KWARG,
     SENTENCE_PIN_KEY,
     disclose_pin_prompts,
+    end_pin_turn,
     pin_only_reply_action,
     register_pending_action,
     start_pin_turn,
@@ -195,7 +196,9 @@ async def test_a_wrong_pin_is_counted_and_asked_again_in_fixed_words(
     # Not tagged as answered: the request can still end unconfirmed.
     assert [r[1] for r in recorded] == [None]
 
-    # The retry is checked the same way.
+    # The turn's end hands the kept prompt to the next message, and the retry
+    # is checked the same way.
+    end_pin_turn(pending, reply.turn_id)
     result, _chat_log, reply = await _answer(monkeypatch, entity, cfg, PIN)
     assert api.calls == ["HassTurnOff"]
     assert result == 'PIN accepted: unlock "Front Door".'

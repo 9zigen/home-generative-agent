@@ -156,11 +156,13 @@ def active_llm_api_ids(options: Mapping[str, Any]) -> list[str]:
     """
     Return the LLM API ids to expose, defaulting to Assist when unset.
 
-    Single definition on purpose.  The options flow *deletes* the key when no
-    API is selected (``_cleanup_none_llm_api`` in ``config_flow.py``), so an
-    absent key is a normal state meaning "the recommended default", not "no
-    APIs at all".  Every reader must apply that same default, because they are
-    not independent: ``conversation.py`` derives
+    Single definition on purpose.  The options flow refuses an empty
+    selection, and the v6.2 migration writes the Assist default where an older
+    flow had deleted the key or stored ``[]`` (issue #949), so after setup the
+    key is present and non-empty unless a programmatic options update wrote
+    otherwise.  An absent key still means "the recommended default",
+    not "no APIs at all", and every reader must apply that same default,
+    because they are not independent: ``conversation.py`` derives
     ``ConversationEntityFeature.CONTROL`` from this, and Home Assistant reads
     that feature flag to decide whether its built-in intent handler may take
     control commands *before* the agent ever sees them
@@ -472,6 +474,9 @@ class ConfigurableData(TypedDict, total=False):
     thread_id: str
     # The satellite conversation of a voice's turn, else None (#974).
     voice_conversation: str | None
+    # The thread of the voice that spoke, which a PIN-only reply may have left
+    # for another voice's: voices are told apart by it (#1001).
+    voice_thread: str | None
     # The user a reply that follows a voice's PIN prompt is checked as.
     pin_owner: str | None
     # The user's message for this turn. A PIN confirmation is accepted only
@@ -501,10 +506,47 @@ class PinReply:
     # in words the model did not choose, and how it ended (`outcome`).
     confirmed: str = ""
     outcome: str = ""
+    # Why `register_pending_action` refused this turn's protected request
+    # (a PIN_REFUSED_* value, "" when none was), so the tool result and the
+    # reply's fixed line say so without working it out again.
+    refusal: str = ""
+    # For PIN_REFUSED_OTHER_VOICE: the satellite conversation, and the id of
+    # the prompt that refused it. The fixed line names the prompt a PIN said
+    # next would follow when the line is delivered, which may by then be
+    # another one (#1001).
+    waiting_conversation: str | None = None
+    waiting_action_id: str | None = None
     # The message was only a number too short or too long to be a PIN, which
     # is how speech-to-text losing a digit looks. It is not an attempt.
     unreadable: bool = False
 
+    @property
+    def other_voice_waiting(self) -> bool:
+        """Return True when another voice's live prompt refused the request."""
+        return self.refusal == PIN_REFUSED_OTHER_VOICE
+
+    @property
+    def refused_for_a_prompt(self) -> bool:
+        """
+        Return True when another prompt refused the request, so a line names it.
+
+        Another voice's, or one another turn is still handling: either way the
+        PIN said next would go to that one, so the reply says so in fixed
+        words and ends on them (#1001).
+        """
+        return self.refusal in {PIN_REFUSED_OTHER_VOICE, PIN_REFUSED_IN_PROGRESS}
+
+
+# Why a protected request was not held, for `PinReply.refusal`.
+# Another voice's prompt in the satellite conversation is still live (#974).
+PIN_REFUSED_OTHER_VOICE = "other_voice"
+# The prompt it would replace is locked out after MAX_PIN_ATTEMPTS wrong PINs.
+PIN_REFUSED_LOCKED = "locked"
+# The turn already holds another request.
+PIN_REFUSED_ONE_AT_A_TIME = "one_at_a_time"
+# The prompt it would replace belongs to another turn still in progress: its
+# line is on its way, or a PIN reply for it is being handled (#1001).
+PIN_REFUSED_IN_PROGRESS = "in_progress"
 
 # How a PIN-confirmed action ended, for `PinReply.outcome`.
 PIN_OUTCOME_DONE = "done"
@@ -522,8 +564,12 @@ PENDING_ACTION_TTL = timedelta(minutes=10)
 # plus a retry after a wrong or unreadable PIN or a failed turn.
 MAX_PIN_REPLIES = 3
 
-# Wrong PINs allowed for one pending action, carried over to a request that
-# replaces it or reopens its prompt.
+# Hard cap on concurrently pending confirmations, so an unconfirmed challenge
+# loop cannot grow the store without bound.
+MAX_PENDING_ACTIONS = 16
+
+# Wrong PINs allowed for one pending action, carried over to the same user's
+# request that replaces it and to a prompt reopened after it ended.
 MAX_PIN_ATTEMPTS = 5
 
 # How long after a prompt expired or took its last reply the user can reopen it
@@ -555,10 +601,6 @@ _PROMPT_STATE = frozenset(
 # action whose PIN it checked, so the model's input does not call that request
 # ended unconfirmed (graph.py, `_mark_ended_pin_requests`).
 PIN_ANSWER_KWARG = "hga_pin_answer"
-
-# Hard cap on concurrently pending confirmations, so an unconfirmed challenge
-# loop cannot grow the store without bound.
-MAX_PENDING_ACTIONS = 16
 
 # Status of a confirmation refused before the PIN is checked: the message is
 # not the reply to the action's PIN prompt, the PIN is not in it, or it was
@@ -966,42 +1008,6 @@ def _spoken_request_key(text: str) -> str | None:
     return " ".join(re.findall(r"\w+", text.casefold())) or None
 
 
-def _only_a_pin_reply(text: str) -> bool:
-    """
-    Return True when every word of the text is a digit, a joiner or a PIN label.
-
-    Punctuation and spacing do not count, so "PIN-code: 1, 2, 3, 4." qualifies;
-    whether the digits make one number is pin_digits' call. A currency, math or
-    other symbol that gives a number another meaning ("It's $1234", "50%") does,
-    and so does "number" or "code" unless it follows "PIN".
-    """
-    previous = ""
-    for token in _TOKEN_RE.findall(_ascii_digits(text)):
-        if not re.match(r"\w", token):
-            # A run of whitespace is one token, and category() takes one
-            # character.
-            if token.isspace():
-                continue
-            if token in _NOT_PIN_SYMBOLS or unicodedata.category(token) in {
-                "Sc",
-                "Sm",
-            }:
-                return False
-            continue
-        lowered = token.casefold()
-        if not (
-            _is_number(token)
-            or lowered in _SPOKEN_DIGITS
-            or lowered in _DIGIT_JOINERS
-            or lowered == _SPOKEN_ZERO
-            or lowered in _PIN_LABEL_WORDS
-            or (lowered in _AFTER_PIN_WORDS and previous in _PIN_NUMBER_AFTER)
-        ):
-            return False
-        previous = lowered
-    return True
-
-
 def normalize_pin(pin: str) -> str:
     """
     Return a PIN as entered, folded the way the user's message is read.
@@ -1153,22 +1159,116 @@ def _reissued_for_owner(
     )
 
 
-def _other_voices_prompt(
-    existing: Mapping[str, Any], action: Mapping[str, Any]
+def _another_voices_prompt(
+    existing: Mapping[str, Any], action: Mapping[str, Any], pin_owner: str | None
 ) -> bool:
     """
-    Return True for another voice's prompt in the action's satellite conversation.
+    Return True when the existing prompt is another voice's and still live.
 
-    The conversation is the one the handler names for a voice's turn
-    (``voice_conversation``), not read from the thread: an automation may give
-    `conversation.process` an id of its own, colons included.
+    Another voice's means a prompt on another thread of the action's satellite
+    conversation, or, on a turn that followed another voice's prompt onto its
+    thread, that prompt when this is a different request. A voice is told
+    apart by its own thread (``voice_thread``), not its user: every voice with
+    no linked person runs as the same user (#1001). The conversation is the
+    one the handler names for a voice's turn (``voice_conversation``), not
+    read from the thread: an automation may give `conversation.process` an id
+    of its own, colons included.
+
+    Live means it can still be answered. A prompt is dropped at the end of the
+    turn that leaves it unanswerable (`end_pin_turn`) and when it expires, so
+    one still stored is live unless its request is locked out.
     """
+    if int(existing.get("attempts", 0) or 0) >= MAX_PIN_ATTEMPTS:
+        return False
     conversation = action.get("voice_conversation")
-    return (
+    if (
         conversation is not None
         and existing.get("voice_conversation") == conversation
         and existing.get("thread_id") != action.get("thread_id")
+    ):
+        return True
+    if existing.get("thread_id") != action.get("thread_id") or _same_request(
+        existing, action
+    ):
+        return False
+    voice = action.get("voice_thread")
+    if voice is None:
+        # A request that does not say which voice made it: tell the voices
+        # apart by user on a turn that followed a prompt, as before #1001.
+        return (
+            pin_owner is not None
+            and existing.get("user") == pin_owner
+            and action.get("user") != pin_owner
+        )
+    return _voice_of(existing) != voice
+
+
+def _voice_of(action: Mapping[str, Any]) -> Any:
+    """Return the thread of the voice that made the request."""
+    return action.get("voice_thread") or action.get("thread_id")
+
+
+def waiting_voice_prompt(
+    pending_actions: Mapping[str, Mapping[str, Any]],
+    action: Mapping[str, Any],
+    *,
+    pin_owner: str | None = None,
+) -> str | None:
+    """Return the id of another voice's live prompt refusing the action (#974)."""
+    now = dt_util.utcnow()
+    return next(
+        (
+            key
+            for key, existing in pending_actions.items()
+            if not pending_action_expired(existing, now)
+            and _another_voices_prompt(existing, action, pin_owner)
+        ),
+        None,
     )
+
+
+def _replacement_refused(
+    existing: Mapping[str, Any], action: Mapping[str, Any]
+) -> str | None:
+    """
+    Return why the action may not replace the existing prompt, if it may not.
+
+    A locked-out prompt could only be replaced by one carrying its wrong PINs,
+    announcing an action no PIN can confirm; and a prompt of another turn
+    still in progress must not be cut off (#1001): its line not delivered
+    yet, or a PIN reply for it being handled. A turn's end drops or hands
+    over what it leaves (`end_pin_turn`), so one still marked is in progress.
+    """
+    if int(existing.get("attempts", 0) or 0) >= MAX_PIN_ATTEMPTS:
+        return PIN_REFUSED_LOCKED
+    turn_id = action.get("turn_id")
+    reply_turn = existing.get("reply_turn")
+    made_by = existing.get("turn_id")
+    if (reply_turn and reply_turn != turn_id) or (
+        not existing.get("disclosed") and made_by and made_by != turn_id
+    ):
+        return PIN_REFUSED_IN_PROGRESS
+    return None
+
+
+def _refuse(
+    pin_reply: PinReply | None,
+    reason: str,
+    action: Mapping[str, Any] | None = None,
+    waiting_id: str | None = None,
+) -> None:
+    """
+    Record on the turn why its protected request was not held, and by what.
+
+    An empty reason clears it: a request held later in the turn leaves no
+    refusal line beside its own prompt.
+    """
+    if pin_reply is not None:
+        pin_reply.refusal = reason
+        pin_reply.waiting_action_id = waiting_id
+        pin_reply.waiting_conversation = (
+            action.get("voice_conversation") if action and waiting_id else None
+        )
 
 
 def register_pending_action(
@@ -1176,6 +1276,7 @@ def register_pending_action(
     action: dict[str, Any],
     *,
     pin_owner: str | None = None,
+    pin_reply: PinReply | None = None,
 ) -> str | None:
     """
     Store a pending PIN-confirmation action and return its action ID.
@@ -1203,26 +1304,31 @@ def register_pending_action(
     On a satellite that recognizes voices, the conversation has at most one
     prompt across its voices too (#974): a PIN said next is followed to the
     newest prompt in the conversation (`waiting_pin_prompt`), so with two from
-    overlapping turns it could confirm the one its speaker did not mean. A
-    voice's new request drops another voice's prompt, and the most failed
-    attempts and sentence checks among the dropped carry over, so a request
-    from another voice does not reset either limit.
+    overlapping turns it could confirm the one its speaker did not mean. The
+    first request wins: while another voice's prompt is live
+    (`waiting_voice_prompt`), a new request is refused (None) and nothing is
+    dropped, so a PIN always confirms what its speaker was told, and a reply
+    already in progress is never cut off. The refused turn says why in fixed
+    words, naming the waiting request (`PinReply.waiting_action_id`).
+
+    Nor is a request held in place of a prompt that is locked out (it could
+    only announce an action no PIN can confirm, while no longer blocking
+    another voice's), or of one another turn is still handling: its line not
+    delivered yet, or its PIN reply in progress (#1001). Each refusal returns
+    None and records its reason on `pin_reply` (`PinReply.refusal`).
     """
     now = dt_util.utcnow()
     thread_id = action.get("thread_id")
     carried: dict[str, Any] = {}
-    other_attempts = 0
-    other_checks = 0
     for key, existing in list(pending_actions.items()):
         if pending_action_expired(existing, now):
             pending_actions.pop(key, None)
-        elif _other_voices_prompt(existing, action):
-            other_attempts = max(other_attempts, int(existing.get("attempts", 0) or 0))
-            other_checks = max(
-                other_checks, int(existing.get("sentence_checks", 0) or 0)
-            )
-            pending_actions.pop(key, None)
-        elif (
+    waiting = waiting_voice_prompt(pending_actions, action, pin_owner=pin_owner)
+    if waiting is not None:
+        _refuse(pin_reply, PIN_REFUSED_OTHER_VOICE, action, waiting)
+        return None
+    for key, existing in list(pending_actions.items()):
+        if (
             thread_id
             and existing.get("thread_id") == thread_id
             and (
@@ -1230,7 +1336,21 @@ def register_pending_action(
                 or _reissued_for_owner(existing, action, pin_owner)
             )
         ):
-            action = {**action, "user": existing.get("user")}
+            if refusal := _replacement_refused(existing, action):
+                _refuse(
+                    pin_reply,
+                    refusal,
+                    action,
+                    key if refusal == PIN_REFUSED_IN_PROGRESS else None,
+                )
+                return None
+            # Still the existing prompt's request: its owner's, and its voice's
+            # even when another voice's turn followed it here (#1001).
+            action = {
+                **action,
+                "user": existing.get("user"),
+                "voice_thread": existing.get("voice_thread"),
+            }
             if _same_request(existing, action) and existing.get("turn_id"):
                 reissued_in_reply = bool(
                     existing.get("reply_turn")
@@ -1257,6 +1377,7 @@ def register_pending_action(
                     if reissued_in_reply:
                         carried["renew"] = True
             elif existing.get("turn_id") == action.get("turn_id"):
+                _refuse(pin_reply, PIN_REFUSED_ONE_AT_A_TIME)
                 return None
             carried["attempts"] = int(existing.get("attempts", 0) or 0)
             # The PIN checks another voice's sentences took (see the
@@ -1269,12 +1390,13 @@ def register_pending_action(
         pending_actions.pop(next(iter(pending_actions)), None)
 
     action_id = ulid.ulid_now()
-    entry = {**action, "attempts": 0, **carried, "created_at": now.isoformat()}
-    entry["attempts"] = max(int(entry["attempts"] or 0), other_attempts)
-    checks = max(int(entry.get("sentence_checks", 0) or 0), other_checks)
-    if checks:
-        entry["sentence_checks"] = checks
-    pending_actions[action_id] = entry
+    pending_actions[action_id] = {
+        **action,
+        "attempts": 0,
+        **carried,
+        "created_at": now.isoformat(),
+    }
+    _refuse(pin_reply, "")
     return action_id
 
 
@@ -1357,6 +1479,7 @@ def start_pin_turn(
     pending_actions: dict[str, dict[str, Any]],
     thread_id: str,
     text: str,
+    turn_id: str | None = None,
     ended_prompts: dict[str, dict[str, Any]] | None = None,
 ) -> PinReply:
     """
@@ -1364,23 +1487,28 @@ def start_pin_turn(
 
     A pending action is answered by the user's next message or not at all:
     the first turn after the one that created it is its reply turn, and the
-    turn after that drops it. A prompt the user moved on from ("never mind",
-    or just another request) cannot be confirmed later by a number that
-    happens to equal the PIN.
+    prompt is dropped as that turn ends (`end_pin_turn`). A prompt the user
+    moved on from ("never mind", or just another request) cannot be
+    confirmed later by a number that happens to equal the PIN.
 
-    While the user is still answering, the prompt is kept for one more
-    message: after a wrong or unreadable PIN, the request repeated, or a
-    turn that failed (see `keep_pin_prompts`), up to MAX_PIN_REPLIES replies.
-    Expired actions are dropped here too, and so is a prompt whose fixed line
-    (`disclose_pin_prompts`) was never delivered: the turn that made it was
-    cancelled or failed before its reply, so the user was never told, in
-    words the model did not choose, what their PIN would run.
+    While the user is still answering, the reply turn may keep the prompt
+    for one more message: after a wrong or unreadable PIN, the request
+    repeated, or a turn that failed (see `keep_pin_prompts`), up to
+    MAX_PIN_REPLIES replies. `end_pin_turn` hands it to the next message;
+    this function only gives it that message. Expired actions are dropped
+    here.
+
+    A prompt still waiting on another turn is left alone: one whose fixed
+    line that turn has not delivered yet, or one whose PIN reply another
+    voice's turn is handling. Each turn's end drops what it leaves
+    unanswerable (`end_pin_turn`), so this turn starting must not cut off
+    one still in progress (#1001).
 
     A delivered prompt that expired, or that ended because it took its last
-    reply, is noted in `ended_prompts` so the request said again can reopen it
-    (`reopen_ended_prompt`).
+    reply (`end_pin_turn`), is noted in `ended_prompts` so the request said
+    again can reopen it (`reopen_ended_prompt`).
     """
-    reply = PinReply(text)
+    reply = PinReply(text) if turn_id is None else PinReply(text, turn_id=turn_id)
     turn_id = reply.turn_id
     now = dt_util.utcnow()
     for key, action in list(pending_actions.items()):
@@ -1391,18 +1519,84 @@ def start_pin_turn(
         if action.get("thread_id") != thread_id or action.get("turn_id") == turn_id:
             continue
         if not action.get("disclosed"):
-            pending_actions.pop(key, None)
             continue
-        replies = int(action.get("replies", 0) or 0)
-        renew = action.pop("renew", False) and prompt_renewable(action)
-        if action.get("reply_turn") is None or renew:
+        if action.get("reply_turn") is None:
             action["reply_turn"] = turn_id
-            action["replies"] = replies + 1
-        else:
-            pending_actions.pop(key, None)
-            if action.get("limit_reached"):
-                _note_ended_prompt(ended_prompts, action, now)
+            action["replies"] = int(action.get("replies", 0) or 0) + 1
     return reply
+
+
+def end_pin_turn(
+    pending_actions: dict[str, dict[str, Any]],
+    turn_id: str,
+    ended_prompts: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    """
+    Drop the prompts this turn leaves that can no longer be answered.
+
+    A prompt the turn made but never delivered (it failed or was cancelled
+    before its reply), and a prompt the turn answered without keeping it for
+    another message (`keep_pin_prompt`). Dropping them as the turn ends means
+    a prompt still stored is live, so it can refuse another voice's request
+    (`waiting_voice_prompt`) without a dead one blocking the conversation,
+    and the next turn on the thread need not drop anything itself
+    (`start_pin_turn`).
+
+    A prompt the turn kept for another message is handed over here, not
+    before: only once the turn has ended can the next message answer it, so
+    another turn cannot take a PIN reply still in progress (#1001).
+
+    A prompt dropped because it took its last reply while the user was still
+    answering (`keep_pin_prompt` marks it) is noted in `ended_prompts`, so the
+    request said again can reopen it (`reopen_ended_prompt`).
+    """
+    now = dt_util.utcnow()
+    for key, action in list(pending_actions.items()):
+        if action.get("turn_id") == turn_id and not action.get("disclosed"):
+            pending_actions.pop(key, None)
+        elif action.get("reply_turn") == turn_id:
+            if action.pop("renew", False) and prompt_renewable(action):
+                action["reply_turn"] = None
+            else:
+                pending_actions.pop(key, None)
+                if action.get("limit_reached"):
+                    _note_ended_prompt(ended_prompts, action, now)
+
+
+def _only_a_pin_reply(text: str) -> bool:
+    """
+    Return True when every word of the text is a digit, a joiner or a PIN label.
+
+    Punctuation and spacing do not count, so "PIN-code: 1, 2, 3, 4." qualifies;
+    whether the digits make one number is pin_digits' call. A currency, math or
+    other symbol that gives a number another meaning ("It's $1234", "50%") does,
+    and so does "number" or "code" unless it follows "PIN".
+    """
+    previous = ""
+    for token in _TOKEN_RE.findall(_ascii_digits(text)):
+        if not re.match(r"\w", token):
+            # A run of whitespace is one token, and category() takes one
+            # character.
+            if token.isspace():
+                continue
+            if token in _NOT_PIN_SYMBOLS or unicodedata.category(token) in {
+                "Sc",
+                "Sm",
+            }:
+                return False
+            continue
+        lowered = token.casefold()
+        if not (
+            _is_number(token)
+            or lowered in _SPOKEN_DIGITS
+            or lowered in _DIGIT_JOINERS
+            or lowered == _SPOKEN_ZERO
+            or lowered in _PIN_LABEL_WORDS
+            or (lowered in _AFTER_PIN_WORDS and previous in _PIN_NUMBER_AFTER)
+        ):
+            return False
+        previous = lowered
+    return True
 
 
 def waiting_pin_prompt(
@@ -1447,14 +1641,23 @@ def pin_length_number(text: str) -> str | None:
 def newest_pin_prompt(
     pending_actions: Mapping[str, dict[str, Any]], conversation_id: str
 ) -> dict[str, Any] | None:
-    """Return the newest prompt a voice of the conversation is waiting on."""
+    """
+    Return the newest prompt a voice of the conversation is waiting on.
+
+    A voice's prompt is one whose turn the handler named the conversation for
+    (``voice_conversation``), the same test the one-prompt rule uses, so a
+    typed or automation conversation whose id has a colon is never taken for
+    a voice. A prompt locked out after MAX_PIN_ATTEMPTS wrong PINs is not
+    followed: no PIN can confirm it, and it no longer blocks another voice's
+    request, so the PIN would go to that one instead (#1001).
+    """
     now = dt_util.utcnow()
-    prefix = f"{conversation_id}:"
     for action in reversed(list(pending_actions.values())):
         if (
-            str(action.get("thread_id") or "").startswith(prefix)
+            action.get("voice_conversation") == conversation_id
             and action.get("disclosed")
-            and (action.get("reply_turn") is None or action.get("renew"))
+            and action.get("reply_turn") is None
+            and int(action.get("attempts", 0) or 0) < MAX_PIN_ATTEMPTS
             and not pending_action_expired(action, now)
         ):
             return action
@@ -1519,7 +1722,9 @@ def keep_pin_prompt(action: dict[str, Any], reply: PinReply | None) -> bool:
     Keep the action's prompt for the user's next message, if this turn answers it.
 
     Returns False when it is not kept: this is not the prompt's reply turn, or
-    the prompt has taken its MAX_PIN_REPLIES replies.
+    the prompt can take no more replies (its MAX_PIN_REPLIES replies taken, or
+    its request locked out after MAX_PIN_ATTEMPTS wrong PINs; see
+    `prompt_renewable`).
     """
     if reply is None or action.get("reply_turn") != reply.turn_id:
         return False
@@ -1552,8 +1757,17 @@ def repeated_pin_request(
 
 
 def prompt_renewable(action: Mapping[str, Any]) -> bool:
-    """Return True while the prompt has not taken all its MAX_PIN_REPLIES replies."""
-    return int(action.get("replies", 0) or 0) < MAX_PIN_REPLIES
+    """
+    Return True while the prompt can take another reply.
+
+    Not once it has taken all its MAX_PIN_REPLIES replies, nor once its
+    request is locked out after MAX_PIN_ATTEMPTS wrong PINs: no PIN can
+    confirm it, so the reply must not offer it again (#1001).
+    """
+    return (
+        int(action.get("replies", 0) or 0) < MAX_PIN_REPLIES
+        and int(action.get("attempts", 0) or 0) < MAX_PIN_ATTEMPTS
+    )
 
 
 def keep_pin_prompts(
@@ -1590,6 +1804,23 @@ def prompts_awaiting_reply(
     ]
 
 
+def refusal_line_due(
+    pending_actions: Mapping[str, Mapping[str, Any]], reply: PinReply
+) -> bool:
+    """
+    Return True when the turn's reply carries a line for a refused request.
+
+    When another prompt refused it (`PinReply.refused_for_a_prompt`), unless
+    this turn's PIN ran an action or the refusing prompt is the one this turn
+    is answering: then there is nothing for the speaker to wait for.
+    conversation.py builds the line (`_refusal_line`) after the same test.
+    """
+    if not reply.refused_for_a_prompt or reply.confirmed:
+        return False
+    refusing = pending_actions.get(reply.waiting_action_id or "")
+    return refusing is None or refusing.get("reply_turn") != reply.turn_id
+
+
 def pin_lines_follow(
     pending_actions: Mapping[str, dict[str, Any]], reply: PinReply
 ) -> bool:
@@ -1597,8 +1828,9 @@ def pin_lines_follow(
     Return True when the turn's reply carries a fixed PIN line.
 
     The lines themselves are built in conversation.py (`_pin_lines`) from the
-    same three facts: a PIN from this message ran an action (its outcome), a
-    PIN from it failed the check, or a prompt awaits the user's next message.
+    same facts: a PIN from this message ran an action (its outcome), a PIN
+    from it failed the check, its request was refused for another voice's
+    prompt, or a prompt awaits the user's next message.
     The graph's round-limit guard uses this to add nothing when a line will
     be the reply.
     """
@@ -1606,6 +1838,7 @@ def pin_lines_follow(
         reply.confirmed
         or reply.spent
         or reply.unreadable
+        or refusal_line_due(pending_actions, reply)
         or prompts_awaiting_reply(pending_actions, reply)
     )
 

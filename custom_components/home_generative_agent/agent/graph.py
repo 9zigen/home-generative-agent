@@ -176,7 +176,7 @@ from .on_off_direction import (
     with_action_performed,
     wrong_direction_refusal,
 )
-from .pin_messages import describe_pending_action, pin_msg
+from .pin_messages import describe_pending_action, pin_msg, refused_pin_request
 from .rule_entities import expand_critical_rules
 from .template_actions import entities_of
 from .token_counter import count_tokens_cross_provider
@@ -563,6 +563,7 @@ def _critical_action_guard(  # noqa: PLR0913
         "user": configurable.get("user_id"),
         "thread_id": configurable.get("thread_id"),
         "voice_conversation": configurable.get("voice_conversation"),
+        "voice_thread": configurable.get("voice_thread"),
         "turn_id": pin_reply.turn_id if pin_reply is not None else None,
         # The automations the change would start, for the PIN line (#814).
         "starts": list(started),
@@ -583,13 +584,17 @@ def _critical_action_guard(  # noqa: PLR0913
         "remote": origin is not None and origin.remote,
     }
     action_id = register_pending_action(
-        ctx.pending_actions, action, pin_owner=configurable.get("pin_owner")
+        ctx.pending_actions,
+        action,
+        pin_owner=configurable.get("pin_owner"),
+        pin_reply=pin_reply,
     )
     if action_id is None:
-        # Another protected request is already waiting for this turn's PIN
-        # prompt; the user asks for this one after answering it.
+        # Not held: this turn already holds another request, another voice's
+        # is waiting (#974), or the prompt it would replace is locked out or
+        # being answered (#1001). The reason is on the turn's PinReply.
         return ToolMessage(
-            content=pin_msg(ctx.hass, "pin_one_action_at_a_time"),
+            content=refused_pin_request(ctx.hass, pin_reply),
             tool_call_id=tool_call.get("id"),
             name=tool_name,
             status="error",

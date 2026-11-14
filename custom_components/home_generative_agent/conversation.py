@@ -55,6 +55,7 @@ from .agent.helpers import (
     active_llm_api_ids,
     chat_log_tool_result,
     disclose_pin_prompts,
+    end_pin_turn,
     filter_excluded_tools,
     format_tool,
     is_actuation_tool,
@@ -62,9 +63,11 @@ from .agent.helpers import (
     langchain_tool_parameters_json,
     llm_api_is_supported,
     newest_pin_prompt,
+    pending_action_expired,
     pin_length_number,
     pin_only_reply_action,
     prompts_awaiting_reply,
+    refusal_line_due,
     remote_house_words,
     reopen_ended_prompt,
     repeated_pin_request,
@@ -1248,9 +1251,9 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
         # locally" is on, whatever this flag says.  Guarding that combination
         # is the repair issue raised in async_added_to_hass, not this line.
         #
-        # The default matters because the options flow deletes the key when no
-        # API is selected, so an absent key means "use Assist" to every other
-        # reader; active_llm_api_ids is the single definition of that.
+        # An absent key means "use Assist" to every other reader (entries
+        # migrated to v6.2 always carry it); active_llm_api_ids is the single
+        # definition of that.
         if active_llm_api_ids(self.entry.runtime_data.options):
             self._attr_supported_features = (
                 conversation.ConversationEntityFeature.CONTROL
@@ -2096,6 +2099,47 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
         ):
             pass
 
+    def _refusal_line(
+        self, pending_actions: Mapping[str, dict[str, Any]], pin_reply: PinReply
+    ) -> str | None:
+        """
+        Return the fixed line for a request another prompt refused, if any.
+
+        Said in fixed words, not only the model's (#974), and naming the
+        request a PIN said next would confirm, so it is not spent on an action
+        its speaker never heard named (#1001). That is read when the line is
+        built, not when the request was refused: the prompt that refused it
+        may be gone by then, or replaced. For another voice's prompt, the one
+        a PIN would follow (`newest_pin_prompt`) is named; failing that, the
+        one that refused it if it can still be answered; with neither, the
+        user is asked to make the request again. Nothing is said once this
+        turn's PIN ran an action, or about the prompt this turn is answering.
+        """
+        if not refusal_line_due(pending_actions, pin_reply):
+            return None
+        now = dt_util.utcnow()
+        refusing = pending_actions.get(pin_reply.waiting_action_id or "")
+        if refusing is not None and (
+            pending_action_expired(refusing, now)
+            or int(refusing.get("attempts", 0) or 0) >= MAX_PIN_ATTEMPTS
+        ):
+            refusing = None
+        if pin_reply.other_voice_waiting:
+            conversation_id = pin_reply.waiting_conversation
+            followed = (
+                newest_pin_prompt(pending_actions, conversation_id)
+                if conversation_id
+                else None
+            )
+            waiting, key = followed or refusing, "pin_other_voice_waiting_line"
+        else:
+            waiting, key = refusing, "pin_in_progress_line"
+        if waiting is None:
+            return pin_msg(self.hass, "pin_request_again_line")
+        return pin_msg(
+            self.hass, key, action=describe_pending_action(self.hass, waiting)
+        )
+
     def _pin_lines(
         self, pending_actions: dict[str, dict[str, Any]], pin_reply: PinReply
     ) -> list[str]:
@@ -2113,13 +2157,17 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
             # of its own (the round-limit guard adds none when a PIN line
             # follows), and "What is your PIN?" alone would have the user
             # repeat the wrong one (red team, 2026-10-16). `pin_lines_follow`
-            # (helpers.py) mirrors these three cases.
+            # (helpers.py) mirrors these cases.
             key = "pin_incorrect_line" if pin_reply.spent else "pin_unreadable_line"
             lines.append(pin_msg(self.hass, key))
             if not prompts_awaiting_reply(pending_actions, pin_reply):
                 # The prompt took its last reply, or the request its last
                 # attempt: no question follows, so say what comes next.
                 lines.append(pin_msg(self.hass, "pin_request_again_line"))
+        if (
+            refusal := self._refusal_line(pending_actions, pin_reply)
+        ) and refusal not in lines:
+            lines.append(refusal)
         lines.extend(
             pin_msg(
                 self.hass,
@@ -2267,10 +2315,14 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
         itself and go in front of the reply, so the turn's result shows them
         and the reply still ends with the model's question, which is what
         keeps a satellite listening for the PIN (ChatLog.continue_conversation
-        reads the last character). They are also spoken when a pipeline is
-        listening for deltas: only the lines when the reply was streamed,
-        the joined reply when it was not (schema-first mode), since a
-        pipeline past HA's streaming threshold speaks deltas alone.
+        reads the last character). A refusal for another prompt (another
+        voice's, or one another turn is still handling) with no prompt of this
+        turn's goes after the reply instead, so the reply ends on it and the
+        satellite stops listening (#1001). They are also
+        spoken when a pipeline is listening for deltas: only the lines when
+        the reply was streamed, the joined reply when it was not (schema-first
+        mode), since a pipeline past HA's streaming threshold speaks deltas
+        alone.
 
         Once delivered, the prompts are marked disclosed: only then can the
         user's next message answer them (`start_pin_turn`).
@@ -2292,7 +2344,16 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
             await self._async_add_spoken_reply(chat_log, text)
             disclose_pin_prompts(pending_actions, pin_reply)
             return
-        merged = f"{text}\n\n{reply.content}"
+        if pin_reply.refused_for_a_prompt and not prompts_awaiting_reply(
+            pending_actions, pin_reply
+        ):
+            # A refusal with nothing to answer goes after the model's reply,
+            # so the reply ends on it rather than on a question of the
+            # model's: a satellite would keep listening, and the PIN said
+            # next would go to the prompt that refused it (#1001).
+            merged = f"{reply.content}\n\n{text}"
+        else:
+            merged = f"{text}\n\n{reply.content}"
         if prompts_awaiting_reply(pending_actions, pin_reply) and not str(
             reply.content
         ).rstrip().endswith(_CONTINUE_MARKS):
@@ -2381,14 +2442,26 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
         )
 
         deployment = runtime_data.model_deployments.get("chat", "edge")
-        async with local_chat_session(deployment, category="chat"):
-            return await self._async_handle_message_active(
-                user_input,
-                chat_log,
-                intent_response,
-                llm_context,
-                message_history,
-                conversation_id,
+        # The turn's PIN id is chosen here so the turn's end can drop the
+        # prompts it leaves unanswerable however it returns or fails: a
+        # stored prompt is then a live one (end_pin_turn, #974).
+        pin_turn_id = ulid.ulid_now()
+        try:
+            async with local_chat_session(deployment, category="chat"):
+                return await self._async_handle_message_active(
+                    user_input,
+                    chat_log,
+                    intent_response,
+                    llm_context,
+                    message_history,
+                    conversation_id,
+                    pin_turn_id=pin_turn_id,
+                )
+        finally:
+            end_pin_turn(
+                runtime_data.pending_actions,
+                pin_turn_id,
+                ended_prompts=runtime_data.ended_pin_prompts,
             )
 
     async def _async_handle_message_active(  # noqa: PLR0911, PLR0913, PLR0915
@@ -2399,6 +2472,8 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
         llm_context: llm.LLMContext,
         message_history: list[Any],
         conversation_id: str,
+        *,
+        pin_turn_id: str,
     ) -> conversation.ConversationResult:
         """Process user input while local chat activity is already marked."""
         hass = self.hass
@@ -2432,7 +2507,8 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
             runtime_data.pending_actions,
             thread_id,
             user_input.text,
-            runtime_data.ended_pin_prompts,
+            pin_turn_id,
+            ended_prompts=runtime_data.ended_pin_prompts,
         )
         unreadable = unreadable_pin_reply(runtime_data.pending_actions, pin_reply)
         if (
@@ -2569,6 +2645,12 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
                 # The satellite conversation a voice's thread belongs to: it
                 # holds one PIN prompt across its voices (#974).
                 "voice_conversation": conversation_id if speaker else None,
+                # The thread of the voice that spoke, which a PIN-only reply
+                # may have left for another voice's: voices are told apart by
+                # it, since every voice with no linked person is "robot".
+                "voice_thread": (
+                    self._thread_id(conversation_id, speaker) if speaker else None
+                ),
                 "user_id": clean_user_name,
                 "pin_owner": pin_owner,
                 "pin_reply": pin_reply,
@@ -2624,9 +2706,13 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
                 )
             except HomeAssistantError as err:
                 keep_pin_prompts(runtime_data.pending_actions, pin_reply)
+                # The error is the whole reply, so it says why a request was
+                # not held (#1001). No prompt was delivered, so it promises
+                # nothing for the PIN; end_pin_turn drops what this turn made.
+                refusal = self._refusal_line(runtime_data.pending_actions, pin_reply)
                 intent_response.async_set_error(
                     intent.IntentResponseErrorCode.UNKNOWN,
-                    str(err),
+                    f"{refusal} {err}" if refusal else str(err),
                 )
                 return conversation.ConversationResult(
                     response=intent_response, conversation_id=conversation_id

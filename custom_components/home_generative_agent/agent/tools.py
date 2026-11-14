@@ -148,7 +148,7 @@ from .indirect_pin import (
     tool_origin,
 )
 from .on_off_direction import with_action_performed
-from .pin_messages import describe_pending_action, pin_msg
+from .pin_messages import describe_pending_action, pin_msg, refused_pin_request
 from .rule_entities import expand_critical_rules
 
 if TYPE_CHECKING:
@@ -1028,13 +1028,15 @@ def _maybe_require_pin_for_automation(
         "user": cfg.get("user_id"),
         "thread_id": cfg.get("thread_id"),
         "voice_conversation": cfg.get("voice_conversation"),
+        "voice_thread": cfg.get("voice_thread"),
         "turn_id": _turn_id(cfg),
     }
+    pin_reply = cfg.get("pin_reply")
     action_id = register_pending_action(
-        pending_actions, action, pin_owner=cfg.get("pin_owner")
+        pending_actions, action, pin_owner=cfg.get("pin_owner"), pin_reply=pin_reply
     )
     if action_id is None:
-        return pin_msg(cfg.get("hass"), "pin_one_action_at_a_time")
+        return refused_pin_request(cfg.get("hass"), pin_reply)
     return json.dumps(
         {
             "status": "requires_pin",

@@ -179,6 +179,7 @@ from custom_components.home_generative_agent.agent.helpers import (  # noqa: E40
     SENTENCE_PIN_KEY,
     PinReply,
     disclose_pin_prompts,
+    end_pin_turn,
     keep_pin_prompts,
     register_pending_action,
     reopen_ended_prompt,
@@ -186,6 +187,7 @@ from custom_components.home_generative_agent.agent.helpers import (  # noqa: E40
     start_pin_turn,
     unreadable_pin_reply,
     waiting_pin_prompt,
+    waiting_voice_prompt,
 )
 from custom_components.home_generative_agent.agent.tools import (  # noqa: E402
     MAX_PIN_ATTEMPTS,
@@ -1418,10 +1420,10 @@ def test_control_feature_set_when_llm_api_key_absent() -> None:
     """
     An absent CONF_LLM_HASS_API must still advertise CONTROL.
 
-    The options flow deletes the key when no API is selected, and the rest of
-    the integration reads that absence as "default to Assist"; __init__ read it
-    as falsy, so the entity's capability disagreed with the tools it actually
-    had.
+    Before issue #949 the options flow deleted the key when no API was
+    selected, and the rest of the integration reads that absence as "default
+    to Assist"; __init__ read it as falsy, so the entity's capability disagreed
+    with the tools it actually had.
 
     CONTROL is NOT a security control -- its only consumer routes state
     questions and media search to the agent. This test pins capability/tool
@@ -2571,7 +2573,8 @@ def test_each_turn_gets_its_own_pin_reply() -> None:
     assert "start_pin_turn(" in src
     assert re.search(
         r"start_pin_turn\(\s*runtime_data\.pending_actions,\s*thread_id,"
-        r"\s*user_input\.text,\s*runtime_data\.ended_pin_prompts,",
+        r"\s*user_input\.text,\s*pin_turn_id,"
+        r"\s*ended_prompts=runtime_data\.ended_pin_prompts,",
         src,
     )
     assert "reopen_ended_prompt(" in src
@@ -3247,6 +3250,204 @@ async def test_a_confirmed_action_is_named_after_it_runs(
     )
 
 
+async def test_a_request_refused_for_another_voice_says_so_in_fixed_words(
+    frozen_assistant_content: None,  # noqa: ARG001
+) -> None:
+    """
+    The model's own words could still ask for a PIN (#974 review).
+
+    The line names the waiting request and ends the reply, so a satellite
+    stops listening even when the model's text ends with a question, and the
+    PIN said next is not spent on a request never named (#1001).
+    """
+    pending: dict[str, Any] = {}
+    from custom_components.home_generative_agent.agent.helpers import (  # noqa: PLC0415
+        PIN_REFUSED_OTHER_VOICE,
+        start_pin_turn,
+    )
+
+    pending["anna"] = _voice_prompt("Front Door")
+    reply = start_pin_turn(pending, "conv1:boris", "unlock the garage door")
+    reply.refusal = PIN_REFUSED_OTHER_VOICE
+    reply.waiting_action_id = "anna"
+    reply.waiting_conversation = "conv1"
+    chat_log = _DeltaChatLog([_assistant_reply("Shall I try again later?")])
+
+    await HGAConversationEntity._async_add_pin_lines(
+        _pin_entity(), cast("Any", chat_log), pending, reply, streamed=True
+    )
+
+    content = chat_log.content[-1].content
+    assert content.startswith("Shall I try again later?\n\nA request to ")
+    assert "Front Door" in content
+    assert content.endswith("is waiting for a PIN. Ask again after it is answered.")
+
+
+def _voice_prompt(name: str, turn_id: str = "earlier") -> dict[str, Any]:
+    """Return another voice's disclosed, waiting prompt in conversation conv1."""
+    from homeassistant.util import dt as dt_util  # noqa: PLC0415
+
+    return {
+        "tool_name": "HassTurnOff",
+        "tool_args": {"domain": ["lock"], "name": name},
+        "thread_id": "conv1:anna",
+        "voice_conversation": "conv1",
+        "voice_thread": "conv1:anna",
+        "turn_id": turn_id,
+        "disclosed": True,
+        "attempts": 0,
+        "created_at": dt_util.utcnow().isoformat(),
+    }
+
+
+def test_the_refusal_names_the_prompt_a_pin_would_follow_now() -> None:
+    """
+    The refusal names the prompt a PIN said next would follow now.
+
+    The prompt that refused the request is gone; another voice's has replaced
+    it. The line names that one, not the stale one (Codex, #1001 review);
+    with none, it asks to make the request again.
+    """
+    from custom_components.home_generative_agent.agent.helpers import (  # noqa: PLC0415
+        PIN_REFUSED_OTHER_VOICE,
+        PinReply,
+    )
+    from custom_components.home_generative_agent.agent.pin_messages import (  # noqa: PLC0415
+        pin_msg,
+    )
+
+    reply = PinReply("unlock the back door")
+    reply.refusal = PIN_REFUSED_OTHER_VOICE
+    reply.waiting_action_id = "gone"
+    reply.waiting_conversation = "conv1"
+    entity = _pin_entity()
+
+    line = entity._refusal_line({"clara": _voice_prompt("Garage Door")}, reply)
+    assert line is not None
+    assert "Garage Door" in line
+
+    assert entity._refusal_line({}, reply) == pin_msg(None, "pin_request_again_line")
+    assert entity._refusal_line({}, PinReply("hello")) is None
+
+    # Not a prompt no PIN can confirm, nor one that has expired.
+    locked = _voice_prompt("Garage Door")
+    locked["attempts"] = 5
+    expired = _voice_prompt("Garage Door")
+    expired["created_at"] = "2000-01-01T00:00:00+00:00"
+    for stale in (locked, expired):
+        reply.waiting_action_id = "x"
+        line = entity._refusal_line({"x": stale}, reply)
+        assert line == pin_msg(None, "pin_request_again_line")
+
+
+def test_make_the_request_again_is_said_once() -> None:
+    """The wrong-PIN lines and the refusal fallback can both ask for it."""
+    from custom_components.home_generative_agent.agent.helpers import (  # noqa: PLC0415
+        PIN_REFUSED_OTHER_VOICE,
+        PinReply,
+    )
+    from custom_components.home_generative_agent.agent.pin_messages import (  # noqa: PLC0415
+        pin_msg,
+    )
+
+    reply = PinReply("0000")
+    reply.spent = True
+    reply.refusal = PIN_REFUSED_OTHER_VOICE
+    reply.waiting_action_id = "gone"
+    reply.waiting_conversation = "conv1"
+
+    lines = _pin_entity()._pin_lines({}, reply)
+
+    assert lines.count(pin_msg(None, "pin_request_again_line")) == 1
+
+
+def test_no_refusal_line_once_this_turns_pin_ran_the_waiting_request() -> None:
+    """A reply saying "PIN accepted", then to ask again, would contradict itself."""
+    from custom_components.home_generative_agent.agent.helpers import (  # noqa: PLC0415
+        PIN_REFUSED_OTHER_VOICE,
+        PinReply,
+    )
+
+    reply = PinReply("1234")
+    reply.refusal = PIN_REFUSED_OTHER_VOICE
+    reply.waiting_action_id = "gone"
+    reply.waiting_conversation = "conv1"
+    reply.confirmed = 'unlock "Front Door"'
+
+    assert _pin_entity()._refusal_line({}, reply) is None
+
+
+def test_no_refusal_line_naming_the_prompt_this_turn_answers() -> None:
+    """The turn answering a prompt is not told that prompt is waiting."""
+    from custom_components.home_generative_agent.agent.helpers import (  # noqa: PLC0415
+        PIN_REFUSED_OTHER_VOICE,
+        PinReply,
+    )
+
+    reply = PinReply("0000")
+    reply.refusal = PIN_REFUSED_OTHER_VOICE
+    reply.waiting_action_id = "anna"
+    reply.waiting_conversation = "conv1"
+    answered = _voice_prompt("Front Door")
+    answered["reply_turn"] = reply.turn_id
+
+    assert _pin_entity()._refusal_line({"anna": answered}, reply) is None
+
+
+def test_an_in_progress_refusal_names_the_request_being_handled() -> None:
+    from custom_components.home_generative_agent.agent.helpers import (  # noqa: PLC0415
+        PIN_REFUSED_IN_PROGRESS,
+        PinReply,
+    )
+
+    reply = PinReply("unlock the back door instead")
+    reply.refusal = PIN_REFUSED_IN_PROGRESS
+    reply.waiting_action_id = "anna"
+    being_answered = _voice_prompt("Front Door")
+    being_answered["reply_turn"] = "another turn"
+
+    line = _pin_entity()._refusal_line({"anna": being_answered}, reply)
+
+    assert line is not None
+    assert "Front Door" in line
+    assert line.endswith(".")
+
+
+async def test_a_refusal_with_a_prompt_of_its_own_keeps_the_question_last(
+    frozen_assistant_content: None,  # noqa: ARG001
+) -> None:
+    """With this turn's prompt waiting, the lines go first and the reply ends it."""
+    from custom_components.home_generative_agent.agent.helpers import (  # noqa: PLC0415
+        PIN_REFUSED_OTHER_VOICE,
+        register_pending_action,
+        start_pin_turn,
+    )
+
+    pending: dict[str, Any] = {"anna": _voice_prompt("Front Door")}
+    reply = start_pin_turn(pending, "conv1:boris", "lock the shed")
+    register_pending_action(
+        pending,
+        {
+            "tool_name": "HassTurnOn",
+            "tool_args": {"domain": ["lock"], "name": "Shed"},
+            "thread_id": "conv1:boris",
+            "turn_id": reply.turn_id,
+        },
+    )
+    reply.refusal = PIN_REFUSED_OTHER_VOICE
+    reply.waiting_action_id = "anna"
+    reply.waiting_conversation = "conv1"
+    chat_log = _DeltaChatLog([_assistant_reply("What is your PIN?")])
+
+    await HGAConversationEntity._async_add_pin_lines(
+        _pin_entity(), cast("Any", chat_log), pending, reply, streamed=True
+    )
+
+    content = chat_log.content[-1].content
+    assert content.startswith("A request to ")
+    assert content.endswith("What is your PIN?")
+
+
 async def test_a_turn_without_a_prompt_or_confirmation_is_left_alone(
     frozen_assistant_content: None,  # noqa: ARG001
 ) -> None:
@@ -3748,8 +3949,11 @@ async def test_person_id_wins_over_another_persons_name(
 
 
 def _waiting_action(thread_id: str, **fields: Any) -> dict[str, Any]:
+    # As the handler holds it: a voice's thread names its conversation.
+    voice = thread_id.split(":", 1)[0] if ":" in thread_id else None
     return {
         "thread_id": thread_id,
+        "voice_conversation": voice,
         "disclosed": True,
         "user": "ivan",
         "created_at": dt_util.utcnow().isoformat(),
@@ -3772,6 +3976,8 @@ def test_waiting_pin_prompt_is_found_on_any_voices_thread(thread: str) -> None:
         _waiting_action("conversation"),
         _waiting_action("conv:Пётр", disclosed=False),
         _waiting_action("conv:Пётр", reply_turn="t1"),
+        # A typed or automation conversation whose id has a colon is no voice.
+        _waiting_action("conv:front", voice_conversation=None),
     ],
 )
 def test_waiting_pin_prompt_ignores_prompts_nobody_can_answer(
@@ -3782,9 +3988,19 @@ def test_waiting_pin_prompt_ignores_prompts_nobody_can_answer(
 
 
 def test_waiting_pin_prompt_keeps_a_renewed_prompt() -> None:
-    """A wrong PIN keeps the prompt for one more reply."""
+    """
+    A wrong PIN keeps the prompt for one more reply, once its turn ends.
+
+    While the turn that kept it still runs, the prompt is not followed, so a
+    PIN reply in progress is not taken over (#1001).
+    """
     action = _waiting_action("conv:Пётр", reply_turn="t1", renew=True)
-    assert waiting_pin_prompt({"a": action}, "conv", "1234") is action
+    pending = {"a": action}
+    assert waiting_pin_prompt(pending, "conv", "1234") is None
+
+    end_pin_turn(pending, "t1")
+
+    assert waiting_pin_prompt(pending, "conv", "1234") is action
 
 
 def test_waiting_pin_prompt_skips_an_expired_prompt(
@@ -3935,17 +4151,17 @@ def test_followed_reply_reissuing_the_request_keeps_the_owners_action() -> None:
     assert _is_wrong_user({"user_id": "Mary", "pin_owner": "ivan"}, action) is False
 
 
-def test_followed_reply_making_a_new_request_stays_the_speakers() -> None:
-    """Only the same request is the owner's; a new one is whoever asked for it."""
+def test_followed_reply_making_a_new_request_is_refused() -> None:
+    """The owner's prompt waits on that thread, so it wins (#974 review)."""
     pending: dict[str, dict[str, Any]] = {
         "a": _held_request(user="ivan", turn_id="t0", attempts=2, disclosed=True)
     }
     new = _held_request(user="Mary", turn_id="t1", tool_args={"name": "Garage"})
-    action_id = register_pending_action(pending, new, pin_owner="ivan")
-    assert action_id is not None
-    assert pending[action_id]["user"] == "Mary"
-    assert pending[action_id]["attempts"] == 0
+    assert register_pending_action(pending, new, pin_owner="ivan") is None
+    assert waiting_voice_prompt(pending, new, pin_owner="ivan") is not None
+    assert list(pending) == ["a"]
     assert pending["a"]["user"] == "ivan"
+    assert pending["a"]["attempts"] == 2
 
 
 def test_another_users_same_request_is_not_the_owners_without_a_followed_prompt() -> (
@@ -4232,14 +4448,17 @@ async def test_a_repeated_request_is_asked_again_in_fixed_words(
     assert next(iter(pending.values()))["renew"] is True
 
 
-def _ended_at_limit(pending: dict[str, Any], *, attempts: int = 0) -> dict[str, Any]:
-    """Deliver a prompt, use up its replies, and return the held action."""
+def _ended_at_limit(
+    pending: dict[str, Any], ended: dict[str, Any], *, attempts: int = 0
+) -> dict[str, Any]:
+    """Deliver a prompt, use up its replies, end the turn, and return the action."""
     reply = _repeat_prompt(pending, "Открой замок", "1 2")
     action = next(iter(pending.values()))
     action["replies"] = 3
     action["attempts"] = attempts
     keep_pin_prompts(pending, reply)
     assert action["limit_reached"] is True
+    end_pin_turn(pending, reply.turn_id, ended_prompts=ended)
     return dict(action)
 
 
@@ -4247,9 +4466,9 @@ def test_a_request_said_again_after_the_retry_limit_reopens_its_prompt() -> None
     """The model answered from history without a tool call (field test 2026-11-10)."""
     pending: dict[str, Any] = {}
     ended: dict[str, Any] = {}
-    held = _ended_at_limit(pending, attempts=2)
+    held = _ended_at_limit(pending, ended, attempts=2)
 
-    reply = start_pin_turn(pending, "conv1", "Открой замок.", ended)
+    reply = start_pin_turn(pending, "conv1", "Открой замок.", ended_prompts=ended)
     assert pending == {}
     action_id = reopen_ended_prompt(pending, ended, "conv1", reply)
 
@@ -4273,7 +4492,7 @@ def test_an_expired_prompt_is_reopened_by_its_request() -> None:
     old = dt_util.utcnow() - PENDING_ACTION_TTL - timedelta(seconds=1)
     next(iter(pending.values()))["created_at"] = old.isoformat()
 
-    reply = start_pin_turn(pending, "conv1", "открой замок", ended)
+    reply = start_pin_turn(pending, "conv1", "открой замок", ended_prompts=ended)
     assert pending == {}
     assert reopen_ended_prompt(pending, ended, "conv1", reply) is not None
 
@@ -4282,8 +4501,9 @@ def test_a_prompt_the_user_moved_on_from_is_not_reopened() -> None:
     """Another command drops the prompt for good, as before."""
     pending: dict[str, Any] = {}
     ended: dict[str, Any] = {}
-    _repeat_prompt(pending, "Открой замок", "Включи свет")
-    reply = start_pin_turn(pending, "conv1", "Открой замок", ended)
+    moved_on = _repeat_prompt(pending, "Открой замок", "Включи свет")
+    end_pin_turn(pending, moved_on.turn_id, ended_prompts=ended)
+    reply = start_pin_turn(pending, "conv1", "Открой замок", ended_prompts=ended)
     assert pending == {}
     assert ended == {}
     assert reopen_ended_prompt(pending, ended, "conv1", reply) is None
@@ -4302,11 +4522,11 @@ def test_an_ended_prompt_reopens_only_for_its_voice_and_words(
 ) -> None:
     pending: dict[str, Any] = {}
     ended: dict[str, Any] = {}
-    _ended_at_limit(pending)
-    start_pin_turn(pending, "conv1", "Спасибо", ended)
+    _ended_at_limit(pending, ended)
+    start_pin_turn(pending, "conv1", "Спасибо", ended_prompts=ended)
     assert "conv1" in ended
 
-    reply = start_pin_turn(pending, thread, text, ended)
+    reply = start_pin_turn(pending, thread, text, ended_prompts=ended)
     assert reopen_ended_prompt(pending, ended, thread, reply) is None
     assert pending == {}
 
@@ -4315,8 +4535,8 @@ def test_a_prompt_out_of_attempts_is_not_reopened() -> None:
     """Reopened, it could only refuse the PIN."""
     pending: dict[str, Any] = {}
     ended: dict[str, Any] = {}
-    _ended_at_limit(pending, attempts=5)
-    reply = start_pin_turn(pending, "conv1", "Открой замок", ended)
+    _ended_at_limit(pending, ended, attempts=5)
+    reply = start_pin_turn(pending, "conv1", "Открой замок", ended_prompts=ended)
     assert ended == {}
     assert reopen_ended_prompt(pending, ended, "conv1", reply) is None
 
@@ -4330,8 +4550,9 @@ def test_a_reopened_prompt_keeps_its_sentence_checks() -> None:
     action["replies"] = 3
     action["sentence_checks"] = 4
     keep_pin_prompts(pending, reply)
+    end_pin_turn(pending, reply.turn_id, ended_prompts=ended)
 
-    reply = start_pin_turn(pending, "conv1", "Открой замок", ended)
+    reply = start_pin_turn(pending, "conv1", "Открой замок", ended_prompts=ended)
     action_id = reopen_ended_prompt(pending, ended, "conv1", reply)
 
     assert action_id is not None
@@ -4341,12 +4562,12 @@ def test_a_reopened_prompt_keeps_its_sentence_checks() -> None:
 def test_an_ended_prompt_is_not_reopened_after_the_window() -> None:
     pending: dict[str, Any] = {}
     ended: dict[str, Any] = {}
-    _ended_at_limit(pending)
-    start_pin_turn(pending, "conv1", "Спасибо", ended)
+    _ended_at_limit(pending, ended)
+    start_pin_turn(pending, "conv1", "Спасибо", ended_prompts=ended)
     late = dt_util.utcnow() - ENDED_PROMPT_REOPEN_WINDOW - timedelta(seconds=1)
     ended["conv1"]["ended_at"] = late.isoformat()
 
-    reply = start_pin_turn(pending, "conv1", "Открой замок", ended)
+    reply = start_pin_turn(pending, "conv1", "Открой замок", ended_prompts=ended)
     assert reopen_ended_prompt(pending, ended, "conv1", reply) is None
     assert ended == {}
 
@@ -4357,8 +4578,8 @@ async def test_a_reopened_prompt_asks_for_the_pin_in_fixed_words(
     """The reply names the action and ends with the question, so the mic stays open."""
     pending: dict[str, Any] = {}
     ended: dict[str, Any] = {}
-    _ended_at_limit(pending)
-    reply = start_pin_turn(pending, "conv1", "Открой замок", ended)
+    _ended_at_limit(pending, ended)
+    reply = start_pin_turn(pending, "conv1", "Открой замок", ended_prompts=ended)
     action_id = reopen_ended_prompt(pending, ended, "conv1", reply)
     assert action_id is not None
     chat_log = _DeltaChatLog([])
@@ -4373,7 +4594,7 @@ async def test_a_reopened_prompt_asks_for_the_pin_in_fixed_words(
     assert action["disclosed"] is True
     assert action["request_key"] == "открой замок"
     # The next message answers it as a first reply.
-    answer = start_pin_turn(pending, "conv1", "1234", ended)
+    answer = start_pin_turn(pending, "conv1", "1234", ended_prompts=ended)
     assert action["reply_turn"] == answer.turn_id
     assert action["replies"] == 1
 

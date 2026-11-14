@@ -27,6 +27,7 @@ from custom_components.home_generative_agent.agent.helpers import (
     PIN_REFUSAL_ENDS_TURN,
     PinReply,
     disclose_pin_prompts,
+    end_pin_turn,
     keep_pin_prompts,
     normalize_pin,
     pin_digits,
@@ -124,8 +125,9 @@ class _Turns:
         )
 
     def say(self, text: str) -> None:
-        """Start the next turn with the user's message."""
+        """End the current turn, as the handler does, and start the next one."""
         configurable = self.config["configurable"]
+        end_pin_turn(self.pending, configurable["pin_reply"].turn_id)
         configurable["pin_reply"] = start_pin_turn(
             self.pending, configurable["thread_id"], text
         )
@@ -1009,8 +1011,10 @@ def test_a_new_turn_only_ages_its_own_conversation() -> None:
         start_pin_turn(pending, "conv-b", "hello")
     assert action_id in pending
 
-    start_pin_turn(pending, "conv-a", "1234")
+    pin_turn = start_pin_turn(pending, "conv-a", "1234")
     assert pending[action_id]["reply_turn"] is not None
+    # The reply turn ends without keeping the prompt, which drops it.
+    end_pin_turn(pending, pin_turn.turn_id)
     start_pin_turn(pending, "conv-a", "never mind")
     assert action_id not in pending
 
@@ -1127,8 +1131,7 @@ async def test_the_refused_pin_warning_hashes_off_the_event_loop(
 def test_the_options_flow_stores_a_full_width_pin_as_ascii() -> None:
     """A PIN typed in full-width digits is enrolled as the ASCII PIN."""
     options: dict[str, Any] = {}
-    error = HomeGenerativeAgentOptionsFlow._maybe_edit_pin(
-        cast("Any", None),
+    error = HomeGenerativeAgentOptionsFlow()._maybe_edit_pin(
         options,
         {
             CONF_CRITICAL_ACTION_PIN_ENABLED: True,
@@ -1166,8 +1169,7 @@ def test_the_options_flow_refuses_digits_that_do_not_fold_to_ascii() -> None:
     fold to ASCII and no message could ever confirm such a PIN.
     """
     options: dict[str, Any] = {}
-    error = HomeGenerativeAgentOptionsFlow._maybe_edit_pin(
-        cast("Any", None),
+    error = HomeGenerativeAgentOptionsFlow()._maybe_edit_pin(
         options,
         {
             CONF_CRITICAL_ACTION_PIN_ENABLED: True,

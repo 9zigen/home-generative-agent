@@ -15,13 +15,13 @@ def _provider_block(marker: str, chars: int = 600) -> str:
 
 def test_openai_provider_has_streaming_true() -> None:
     """ChatOpenAI construction includes streaming=True."""
-    block = _provider_block("openai_provider = ChatOpenAI(")
+    block = _provider_block("def build_openai_chat(", 2000)
     assert "streaming=True" in block
 
 
 def test_openai_provider_has_stream_usage_true() -> None:
     """ChatOpenAI construction includes stream_usage=True to preserve usage_metadata."""
-    block = _provider_block("openai_provider = ChatOpenAI(")
+    block = _provider_block("def build_openai_chat(", 2000)
     assert "stream_usage=True" in block
 
 
@@ -33,9 +33,12 @@ def test_anthropic_provider_has_streaming_true() -> None:
 
 def test_openai_provider_http_client_preserved() -> None:
     """ChatOpenAI construction still wires the sync and async HTTP clients."""
-    block = _provider_block("openai_provider = ChatOpenAI(")
-    assert "http_client=openai_http_client" in block
+    block = _provider_block("def build_openai_chat(", 2000)
+    assert "http_client=http_client" in block
     assert "http_async_client=http_async_client" in block
+    setup = _provider_block("return build_openai_chat(")
+    assert "http_client=openai_http_client" in setup
+    assert "http_async_client=http_async_client" in setup
 
 
 def test_anthropic_provider_primed_before_publish() -> None:
@@ -44,5 +47,5 @@ def test_anthropic_provider_primed_before_publish() -> None:
     end = _INIT.index("except Exception:", start)
     block = _INIT[start:end]
     prime = block.index("await async_prime_async_client(hass, anthropic_chat)")
-    publish = block.index("anthropic_provider = anthropic_chat.configurable_fields(")
+    publish = block.index("return anthropic_chat.configurable_fields(")
     assert prime < publish

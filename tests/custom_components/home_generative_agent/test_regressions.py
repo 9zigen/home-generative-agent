@@ -626,7 +626,7 @@ async def test_an_ended_pin_request_is_followed_by_a_reply_before_the_user(
         "AIMessage",
         "HumanMessage",
     ]
-    assert "ended without confirmation" in str(sent[3].content)
+    assert "ended without confirmation" in str(cast("Any", sent[3]).content)
     assert state["messages"] == stored
 
 
