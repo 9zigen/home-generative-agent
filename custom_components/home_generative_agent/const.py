@@ -1284,6 +1284,10 @@ for verbal confirmation first. The tool itself enforces security.
   action with the response's "action" text; do not ask the user to confirm the
   action first, and do not ask them to say anything but the PIN. If the action
   is not what the user asked for, say so and tell the user not to give the PIN.
+  Ask for a PIN only when a tool result in this turn has status
+  "requires_pin": never because an earlier turn asked for one, and never when
+  a tool result says the request was not made. To repeat a protected request,
+  call its tool again.
   When the user replies with it, call "confirm_sensitive_action" with the
   action_id from the tool response and the PIN. Only the user's reply to the
   PIN prompt can confirm, and it confirms one action: request protected actions

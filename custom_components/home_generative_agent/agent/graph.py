@@ -204,6 +204,9 @@ _LC_TOOL_TIMEOUT_S: float = 30.0
 _LLM_INVOKE_TIMEOUT_S: float = 180.0
 
 _PIN_LOOKBACK = 20  # messages to scan for an unresolved requires_pin
+# Marks the result of a protected request that was not held for a PIN
+# (`_request_refused`); kept as the ToolMessage artifact, which no model sees.
+_PIN_REQUEST_REFUSED = "pin_request_refused"
 _ROUTING_REJECTION_MARKER = "is not available for this request"
 _OPEN_STATE_RETRY_PHRASES: frozenset[str] = frozenset(
     {"yes", "y", "try again", "again"}
@@ -598,6 +601,7 @@ def _critical_action_guard(  # noqa: PLR0913
             tool_call_id=tool_call.get("id"),
             name=tool_name,
             status="error",
+            artifact={_PIN_REQUEST_REFUSED: True},
         )
     return ToolMessage(
         content=json.dumps(
@@ -4663,6 +4667,21 @@ def _requests_pin(msg: BaseMessage) -> bool:
     return isinstance(data, dict) and data.get("status") == "requires_pin"
 
 
+def _request_refused(msg: BaseMessage) -> bool:
+    """
+    Return True for a protected request that was not held (`_critical_action_guard`).
+
+    Another voice's prompt is waiting, another request of this conversation
+    is being answered, or this turn already holds one. The tool tells the
+    model not to ask for a PIN, but a local model asked anyway ("Пожалуйста,
+    введите ПИН-код ...", field test 2026-11-14), so the user heard a prompt
+    that did not exist, and the model later repeated it from the thread
+    without calling the tool. The fixed refusal line is the reply instead.
+    """
+    artifact = getattr(msg, "artifact", None)
+    return isinstance(artifact, dict) and artifact.get(_PIN_REQUEST_REFUSED) is True
+
+
 def _pin_line_ends_turn(msg: BaseMessage, pin_reply: PinReply | None) -> bool:
     """Return True for a result the fixed PIN lines answer without the model."""
     failed_check = (
@@ -4671,7 +4690,12 @@ def _pin_line_ends_turn(msg: BaseMessage, pin_reply: PinReply | None) -> bool:
         and not pin_reply.confirmed
         and getattr(msg, "name", None) == CONFIRM_TOOL_NAME
     )
-    return failed_check or _refusal_ends_turn(msg) or _requests_pin(msg)
+    return (
+        failed_check
+        or _refusal_ends_turn(msg)
+        or _requests_pin(msg)
+        or _request_refused(msg)
+    )
 
 
 def _after_tools(

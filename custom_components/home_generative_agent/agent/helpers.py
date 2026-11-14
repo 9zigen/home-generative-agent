@@ -680,6 +680,9 @@ _SPOKEN_DIGITS = {
     "один": "1",
     "одна": "1",
     "одно": "1",
+    # Russian speakers read "one" as "раз" in digit strings ("раз, два, три");
+    # a PIN said so missed the PIN check (field test 2026-11-14).
+    "раз": "1",
     "два": "2",
     "две": "2",
     "три": "3",

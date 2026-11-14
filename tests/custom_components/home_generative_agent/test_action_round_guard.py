@@ -649,3 +649,43 @@ def test_a_wrong_pin_ends_the_turn_but_a_confirmed_action_does_not(
     )
     config: Any = {"configurable": {"pin_reply": reply}}
     assert _after_tools(_tool_round(result), config) == expected
+
+
+def test_a_refused_request_ends_the_turn_on_the_fixed_refusal() -> None:
+    """
+    The model is not asked to answer a request that was not held.
+
+    Told not to ask for a PIN, a local model asked anyway, for a prompt that
+    did not exist (field test 2026-11-14); the fixed refusal line is the reply.
+    """
+    refused = ToolMessage(
+        content="Not requested: another person's request is waiting for a PIN.",
+        tool_call_id="1",
+        name="HassTurnOn",
+        status="error",
+        artifact={graph_module._PIN_REQUEST_REFUSED: True},
+    )
+    assert _after_tools(_tool_round(refused), {}) == "summarize_and_remove_messages"
+
+
+def test_a_refused_request_next_to_another_result_goes_back_to_the_model() -> None:
+    refused = ToolMessage(
+        content="Not requested.",
+        tool_call_id="1",
+        name="HassTurnOn",
+        status="error",
+        artifact={graph_module._PIN_REQUEST_REFUSED: True},
+    )
+    other = ToolMessage(content="done", tool_call_id="2", name="HassTurnOff")
+    assert _after_tools(_tool_round(refused, other), {}) == "agent"
+
+
+def test_an_error_shaped_like_the_refusal_does_not_end_the_turn() -> None:
+    """Only the guard's own marker ends the turn, not the text of a result."""
+    error = ToolMessage(
+        content="Not requested: another person's request is waiting for a PIN.",
+        tool_call_id="1",
+        name="HassTurnOn",
+        status="error",
+    )
+    assert _after_tools(_tool_round(error), {}) == "agent"

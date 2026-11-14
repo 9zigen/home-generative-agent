@@ -455,6 +455,10 @@ async def test_an_unexpected_error_still_uses_up_the_confirmation() -> None:
         ("один два три четыре", True),
         ("Один, два, три и четыре.", True),
         ("пин один две три четыре", True),
+        # "раз" for one, as Russian speakers read digits (field test 2026-11-14).
+        ("Пин-код раз, два, три, четыре.", True),
+        ("раз два три", False),
+        ("попроси ещё раз", False),
         ("один два три", False),
         ("один два три пять", False),
         ("unlock 2 doors, PIN 1234", True),

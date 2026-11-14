@@ -4228,6 +4228,7 @@ def test_misheard_pin_from_another_voice_is_asked_again() -> None:
         "Пин-код 1234.",
         "Мой пин-код один два три четыре",
         "ПИН один, два, три и четыре",
+        "Пин-код раз, два, три, четыре",
     ],
 )
 def test_a_pin_reply_with_labels_follows_a_prompt(text: str) -> None:
