@@ -40,6 +40,15 @@ their own. See [RELEASING.md](RELEASING.md).
 - **Sentinel's Home Assistant notifications no longer turn device names or model text into links or images.** A device named like a Markdown link (`[Check](https://…)`), or an explanation carrying an image, rendered as a live link or picture in the persistent notifications Sentinel posts when no notify service is set, burst-batch summaries included (and in the new full-text records). That text is now escaped and shown as written ([#922](https://github.com/goruck/home-generative-agent/issues/922)).
 - **A Sentinel Model on a second Ollama server is no longer held back by chat on the first** ([#877](https://github.com/goruck/home-generative-agent/issues/877)). The local GPU gates decided by deployment alone, so with the Sentinel Model on its own Ollama server, Sentinel still waited for every chat and camera turn on the Conversation server (and its 30 s grace), had its calls cancelled by chat there, and kept the per-run triage limit and the gap between calls: during a conversation, findings went out untriaged and without explanations. Now, when no server in the Sentinel Model's chain (its fallbacks included) is one a Conversation, camera, summarization or embedding model or any of their fallbacks can reach, none of those gates hold Sentinel back, and the log says so at startup. A stalled-provider probe to such a server is also sent during chat. Any shared server, or one whose address is not known, keeps every gate exactly as before. A server is its host name: two Ollama instances on one machine count as one, and every loopback address (`localhost`, `127.0.0.1`, `::1`) is the same. Also fixed: a reload during a Sentinel model call could leave the old Sentinel engine subscribed to state changes.
 
+## [3.45.3-alab.1] - 2026-11-14
+
+Fork release: 3.45.2-alab.9 plus two PIN fixes from the first live two-voice test. The patch base moves to 3.45.3 so the release list keeps sorting fork versions in order; no upstream 3.45.3 is included.
+
+### Fixed
+
+- **A refused PIN request no longer makes up a PIN prompt.** When another voice's prompt was waiting, the protected request was refused, but Gemma still answered "Пожалуйста, введите ПИН-код …" for a prompt that did not exist, and on a later turn repeated it from the thread without calling the tool, so no prompt was opened at all. A round whose protected requests were all refused now ends without another model round: the fixed refusal line is the whole reply. The system prompt also says to ask for a PIN only when a tool result in this turn asks for one.
+- **A PIN read with "раз" for one is recognized** ("пин-код раз, два, три, четыре"). It used to miss the PIN check and go to the model, which answered as if asked to store the PIN.
+
 ## [3.45.2-alab.9] - 2026-11-14
 
 Fork release: 3.45.2-alab.8 plus upstream main (#987 merged, #1001, #1006, #949, #996).
