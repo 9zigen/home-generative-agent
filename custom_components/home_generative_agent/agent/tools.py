@@ -82,7 +82,6 @@ from ..core.fallback import (  # noqa: TID252
     ainvoke_dropping_unsupported_params,
 )
 from ..core.memories import (  # noqa: TID252
-    all_memories,
     memories_full,
     memory_limit,
     memory_namespace,
@@ -121,11 +120,15 @@ from .helpers import (
     PIN_AWAITING_USER_REPLY,
     PIN_OUTCOME_DONE,
     PIN_OUTCOME_FAILED,
+    PIN_OUTCOME_PARTIAL,
     PIN_OUTCOME_UNKNOWN,
     PIN_REFUSAL_ENDS_TURN,
+    TOOL_STATUS_PARTIAL,
     ConfigurableData,
+    IntentResults,
     base_tool_name,
     drop_empty_args,
+    intent_results,
     keep_pin_prompt,
     minimal_payload_for_domain,
     narrow_intent_args,
@@ -139,6 +142,7 @@ from .helpers import (
     sanitize_tool_args,
     sanitize_tool_text,
     tool_call_data,
+    with_failure_note,
 )
 from .indirect_pin import (
     BUILTIN_INTENT,
@@ -716,11 +720,12 @@ async def upsert_memory(  # noqa: D417
     """
     INSERT or UPDATE a memory about users in the database.
 
-    You MUST use this tool to INSERT or UPDATE memories about users.
-    Examples of memories are specific facts or concepts learned from interactions
-    with users. If a memory conflicts with an existing one then just UPDATE the
-    existing one by passing in "memory_id" and DO NOT create two memories that are
-    the same. If the user corrects a memory then UPDATE it.
+    Use this when the user asks you to remember something, or tells you a
+    lasting fact or preference about themselves (a routine, a schedule, how
+    they like things). Do not save the request itself, or a one-off command
+    or question. If a memory conflicts with an existing one then just UPDATE
+    the existing one by passing in "memory_id" and DO NOT create two memories
+    that are the same. If the user corrects a memory then UPDATE it.
 
     Args:
         content: The main content of the memory.
@@ -769,13 +774,17 @@ async def list_memories(
     """
     if "configurable" not in config:
         return "Configuration not found. Please check your setup."
-    found = await all_memories(store, config["configurable"]["user_id"])
+    # One row past what is shown says whether older memories were left out.
+    found = await store.asearch(
+        memory_namespace(config["configurable"]["user_id"]),
+        limit=MEMORY_LIST_MAX_SHOWN + 1,
+    )
     if not found:
         return "You have no memories about this user."
     shown = found[:MEMORY_LIST_MAX_SHOWN]
     lines = [f"[{item.key}]: {item.value.get('content', '')}" for item in shown]
     if len(found) > len(shown):
-        lines.append(f"({len(found) - len(shown)} older memories are not shown.)")
+        lines.append("(Older memories are not shown.)")
     return "\n".join(lines)
 
 
@@ -802,7 +811,11 @@ async def forget_memory(  # noqa: D417
     if await store.aget(namespace, memory_id) is None:
         return f"No memory with id {memory_id}. Nothing was deleted."
     await store.adelete(namespace, memory_id)
-    return f"Deleted memory {memory_id}"
+    # The memories shown to you this turn were read before the delete.
+    return (
+        f"Deleted memory {memory_id}. It may still appear in your memories "
+        "until the next request; do not save it again."
+    )
 
 
 @tool(parse_docstring=True)
@@ -1495,13 +1508,18 @@ def _claim_pending_action(cfg: Mapping[str, Any], action_id: str) -> bool:
 
 
 def _record_confirmed(
-    cfg: Mapping[str, Any], action: Mapping[str, Any], outcome: str
+    cfg: Mapping[str, Any],
+    action: Mapping[str, Any],
+    outcome: str,
+    results: IntentResults | None = None,
 ) -> None:
     """Record on the user's message the action its PIN was accepted for and its end."""
     pin_reply = cfg.get("pin_reply")
     if pin_reply is not None:
         pin_reply.confirmed = describe_pending_action(cfg.get("hass"), action)
         pin_reply.outcome = outcome
+        pin_reply.failed_count = results.failed if results else 0
+        pin_reply.failed_targets = results.names if results else ()
 
 
 def _spend_pin_reply(cfg: Mapping[str, Any]) -> None:
@@ -1535,6 +1553,36 @@ def _held_api(ha_llm_api: Any, held_api: object, tool_name: str) -> Any | None:
         )
     ]
     return owners[0] if len(owners) == 1 else None
+
+
+def _completed_reply(
+    cfg: Mapping[str, Any],
+    action: Mapping[str, Any],
+    action_id: str,
+    data: Any,
+    status: str | None,
+) -> str:
+    """Record a PIN-confirmed call that acted, and return its tool result."""
+    # Some targets may have failed while the rest acted (#948).
+    results = intent_results(data) if status == TOOL_STATUS_PARTIAL else None
+    partial = results is not None and results.failed > 0
+    _record_confirmed(
+        cfg,
+        action,
+        PIN_OUTCOME_PARTIAL if partial else PIN_OUTCOME_DONE,
+        results if partial else None,
+    )
+    result = data
+    if partial and results is not None:
+        payload = json.loads(data) if isinstance(data, str) else data
+        # The same note, names withheld the same way, as the normal path's.
+        result = with_failure_note(payload, results)
+    # default=str: a result the JSON encoder cannot take must not raise after
+    # the action ran.
+    return json.dumps(
+        {"status": "completed", "action_id": action_id, "result": result},
+        default=str,
+    )
 
 
 async def _execute_pending_action(  # noqa: PLR0911, PLR0912
@@ -1638,17 +1686,7 @@ async def _execute_pending_action(  # noqa: PLR0911, PLR0912
         failure = type(err).__name__
     else:
         if not response.error and status != "error":
-            _record_confirmed(cfg, action, PIN_OUTCOME_DONE)
-            # default=str: a result the JSON encoder cannot take must not
-            # raise after the action ran.
-            return json.dumps(
-                {
-                    "status": "completed",
-                    "action_id": resolved_action_id,
-                    "result": data,
-                },
-                default=str,
-            ), None
+            return _completed_reply(cfg, action, resolved_action_id, data, status), None
         # HA 2026.10's error flag gets the same reply as a raised error.
         failure = (
             content if status == "error" else json.dumps(response.data, default=str)
@@ -2150,7 +2188,9 @@ async def get_entity_history(  # noqa: D417
             for n, d in zip(friendly_names, domains, strict=False)
         ]
     except ValueError as e:
-        LOGGER.exception("Invalid name %s or domain: %s", friendly_names, domains)
+        # The usual answer for a misheard name or one hidden from Assist (#952),
+        # and the model is told: not a fault, so no ERROR line or traceback.
+        LOGGER.debug("get_entity_history: %s", e)
         return {"error": str(e)}
 
     now = dt_util.utcnow()

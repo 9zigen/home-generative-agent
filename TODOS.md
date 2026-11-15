@@ -467,6 +467,18 @@ v3.41.1 rather than deferred; see the TODO above.
 **Priority:** P3
 **Depends on:** None
 
+### parse_tool_response reads an alarm intent's disarm as a failed arm
+
+**What:** In `parse_tool_response` (`agent/helpers.py`), the alarm branch tests `"arm" in service`, which is also true for `alarm_disarm`, so a successful disarm (`inferred_state` "disarmed") is set to `status="error"` by the arm check, and the disarm check cannot clear it. An intent call with domain `alarm_control_panel` never sets `inferred_state` at all, so any arm or disarm read there is an error, which also hides a partial result (#948).
+
+**Why:** Claude adversarial pass, #948 review cycle 1 (2026-11-13). Not reachable in practice today: the agent's own alarm tool does not go through `parse_tool_response`, and `_route_alarm_intent_to_tool` (`agent/graph.py`) redirects intent alarm calls to it. Lindo chose TODOS over an issue.
+
+**How to apply:** Check disarm first (`service.endswith("disarm")`), or match the service name exactly against the arm and disarm service sets. Add a classifier row in `test_pin_action_line.py::test_the_shared_reply_classifier` for a disarm that reached "disarmed".
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** None
+
 ### Mixed-provider fallback chains: lossy schema for capable fallbacks, schema 400s do not advance the chain
 
 **What:** `_bind_model_tools` now re-runs the provider-gated schema passes per chain member (`_tools_for_chain_member`, `agent/graph.py`), which fixed the field failure (Ollama primary, Gemini fallback, `any_of[0].required` 400, 2026-10-03). Two leftovers: (1) the passes are subtractive and run on the primary's already-shaped list, so an OpenAI/Anthropic/Gemini primary still hands its lossy flattened or sanitized schema to a union-capable fallback (Ollama); (2) `_is_retryable` (`core/fallback.py`) does not classify an invalid-function-schema 400 as a chain-advance error, so a novel rejected shape on a middle member hard-fails the wrapper and relies on the graph-level drop-and-retry, which re-walks the chain from the primary.
@@ -2156,6 +2168,18 @@ label pair ("Server URL" vs "Base URL").
 **Why:** Claude adversarial pass of the #942 subset (2026-11-09); Low, each needs a database outage or an unload to land in a narrow window, and the docs state the reload limit.
 
 **How to apply:** (1) Persist the notes in an HA Store and flush at setup. (2) Refuse to start a note once unload has begun, or loop until the set is empty. (3) Re-read the primary before a removal on the held path, outside the verifier lock.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** None
+
+### The tool-bound sampling retry drops every sampling parameter, not the rejected one
+
+**What:** When a provider rejects a sampling parameter with tools bound, the retry rebinds with `dict.fromkeys(DROPPABLE_SAMPLING_PARAMS)`, clearing `temperature`, `top_p` and `reasoning_effort` together, whichever one was rejected: `_retry_with_default_sampling` in `core/fallback.py` and `_invoke_chat_model_with_sampling_rebind` in `agent/graph.py`. Since PR #1000 makes Top P configurable per feature, a rejected `reasoning_effort` or temperature also discards the user's Top P for that call. The untooled path removes only the rejected parameter.
+
+**Why:** Codex adversarial pass on PR #1000 (2026-11-14), confirmed in the code; the retry dates from #502. Before #1000 the only Top P was the built-in 1.0, so dropping it changed nothing. The retry logs a warning ("retried with provider-default sampling parameters"), so it is not silent, and it fires only for a provider that rejects a sampling setting.
+
+**How to apply:** Rebind with only the parameter `unsupported_sampling_param_in_chain(err)` names, and repeat if the retry is rejected for another one, as the untooled path does; keep the attempt bound. Note the Gemini entry under Agent: a `None` temperature cannot unset a Gemini model's field, so the selective rebind must not pass `None` for a field the model type cannot take. Test both call sites with a fake model that rejects `reasoning_effort` and check the retry still carries `top_p`.
 
 **Effort:** S
 **Priority:** P3

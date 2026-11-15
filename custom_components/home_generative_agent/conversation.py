@@ -50,6 +50,7 @@ from .agent.graph import workflow
 from .agent.helpers import (
     PIN_ANSWER_KWARG,
     PIN_OUTCOME_FAILED,
+    PIN_OUTCOME_PARTIAL,
     PIN_OUTCOME_UNKNOWN,
     SENTENCE_PIN_KEY,
     active_llm_api_ids,
@@ -86,7 +87,11 @@ from .agent.indirect_pin import (
     is_remote_home_assistant,
     remote_house_name,
 )
-from .agent.pin_messages import describe_pending_action, pin_msg
+from .agent.pin_messages import (
+    describe_failed_targets,
+    describe_pending_action,
+    pin_msg,
+)
 from .agent.rag_embedding_text import (
     strip_for_embedding,
     truncate_for_embedding_index,
@@ -127,9 +132,11 @@ from .const import (
     DOMAIN,
     LANGCHAIN_LOGGING_LEVEL,
     NETWORK_AUDIT_TOOL_PROMPT,
+    NO_REPLY_APOLOGY,
     RECOMMENDED_SENTINEL_NETWORK_ENABLED,
     RECOMMENDED_VOICE_ACK_TIMING,
     SCHEMA_FIRST_YAML_PROMPT,
+    SHARED_MEMORY_USER,
     SIGNAL_TOOL_INDEX_UPDATED,
     SPEAKER_KNOWN_PROMPT,
     SPEAKER_NAME_MAX_CHARS,
@@ -1705,6 +1712,20 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
             return user_name
         return speaker.user if speaker else None
 
+    @classmethod
+    def _memory_namespace(
+        cls, user_name: str | None, speaker: Speaker | None
+    ) -> tuple[str, bool]:
+        """
+        Return the turn's memory namespace label and whether it is a user's own.
+
+        A turn with no memory user (an automation, an unrecognized voice) runs
+        as "robot", whose memories everyone shares. A user name that cleans to
+        "robot" or to nothing is not a memory user of its own either (#1015).
+        """
+        clean = memory_store_user(cls._memory_user(user_name, speaker))
+        return clean, clean != SHARED_MEMORY_USER
+
     @staticmethod
     def _pin_owner(
         user_name: str | None, waiting_prompt: Mapping[str, Any] | None
@@ -2150,7 +2171,20 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
     ) -> list[str]:
         """Return the fixed lines this turn's reply must carry, in order."""
         lines: list[str] = []
-        if pin_reply.confirmed:
+        if pin_reply.confirmed and pin_reply.outcome == PIN_OUTCOME_PARTIAL:
+            # Said in fixed words: "PIN accepted: unlock..." alone would
+            # read as done with one of the locks still locked (#948).
+            lines.append(
+                pin_msg(
+                    self.hass,
+                    "pin_partial_line",
+                    action=pin_reply.confirmed,
+                    failed=describe_failed_targets(
+                        self.hass, pin_reply.failed_targets, pin_reply.failed_count
+                    ),
+                )
+            )
+        elif pin_reply.confirmed:
             key = {
                 PIN_OUTCOME_FAILED: "pin_failed_line",
                 PIN_OUTCOME_UNKNOWN: "pin_unknown_line",
@@ -2570,8 +2604,7 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
             user_name = user.name
             requester_is_admin = bool(user.is_admin)
         # A user name of None indicates an automation is being run.
-        memory_user = self._memory_user(user_name, speaker)
-        clean_user_name = memory_store_user(memory_user)
+        clean_user_name, has_memory_user = self._memory_namespace(user_name, speaker)
         pin_owner = self._pin_owner(user_name, waiting_prompt)
 
         if result := await self._async_confirm_pin_reply(
@@ -2657,6 +2690,7 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
                     self._thread_id(conversation_id, speaker) if speaker else None
                 ),
                 "user_id": clean_user_name,
+                "has_memory_user": has_memory_user,
                 "pin_owner": pin_owner,
                 "pin_reply": pin_reply,
                 "requester_is_admin": requester_is_admin,
@@ -2761,17 +2795,17 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
         # our mark on it (see _async_get_message_history). A PIN line is a
         # reply of its own, and "try again" would be wrong next to "PIN
         # accepted".
-        no_reply = not chat_log.content or not isinstance(
-            chat_log.content[-1], conversation.AssistantContent
+        last = chat_log.content[-1] if chat_log.content else None
+        # An entry with no text and no tool call says nothing either (#946).
+        no_reply = not isinstance(last, conversation.AssistantContent) or not (
+            (last.content and last.content.strip()) or last.tool_calls
         )
         if no_reply and not self._pin_lines(pending_actions, pin_reply):
             # Nothing to say at all: a turn ended on a tool round whose PIN
             # prompt vanished before the reply (the store evicted it, or a
             # concurrent turn dropped it), or recovery found nothing.
             _LOGGER.warning("Turn ended with no reply; apologizing.")
-            await self._async_add_spoken_reply(
-                chat_log, "I'm sorry, I was unable to respond. Please try again."
-            )
+            await self._async_add_spoken_reply(chat_log, NO_REPLY_APOLOGY)
         await self._async_add_pin_lines(
             chat_log, pending_actions, pin_reply, streamed=streamed
         )

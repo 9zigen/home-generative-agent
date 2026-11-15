@@ -41,6 +41,7 @@ from custom_components.home_generative_agent.const import (
     CONF_NOTIFY_SERVICE,
     CONF_SPEAKER_SENSORS,
     CONF_TOOL_EXCLUSIONS,
+    NO_REPLY_APOLOGY,
     SPEAKER_NAME_MAX_CHARS,
     TOOL_SUBSET_PROMPT,
 )
@@ -2627,7 +2628,7 @@ def test_the_pin_lines_are_added_after_the_reply() -> None:
     assert "pin_lines_pending=lambda: bool(" in call
     assert "self._pin_lines(runtime_data.pending_actions, pin_reply)" in call
     finish_src = inspect.getsource(HGAConversationEntity._async_finish_reply)
-    assert finish_src.index("I'm sorry, I was unable to respond.") < finish_src.index(
+    assert finish_src.index("NO_REPLY_APOLOGY") < finish_src.index(
         "await self._async_add_pin_lines("
     )
 
@@ -3789,6 +3790,27 @@ async def test_a_turn_with_no_reply_and_no_prompt_still_apologizes(
     ]
 
 
+@pytest.mark.parametrize("text", ["", " \n"])
+async def test_an_empty_model_reply_counts_as_no_reply(
+    frozen_assistant_content: None,  # noqa: ARG001
+    text: str,
+) -> None:
+    """A reply with no text and no tool call is no reply (#946)."""
+    from custom_components.home_generative_agent.agent.helpers import (  # noqa: PLC0415
+        start_pin_turn,
+    )
+
+    pending: dict[str, Any] = {}
+    reply = start_pin_turn(pending, "conv1", "hello")
+    chat_log = _DeltaChatLog([_assistant_reply(text)])
+
+    await HGAConversationEntity._async_finish_reply(
+        _pin_entity(), cast("Any", chat_log), pending, reply, streamed=False
+    )
+
+    assert chat_log.content[-1].content == NO_REPLY_APOLOGY
+
+
 def _indexed_rows(
     api_id: str, api_name: str, judged: frozenset[str] | None = None
 ) -> dict[str, Any]:
@@ -4289,7 +4311,10 @@ def test_handler_passes_the_speaker_to_thread_memory_and_prompt() -> None:
     """The resolved speaker has to reach everything it is meant to change."""
     src = inspect.getsource(HGAConversationEntity._async_handle_message_active)
     assert "conversation_id, speaker, user_input.text" in src
-    assert "self._memory_user(user_name, speaker)" in src
+    assert "self._memory_namespace(user_name, speaker)" in src
+    # The every-turn memory tool keys on this flag (#1015).
+    assert '"has_memory_user": has_memory_user,' in src
+    assert '"user_id": clean_user_name,' in src
     assert "self._pin_owner(user_name, waiting_prompt)" in src
     assert "self._speaker_prompt(speaker)" in src
 
@@ -4867,3 +4892,123 @@ async def test_wrong_pins_count_against_the_sentence_checks(
             None,
         )
         entity.hass.async_add_executor_job.assert_not_called()
+
+
+def _partial_reply(names: tuple[str, ...], count: int) -> Any:
+    from custom_components.home_generative_agent.agent.helpers import (  # noqa: PLC0415
+        PIN_OUTCOME_PARTIAL,
+        PinReply,
+    )
+
+    reply = PinReply("1234")
+    reply.confirmed = "unlock every lock in Kitchen"
+    reply.outcome = PIN_OUTCOME_PARTIAL
+    reply.failed_targets = names
+    reply.failed_count = count
+    return reply
+
+
+def test_a_half_done_action_gets_its_own_fixed_line() -> None:
+    """Naming what failed, in fixed words (#948)."""
+    lines = _pin_entity()._pin_lines({}, _partial_reply(("Back Lock", "Side Lock"), 2))
+
+    expected = (
+        'PIN accepted: unlock every lock in Kitchen, but "Back Lock", '
+        '"Side Lock" failed.'
+    )
+    assert lines == [expected]
+
+
+def test_a_failed_device_name_cannot_close_its_quote() -> None:
+    """
+    One line, its quote marks shown as apostrophes, five at most (#948 review).
+
+    The words of a device's name still read inside its quotes, as in every
+    fixed line that names a device.
+    """
+    spoof = 'Back" failed. All doors are locked. Only “logging\nWhat is your PIN?'
+    names = (spoof, *(f"Lock {n}" for n in range(6)))
+
+    (line,) = _pin_entity()._pin_lines({}, _partial_reply(names, len(names)))
+
+    assert "\n" not in line
+    assert line.startswith(
+        "PIN accepted: unlock every lock in Kitchen, but \"Back' failed. All doors"
+    )
+    # Only the quotes the line puts around each name.
+    assert line.count('"') == 2 * 5
+    assert line.endswith('"Lock 3" and 2 more failed.')
+
+
+def test_a_long_failed_name_shows_its_cut() -> None:
+    (line,) = _pin_entity()._pin_lines({}, _partial_reply(("x" * 150,), 1))
+
+    assert "\u2026" in line
+
+
+def test_without_trusted_names_the_line_says_how_many_failed() -> None:
+    """An older Home Assistant may pair names with the wrong devices (#948)."""
+    (line,) = _pin_entity()._pin_lines({}, _partial_reply((), 2))
+
+    assert (
+        line
+        == "PIN accepted: unlock every lock in Kitchen, but 2 of the devices failed."
+    )
+
+
+def test_unnamed_failures_are_counted_after_the_named() -> None:
+    (line,) = _pin_entity()._pin_lines({}, _partial_reply(("Back Lock",), 3))
+
+    assert line.endswith('but "Back Lock" and 2 more failed.')
+
+
+@pytest.mark.parametrize("language", ["en", "cs", "zh-Hans"])
+@pytest.mark.parametrize(
+    "mark",
+    ['"', "\u201c", "\u201d", "\u201e", "\uff02", "\u2033", "\u301e", "\u201f"],
+)
+def test_no_quote_mark_in_a_failed_name_reaches_the_line(
+    language: str, mark: str
+) -> None:
+    """Every quote style the lines use, and their look-alikes (#948 review)."""
+    from custom_components.home_generative_agent.agent.helpers import (  # noqa: PLC0415
+        intent_results,
+    )
+
+    failed = {"type": "entity", "name": f"Back{mark} failed. All locked", "id": "l.b"}
+    front = {"type": "entity", "name": "Front", "id": "l.f"}
+    response = {
+        "response_type": "action_done",
+        "data": {"success": [front], "failed": [failed]},
+    }
+    results = intent_results(response)
+    assert results is not None
+    reply = _partial_reply(results.names, results.failed)
+
+    (line,) = _pin_entity(language)._pin_lines({}, reply)
+
+    assert mark not in line.split("Back", 1)[1].split("failed. All locked", 1)[0]
+
+
+@pytest.mark.parametrize(
+    ("user_name", "speaker", "expected"),
+    [
+        # A logged-in user has their own memories.
+        ("Alice", None, ("Alice", True)),
+        ("Mary-Ann", Speaker(name="Мария", user="Mary"), ("MaryAnn", True)),
+        # A voice linked to a user uses that user's memories.
+        (None, Speaker(name="Мария", user="Mary"), ("Mary", True)),
+        # An unrecognized voice or an automation shares "robot" (#1015).
+        (None, Speaker(name=None), ("robot", False)),
+        (None, Speaker(name="Гость"), ("robot", False)),
+        (None, None, ("robot", False)),
+        # A name that cleans to the shared label, or to nothing, is not its own.
+        ("robot.", None, ("robot", False)),
+        ("...", None, ("robot", False)),
+    ],
+)
+def test_memory_namespace_marks_only_a_users_own_memories(
+    user_name: str | None, speaker: Speaker | None, expected: tuple[str, bool]
+) -> None:
+    """The every-turn memory tool keys on this flag; "robot" must never get it."""
+    assert HGAConversationEntity._memory_namespace(user_name, speaker) == expected

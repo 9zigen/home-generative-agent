@@ -52,6 +52,7 @@ from .helpers import (
     PIN_REFUSED_IN_PROGRESS,
     PIN_REFUSED_LOCKED,
     PIN_REFUSED_OTHER_VOICE,
+    QUOTE_MARKS,
     SET_POSITION_INTENT,
     STOP_MOVING_INTENT,
     TOOL_NAMESPACE_SEP,
@@ -182,6 +183,8 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "pin_done_line": "PIN accepted: {action}.",
         "pin_failed_line": "PIN accepted, but {action} failed.",
         "pin_unknown_line": "PIN accepted; {action} may have run. Check the device.",
+        "pin_partial_line": "PIN accepted: {action}, but {failed} failed.",
+        "failed_device_count": "{count} of the devices",
         "pin_other_voice_waiting_line": (
             "A request to {action} is waiting for a PIN. Ask again after it is "
             "answered."
@@ -344,6 +347,8 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "pin_unknown_line": (
             "PIN přijat; {action} možná proběhlo. Zkontrolujte zařízení."
         ),
+        "pin_partial_line": "PIN přijat: {action}, ale u {failed} se to nepodařilo.",
+        "failed_device_count": "{count} zařízení",
         "pin_other_voice_waiting_line": (
             "Na PIN čeká požadavek: {action}. Zopakujte ten svůj, až bude vyřízen."
         ),
@@ -467,6 +472,8 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "pin_done_line": "PIN 已接受：{action}。",
         "pin_failed_line": "PIN 已接受，但{action}失败了。",
         "pin_unknown_line": "PIN 已接受；{action}可能已经执行。请检查设备。",
+        "pin_partial_line": "PIN 已接受：{action}，但{failed}失败了。",
+        "failed_device_count": "{count} 个设备",
         "pin_other_voice_waiting_line": (
             "“{action}”的请求正在等待 PIN。请在它处理完后再试。"
         ),
@@ -612,6 +619,10 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "pin_request_again_line": "Попросите ещё раз.",
         "pin_done_line": "ПИН-код принят. Выполнено: {action}.",
         "pin_failed_line": "ПИН-код принят, но не получилось {action}.",
+        "pin_partial_line": (
+            "ПИН-код принят. Выполнено: {action}. Не сработало: {failed}."
+        ),
+        "failed_device_count": "{count} из устройств",
         "pin_unknown_line": (
             "ПИН-код принят, но неизвестно, получилось ли {action}. Проверьте "
             "устройство."
@@ -826,6 +837,37 @@ def _one_line(value: Any, limit: int, *, mark_cut: bool = False) -> str:
     return sanitize_tool_text(text, limit=limit)
 
 
+# How many failed devices a partial line names before "and N more" (#948).
+_FAILED_TARGETS_MAX = 5
+
+
+def describe_failed_targets(hass: HomeAssistant | None, names: Any, count: int) -> str:
+    """
+    Name the devices a half-done action failed on, for the fixed line (#948).
+
+    Each one line, bounded (a cut shown) and quoted like every name in these
+    lines, its own quote marks shown as apostrophes, so a device name cannot
+    close the quote and read as more of the line; at most five, then a count
+    of the rest. With no names (an older Home Assistant may pair them with the
+    wrong devices), only how many failed.
+    """
+    lines = [
+        _one_line(
+            str(name).translate(_QUOTE_MARKS), _ACTION_TARGET_MAX_LEN, mark_cut=True
+        )
+        for name in names
+    ]
+    quoted = [_named(hass, line) for line in lines if line][:_FAILED_TARGETS_MAX]
+    if not quoted:
+        return pin_msg(hass, "failed_device_count", count=max(count, 1))
+    shown = ", ".join(quoted)
+    if count > len(quoted):
+        shown = pin_msg(
+            hass, "action_calls_more", calls=shown, count=count - len(quoted)
+        )
+    return shown
+
+
 def _first(value: Any) -> str:
     """Return the first entry of a list value, or the value, as text."""
     if isinstance(value, list):
@@ -900,8 +942,9 @@ def _slot_line(value: Any) -> str:
     return _one_line(str(value), _ACTION_TARGET_MAX_LEN)
 
 
-# Quote marks a device's own name may carry, read in the line as its end.
-_QUOTE_MARKS = str.maketrans(dict.fromkeys('"“”„', "'"))
+# Quote marks a device's own name may carry, read in the line as its end
+# (shared with the failed-device names, helpers.py).
+_QUOTE_MARKS = QUOTE_MARKS
 
 
 def _entity_friendly_name(hass: HomeAssistant | None, raw_name: Any) -> str:

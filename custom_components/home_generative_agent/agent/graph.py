@@ -64,6 +64,7 @@ from custom_components.home_generative_agent.const import (
     EMBEDDING_MODEL_PROMPT_TEMPLATE,
     MAX_AFFIRMATIVE_FOLLOW_UP_WORDS,
     MAX_REFERENTIAL_FOLLOW_UP_WORDS,
+    NO_REPLY_APOLOGY,
     NON_OPEN_ACTUATION_KEYWORDS_REGEX,
     OPEN_AS_STATE_REGEX,
     OPEN_COMMAND_CLAUSE_REGEX,
@@ -85,6 +86,7 @@ from ..core.fallback import (  # noqa: TID252
     ainvoke_dropping_unsupported_params,
     unsupported_sampling_param_in_chain,
 )
+from ..core.memories import memory_namespace  # noqa: TID252
 from ..core.prompt_cache import (  # noqa: TID252
     ANTHROPIC_LLM_TYPE,
     adapt_system_message_for_model,
@@ -643,7 +645,8 @@ async def _run_ha_tool(
         content=content_str,
         tool_call_id=tool_call.get("id"),
         name=tool_name,
-        status=status or "success",
+        # A partial run acted, so it is no error; its content names the rest.
+        status="error" if status == "error" else "success",
     )
 
 
@@ -1562,33 +1565,56 @@ async def _append_security_audit_tool(  # noqa: PLR0913
 _HISTORY_TOOL = "get_entity_history"
 # Tool search misses "remember this" requests, above all in languages other than
 # English, and a memory the model cannot save is simply lost.
-_ALWAYS_OFFERED_LOCAL_TOOLS = (
-    ("hga_local", "upsert_memory"),
-    ("hga_local", "list_memories"),
-    ("hga_local", "forget_memory"),
-)
+_MEMORY_TOOL = "upsert_memory"
+# "What do you remember about me?" (#997). forget_memory deletes, so it is
+# left to ranking: nothing has shown models leave it alone on commands.
+_MEMORY_LIST_TOOL = "list_memories"
+# HGA's own tools that step 3g binds on every turn, outside the limit.
+_ALWAYS_BOUND_LOCAL_TOOLS = (_HISTORY_TOOL, _MEMORY_TOOL, _MEMORY_LIST_TOOL)
+# Of those, the tools that read or write the turn's user's memories. A turn
+# with no memory user (an unrecognized voice, an automation) runs as "robot",
+# whose memories everyone shares, so these are bound only when ranking picks
+# them.
+_MEMORY_USER_TOOLS = frozenset({_MEMORY_TOOL, _MEMORY_LIST_TOOL})
 
 
-def _is_local_history_tool(tool: RawTool) -> bool:
-    """Return True for HGA's own history tool, which step 3g always binds."""
-    return tool["api_id"] == "hga_local" and tool["name"] == _HISTORY_TOOL
+def _always_bound_local_tools(config: RunnableConfig) -> tuple[str, ...]:
+    """Return the names of HGA's own tools step 3g binds on this turn."""
+    has_memory_user = config.get("configurable", {}).get("has_memory_user", False)
+    return tuple(
+        name
+        for name in _ALWAYS_BOUND_LOCAL_TOOLS
+        if has_memory_user or name not in _MEMORY_USER_TOOLS
+    )
 
 
-async def _append_history_tool(
+def _is_always_bound_local_tool(tool: RawTool, names: Sequence[str]) -> bool:
+    """Return True for one of HGA's own tools step 3g binds on this turn."""
+    return tool["api_id"] == "hga_local" and tool["name"] in names
+
+
+async def _append_always_bound_tools(
     candidates: list[RawTool],
     store: BaseStore,
     config: RunnableConfig,
     live_tool_ids: set[tuple[str, str]] | None,
 ) -> list[RawTool]:
     """
-    Bind ``get_entity_history`` on every turn.
+    Bind HGA's own every-turn tools (`_always_bound_local_tools`).
 
-    A history question phrased around the device ("when did the mudroom
-    lights turn off today?") ranks entity-control and date/time tools above
-    the history tool, and a model that is not handed the tool tells the user
-    it has no access to history (issue #715). English intent patterns caught
-    some of those, never other languages (#902), and missed English
-    phrasings such as "did anyone open the garage while I was away?". An eval
+    ``upsert_memory``: a request to remember something ("remember that I take
+    my tea without sugar") shares few words with the tool's description,
+    above all in another language, so ranking often left it out and the fact
+    was lost. ``list_memories`` answers "what do you remember about me?"
+    (#997). Both are bound only on a turn with a memory user.
+
+    ``get_entity_history``: a history question phrased around the device
+    ("when did the mudroom lights turn off today?") ranks entity-control and
+    date/time tools above the history tool, and a model that is not handed the
+    tool tells the user it has no access to history (issue #715). English
+    intent patterns caught some of those, never other languages (#902), and
+    missed English phrasings such as "did anyone open the garage while I was
+    away?". An eval
     on four Ollama models found that binding it every turn never drew a
     history call on a command or status question and did not change their
     tool choice or latency (#907), so it is always bound. Appended outside the
@@ -1596,19 +1622,29 @@ async def _append_history_tool(
     selection. The lookup is pinned to ``hga_local``: dispatch routes this
     name to the local implementation, so the bind must not pull in another
     API's same-named tool. A same-named tool that ranking already bound is
-    left as is.
+    left as is. The binding works the same way for the memory tools (outside
+    the limit, pinned to ``hga_local``), and an exclusion stored for any of
+    them still keeps it out. The #907 eval covered only the read-only history
+    tool; for ``upsert_memory``, a run on Gemma 4 12B over 40 commands and
+    status questions found no stray calls (#994). ``list_memories`` only
+    reads; ``forget_memory`` is not bound here.
     """
     opts = config.get("configurable", {}).get("options", {})
-    # An exclusion wins even when the live filter is fail-open and the lookup
-    # reads the raw index, as in ``_append_included_tools``.
-    if _has_local_tool(
-        candidates, _remote_ids(config), lambda name: name == _HISTORY_TOOL
-    ) or is_tool_excluded(_HISTORY_TOOL, tool_exclusions(opts).get("hga_local", ())):
-        return candidates
-    fetched = await _get_tool_by_name(
-        store, config, _HISTORY_TOOL, {"hga_local"}, live_tool_ids
-    )
-    return candidates if fetched is None else [*candidates, fetched]
+    excluded = tool_exclusions(opts).get("hga_local", ())
+    remote_ids = _remote_ids(config)
+    for tool_name in _always_bound_local_tools(config):
+        # An exclusion wins even when the live filter is fail-open and the
+        # lookup reads the raw index, as in ``_append_included_tools``.
+        if _has_local_tool(
+            candidates, remote_ids, lambda name, wanted=tool_name: name == wanted
+        ) or is_tool_excluded(tool_name, excluded):
+            continue
+        fetched = await _get_tool_by_name(
+            store, config, tool_name, {"hga_local"}, live_tool_ids
+        )
+        if fetched is not None:
+            candidates = [*candidates, fetched]
+    return candidates
 
 
 _TURN_ON_TOOL = "HassTurnOn"
@@ -3102,7 +3138,7 @@ async def _append_included_tools(
             len(inclusions),
         )
         inclusions = inclusions[:TOOL_INCLUSIONS_MAX_PER_TURN]
-    for api_id, name in [*_ALWAYS_OFFERED_LOCAL_TOOLS, *inclusions]:
+    for api_id, name in inclusions:
         if api_id not in allowed_api_ids or is_tool_excluded(
             name, excluded_names.get(api_id, ())
         ):
@@ -3188,10 +3224,14 @@ async def _retrieve_tools(  # noqa: PLR0915
         _filter_live_candidates(config, rag_tools, safety_tools, live_tool_ids)
     )
     live_filter_dropped += rag_dropped_not_live
-    # 1c. Step 3g binds HGA's own history tool on every turn, outside the
-    # limit, so a ranked copy would only take a slot from another tool (#907).
-    # A remote server's namesake is another tool and still ranks.
-    rag_tools = [t for t in rag_tools if not _is_local_history_tool(t)]
+    # 1c. Step 3g binds HGA's own every-turn tools (the history tool, #907,
+    # and the memory tool when the turn has a memory user) outside the limit,
+    # so a ranked copy would only take a slot from another tool. A remote
+    # server's namesake is another tool and still ranks.
+    always_bound = _always_bound_local_tools(config)
+    rag_tools = [
+        t for t in rag_tools if not _is_always_bound_local_tool(t, always_bound)
+    ]
 
     # 2. Merge: safety tools take priority; RAG fills remaining slots.
     #
@@ -3234,7 +3274,7 @@ async def _retrieve_tools(  # noqa: PLR0915
         fallback = [
             t
             for t in _get_fallback_tools(config, allowed_api_ids)
-            if not _is_local_history_tool(t)
+            if not _is_always_bound_local_tool(t, always_bound)
         ]
         (
             fallback_reason,
@@ -3353,9 +3393,10 @@ async def _retrieve_tools(  # noqa: PLR0915
         all_candidates, store, config, query, allowed_api_ids, live_tool_ids
     )
 
-    # 3g. Bind get_entity_history on every turn (#907). Before 3e so
-    # inclusions dedupe against it.
-    all_candidates = await _append_history_tool(
+    # 3g. Bind HGA's every-turn tools: get_entity_history (#907) and, with a
+    # memory user, upsert_memory and list_memories. Before 3e so inclusions
+    # dedupe against them.
+    all_candidates = await _append_always_bound_tools(
         all_candidates, store, config, live_tool_ids
     )
 
@@ -3739,7 +3780,7 @@ def _bind_model_tools(
 async def _recent_memories(store: BaseStore, user_id: str) -> list:
     """Return the most recent memories, without semantic search."""
     try:
-        return await store.asearch((user_id, "memories"), limit=10)
+        return await store.asearch(memory_namespace(user_id), limit=10)
     except Exception:
         LOGGER.exception("Memory recency search also failed; no memories injected")
         return []
@@ -3748,7 +3789,7 @@ async def _recent_memories(store: BaseStore, user_id: str) -> list:
 async def _search_memories(store: BaseStore, user_id: str, query: str | None) -> list:
     """Search the memory store, falling back gracefully on embedding errors."""
     try:
-        return await store.asearch((user_id, "memories"), query=query, limit=10)
+        return await store.asearch(memory_namespace(user_id), query=query, limit=10)
     except AttributeError:
         # Some OpenAI-compatible servers (e.g. llama-server) return a raw JSON
         # list from /v1/embeddings instead of {"data": [...]}, which causes the
@@ -3863,6 +3904,24 @@ def _pin_answered_later(messages: Sequence[AnyMessage], action_id: Any) -> bool:
     return False
 
 
+def _empty_reply_fallback(last_message: AnyMessage) -> str:
+    """
+    Return the text for a model reply with no text and no tool call.
+
+    Qwen3 extended-thinking: Ollama strips <think>…</think> tokens from
+    content, leaving content='' when all output was reasoning. After a tool
+    round a minimal acknowledgement keeps the conversation from going
+    silent. A first reply gets the apology instead: "Done." would claim an
+    action that never ran, and an empty AIMessage would stay in the
+    checkpoint for every later turn to read (#946).
+    """
+    if isinstance(last_message, ToolMessage):
+        LOGGER.debug("Empty model response after tool execution; injecting fallback.")
+        return "Done."
+    LOGGER.warning("Model returned an empty reply; apologizing.")
+    return NO_REPLY_APOLOGY
+
+
 async def _call_model(
     state: State, config: RunnableConfig, *, store: BaseStore
 ) -> dict[str, Any]:
@@ -3969,17 +4028,8 @@ async def _call_model(
 
     tool_calls = getattr(raw_response, "tool_calls", []) or []
 
-    # Qwen3 extended-thinking: Ollama strips <think>…</think> tokens from content,
-    # leaving content='' when all output was reasoning.  On a post-tool turn with no
-    # follow-up tool call the user would receive no reply at all.  Inject a minimal
-    # acknowledgement so the conversation doesn't go silent.
-    if (
-        not response
-        and not tool_calls
-        and isinstance(state["messages"][-1], ToolMessage)
-    ):
-        LOGGER.debug("Empty model response after tool execution; injecting fallback.")
-        response = "Done."
+    if not response.strip() and not tool_calls:
+        response = _empty_reply_fallback(state["messages"][-1])
 
     # Create AI message, no need to include tool call metadata if there's none.
     if tool_calls:
