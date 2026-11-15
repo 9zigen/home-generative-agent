@@ -167,13 +167,16 @@ async def test_a_pin_the_user_did_not_write_is_refused_without_an_attempt() -> N
     assert turns.pending[action_id]["attempts"] == 0
 
 
-async def test_only_the_request_turn_refusal_ends_the_turn() -> None:
+async def test_a_refusal_before_the_pin_is_checked_ends_the_turn() -> None:
     """
-    Before the user was asked, the reply asks in fixed words and the turn ends.
+    A refusal the user can only learn of in fixed words ends the turn.
 
-    In the reply turn the model is told what to say (say the digits one by
-    one; the PIN was already used), so the turn goes on. So does a turn whose
-    PIN already ran an action and whose model then re-issued the request.
+    Before the user was asked, the reply asks for the PIN. In the reply turn,
+    a PIN the user's message does not hold is answered "did not catch the PIN":
+    given the refusal back, a local model read its text out to the user (field
+    test 2026-11-14). A turn whose PIN already ran an action, and whose model
+    then re-issued the request, goes on: the model's reply is where the user
+    learns what happened.
     """
     api = _FakeAPI()
     turns = _Turns(api)
@@ -196,7 +199,11 @@ async def test_only_the_request_turn_refusal_ends_the_turn() -> None:
     not_in_message = await turns.confirm(action_id)
     assert isinstance(not_in_message, dict)
     assert not_in_message["status"] == PIN_AWAITING_USER_REPLY
-    assert PIN_REFUSAL_ENDS_TURN not in not_in_message
+    assert not_in_message[PIN_REFUSAL_ENDS_TURN] is True
+    reply = turns.config["configurable"]["pin_reply"]
+    assert reply.unreadable
+    # The prompt is kept, so the user's next message can still answer it.
+    assert prompts_awaiting_reply(turns.pending, reply)
 
     turns.say(PIN)
     done = await turns.confirm(action_id)

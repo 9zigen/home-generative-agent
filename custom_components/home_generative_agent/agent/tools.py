@@ -1405,6 +1405,12 @@ def _confirmation_refusal(
         # conversation), not from the user's message for this turn.
         not_in_message = True
         reason = "pin_awaiting_user_reply"
+        # The user's reply holds no PIN that can be read, so the reply says so
+        # in fixed words and the turn ends: given the refusal back, a local
+        # model read its text out ("Ошибка, ПИН-код должен быть в текущем
+        # сообщении", field test 2026-11-14).
+        pin_reply.unreadable = True
+        ends_turn = True
         kept = keep_pin_prompt(action, pin_reply)
         hint = "pin_say_digits" if kept else "pin_request_again"
     elif pin_reply.spent:
