@@ -82,8 +82,10 @@ from ..core.fallback import (  # noqa: TID252
     ainvoke_dropping_unsupported_params,
 )
 from ..core.memories import (  # noqa: TID252
+    MEMORY_DATES_NOTE,
     memories_full,
     memory_limit,
+    memory_line,
     memory_namespace,
 )
 from ..core.utils import extract_final, verify_pin  # noqa: TID252
@@ -723,9 +725,11 @@ async def upsert_memory(  # noqa: D417
     Use this when the user asks you to remember something, or tells you a
     lasting fact or preference about themselves (a routine, a schedule, how
     they like things). Do not save the request itself, or a one-off command
-    or question. If a memory conflicts with an existing one then just UPDATE
-    the existing one by passing in "memory_id" and DO NOT create two memories
-    that are the same. If the user corrects a memory then UPDATE it.
+    or question. Write it so it still reads right later: name the date
+    (from the current date and time you were given) instead of "today",
+    "tomorrow" or "this evening". If a memory conflicts with an existing one
+    then just UPDATE the existing one by passing in "memory_id" and DO NOT
+    create two memories that are the same. If the user corrects a memory then UPDATE it.
 
     Args:
         content: The main content of the memory.
@@ -782,7 +786,7 @@ async def list_memories(
     if not found:
         return "You have no memories about this user."
     shown = found[:MEMORY_LIST_MAX_SHOWN]
-    lines = [f"[{item.key}]: {item.value.get('content', '')}" for item in shown]
+    lines = [MEMORY_DATES_NOTE, *(memory_line(item) for item in shown)]
     if len(found) > len(shown):
         lines.append("(Older memories are not shown.)")
     return "\n".join(lines)

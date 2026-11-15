@@ -9,6 +9,7 @@ import voluptuous as vol
 from homeassistant.core import SupportsResponse
 from homeassistant.exceptions import HomeAssistantError, Unauthorized
 from homeassistant.helpers import config_validation as cv
+from homeassistant.util import dt as dt_util
 
 from ..const import (  # noqa: TID252
     CONF_MEMORY_MAX_PER_PERSON,
@@ -17,11 +18,19 @@ from ..const import (  # noqa: TID252
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
+    from datetime import datetime
 
     from homeassistant.core import HomeAssistant, ServiceCall
     from langgraph.store.base import BaseStore, SearchItem
 
 _MEMORIES = "memories"
+# Shown above recalled or listed memories, so a relative word in an old
+# memory ("today", "сегодня") is read against the day it was saved.
+MEMORY_DATES_NOTE = (
+    'Each memory shows when it was saved. Words like "today" or '
+    '"tomorrow" in a memory refer to that date, not to now: compare it with '
+    'the current date and say "today", "yesterday" or the date.'
+)
 _PAGE = 100
 
 
@@ -106,6 +115,33 @@ async def all_memories(store: BaseStore, user: str) -> list[SearchItem]:
         found.extend(page)
         if len(page) < _PAGE:
             return found
+
+
+def _local_minute(when: datetime) -> str:
+    return dt_util.as_local(when).strftime("%Y-%m-%d %H:%M")
+
+
+def memory_dates(item: Any) -> str:
+    """
+    Say when a memory was saved, in Home Assistant's time zone.
+
+    A memory such as "today Alex fed the fish" is only true on the day it was
+    said, so the model needs the date to place "today" when it reads the
+    memory later. An updated memory also says when it was last changed.
+    """
+    saved = _local_minute(item.created_at)
+    updated = _local_minute(item.updated_at)
+    if updated == saved:
+        return f"saved {saved}"
+    return f"saved {saved}, updated {updated}"
+
+
+def memory_line(item: Any) -> str:
+    """One memory as the model reads it: id, dates, then content and context."""
+    content = str(item.value.get("content", ""))
+    context = str(item.value.get("context", ""))
+    text = f"{content} ({context})" if context else content
+    return f"[{item.key}] ({memory_dates(item)}): {text}"
 
 
 def _as_record(item: Any) -> dict[str, Any]:

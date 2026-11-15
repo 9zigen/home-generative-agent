@@ -86,7 +86,11 @@ from ..core.fallback import (  # noqa: TID252
     ainvoke_dropping_unsupported_params,
     unsupported_sampling_param_in_chain,
 )
-from ..core.memories import memory_namespace  # noqa: TID252
+from ..core.memories import (  # noqa: TID252
+    MEMORY_DATES_NOTE,
+    memory_line,
+    memory_namespace,
+)
 from ..core.prompt_cache import (  # noqa: TID252
     ANTHROPIC_LLM_TYPE,
     adapt_system_message_for_model,
@@ -3523,8 +3527,8 @@ def _format_memories(mems: list[Any]) -> str:
     """Render retrieved memories as the <memories> block, or "" when none."""
     if not mems:
         return ""
-    formatted_mems = "\n".join(f"[{mem.key}]: {mem.value}" for mem in mems)
-    return f"<memories>\n{formatted_mems}\n</memories>"
+    formatted_mems = "\n".join(memory_line(mem) for mem in mems)
+    return f"<memories>\n{MEMORY_DATES_NOTE}\n{formatted_mems}\n</memories>"
 
 
 def _build_system_message(

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -10,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import voluptuous as vol
 from homeassistant.exceptions import HomeAssistantError, Unauthorized
+from homeassistant.util import dt as dt_util
 from langgraph.store.memory import InMemoryStore
 
 import custom_components.home_generative_agent as hga_component
@@ -25,9 +27,11 @@ from custom_components.home_generative_agent.const import (
 from custom_components.home_generative_agent.core.memories import (
     DELETE_MEMORY_SCHEMA,
     GET_MEMORIES_SCHEMA,
+    MEMORY_DATES_NOTE,
     all_memories,
     memories_full,
     memory_limit,
+    memory_line,
     memory_user,
     register_memory_services,
 )
@@ -114,7 +118,55 @@ async def test_list_memories_is_for_the_current_person_only() -> None:
     args = {"config": _config(), "store": store}
     listed = await list_memories.coroutine(**args)  # type: ignore[misc]
 
-    assert listed == "[a]: mine"
+    lines = listed.splitlines()
+    assert lines[0] == MEMORY_DATES_NOTE
+    assert len(lines) == 2
+    assert lines[1].startswith("[a] (saved ")
+    assert lines[1].endswith("): mine")
+
+
+def _item(created: datetime, updated: datetime, **value: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        key="m1", value=value, created_at=created, updated_at=updated
+    )
+
+
+def test_a_memory_line_dates_it_in_the_home_time_zone() -> None:
+    """
+    "Сегодня" in a memory is read against the day it was saved (field test).
+
+    A memory saved as "today Alex fed the fish" was recalled days later as if
+    it were still today, because the model saw no date.
+    """
+    previous = dt_util.get_default_time_zone()
+    madrid = dt_util.get_time_zone("Europe/Madrid")
+    assert madrid is not None
+    dt_util.set_default_time_zone(madrid)
+    try:
+        saved = datetime(2026, 11, 15, 11, 20, tzinfo=UTC)
+        line = memory_line(_item(saved, saved, content="сегодня покормил рыб"))
+    finally:
+        dt_util.set_default_time_zone(previous)
+    assert line == "[m1] (saved 2026-11-15 12:20): сегодня покормил рыб"
+
+
+def test_an_updated_memory_line_says_when_it_changed_and_keeps_context() -> None:
+    saved = datetime(2026, 11, 14, 9, 0, tzinfo=UTC)
+    changed = datetime(2026, 11, 15, 18, 30, tzinfo=UTC)
+    line = memory_line(
+        _item(saved, changed, content="likes it warm", context="said at dinner")
+    )
+    assert line == (
+        "[m1] (saved 2026-11-14 09:00, updated 2026-11-15 18:30): "
+        "likes it warm (said at dinner)"
+    )
+
+
+def test_upsert_memory_asks_for_dates_instead_of_today() -> None:
+    """The tool text tells the model to name the date when it saves."""
+    description = upsert_memory.description
+    assert '"today"' in description
+    assert "name the date" in description
 
 
 async def test_list_memories_with_none_and_with_too_many() -> None:
@@ -126,7 +178,7 @@ async def test_list_memories_with_none_and_with_too_many() -> None:
     for number in range(MEMORY_LIST_MAX_SHOWN + 2):
         await store.aput(("Anna", "memories"), str(number), {"content": "x"})
     listed = await list_memories.coroutine(**args)  # type: ignore[misc]
-    assert listed.count("]: x") == MEMORY_LIST_MAX_SHOWN
+    assert listed.count("): x") == MEMORY_LIST_MAX_SHOWN
     assert "Older memories are not shown" in listed
 
 

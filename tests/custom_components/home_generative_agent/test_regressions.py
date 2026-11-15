@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import ssl
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -22,6 +23,7 @@ from homeassistant.components.homeassistant.exposed_entities import (
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.setup import async_setup_component
+from homeassistant.util import dt as dt_util
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
@@ -45,6 +47,7 @@ from custom_components.home_generative_agent.core.fallback import (
     EmbeddingsUnavailableError,
 )
 from custom_components.home_generative_agent.core.image_entity import LastEventImage
+from custom_components.home_generative_agent.core.memories import MEMORY_DATES_NOTE
 from custom_components.home_generative_agent.core.person_gallery import PersonGalleryDAO
 from custom_components.home_generative_agent.core.recognized_sensor import (
     RecognizedPeopleSensor,
@@ -1271,10 +1274,21 @@ async def test_schema_recovery_passes_through_unrelated_errors(
 # ---------------------------------------------------------------------------
 
 
+_MEM_SAVED = datetime(2026, 9, 9, 13, 0, tzinfo=UTC)
+
+
+def _mem_line(key: str, content: str) -> str:
+    """Render a ``_Mem`` line in the test's Home Assistant time zone."""
+    saved = dt_util.as_local(_MEM_SAVED).strftime("%Y-%m-%d %H:%M")
+    return f"[{key}] (saved {saved}): {content}"
+
+
 class _Mem:
     def __init__(self, key: str, value: str) -> None:
         self.key = key
-        self.value = value
+        self.value = {"content": value}
+        self.created_at = _MEM_SAVED
+        self.updated_at = _MEM_SAVED
 
 
 def test_build_system_message_puts_volatile_context_after_stable_prefix() -> None:
@@ -1291,7 +1305,8 @@ def test_build_system_message_puts_volatile_context_after_stable_prefix() -> Non
             "type": "text",
             "text": (
                 "Current time is 15:09:20. Today's date is 2026-09-09.\n"
-                "<memories>\n[k]: v\n</memories>\n"
+                f"<memories>\n{MEMORY_DATES_NOTE}\n"
+                f"{_mem_line('k', 'v')}\n</memories>\n"
                 "<past_conversation_summary>\nearlier we talked\n"
                 "</past_conversation_summary>"
             ),
@@ -1388,11 +1403,11 @@ async def test_call_model_tool_loop_keys_memories_on_last_user_message(
     assert system.content[0] == {"type": "text", "text": "STABLE"}
     tail = cast("dict[str, Any]", system.content[1])
     assert "Current time is 15:09:20." in tail["text"]
-    assert "[pref]: likes it warm" in tail["text"]
+    assert _mem_line("pref", "likes it warm") in tail["text"]
     # The memo the next call of this turn will reuse.
     memo = result["turn_memories"]
     assert memo["key"] == "turn it off"
-    assert "[pref]: likes it warm" in memo["text"]
+    assert _mem_line("pref", "likes it warm") in memo["text"]
 
 
 def _call_model_harness(
@@ -1492,7 +1507,7 @@ async def test_call_model_ignores_memo_from_another_user_message(
     store.asearch.assert_awaited_once()
     assert "what time is it" in store.asearch.await_args.kwargs["query"]
     assert result["turn_memories"]["key"] == "what time is it"
-    assert "[new]: fresh" in result["turn_memories"]["text"]
+    assert _mem_line("new", "fresh") in result["turn_memories"]["text"]
 
 
 @pytest.mark.asyncio
