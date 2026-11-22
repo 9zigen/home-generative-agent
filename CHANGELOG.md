@@ -78,6 +78,15 @@ their own. See [RELEASING.md](RELEASING.md).
 - **Sentinel's Home Assistant notifications no longer turn device names or model text into links or images.** A device named like a Markdown link (`[Check](https://…)`), or an explanation carrying an image, rendered as a live link or picture in the persistent notifications Sentinel posts when no notify service is set, burst-batch summaries included (and in the new full-text records). That text is now escaped and shown as written ([#922](https://github.com/goruck/home-generative-agent/issues/922)).
 - **A Sentinel Model on a second Ollama server is no longer held back by chat on the first** ([#877](https://github.com/goruck/home-generative-agent/issues/877)). The local GPU gates decided by deployment alone, so with the Sentinel Model on its own Ollama server, Sentinel still waited for every chat and camera turn on the Conversation server (and its 30 s grace), had its calls cancelled by chat there, and kept the per-run triage limit and the gap between calls: during a conversation, findings went out untriaged and without explanations. Now, when no server in the Sentinel Model's chain (its fallbacks included) is one a Conversation, camera, summarization or embedding model or any of their fallbacks can reach, none of those gates hold Sentinel back, and the log says so at startup. A stalled-provider probe to such a server is also sent during chat. Any shared server, or one whose address is not known, keeps every gate exactly as before. A server is its host name: two Ollama instances on one machine count as one, and every loopback address (`localhost`, `127.0.0.1`, `::1`) is the same. Also fixed: a reload during a Sentinel model call could leave the old Sentinel engine subscribed to state changes.
 
+## [3.46.0-beta.8.alab.7] - 2026-11-22
+
+Fork release: 3.45.3-alab.6 plus upstream's [v3.46.0-beta.8](https://github.com/goruck/home-generative-agent/releases/tag/v3.46.0-beta.8), for field validation of the 3.46.0 bundle with the fork's PIN and memory fixes.
+
+### Changed
+
+- **Everything in upstream's 3.46.0 pre-releases up to beta.8**, including the dashboard cards that load even when the integration's setup fails ([#1060](https://github.com/goruck/home-generative-agent/pull/1060)). A tool result that refuses an action now has the error status upstream gives it (#1023), and so does the fork's PIN check when it refuses a PIN.
+- **The fork keeps its own PIN handling** next to upstream's: a reply that is only the PIN is checked without the model, a PIN request that ended is shown to the model as ended, and only one PIN prompt is held per satellite conversation. Recalled memories keep their saved dates.
+
 ## [3.45.3-alab.6] - 2026-11-15
 
 Fork release: 3.45.3-alab.5 plus one memory fix from a live recall.
