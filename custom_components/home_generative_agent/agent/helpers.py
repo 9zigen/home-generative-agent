@@ -198,19 +198,39 @@ def normalize_llm_api_value(raw: Any) -> list[str]:
     return [api_id for api_id in raw if isinstance(api_id, str) and api_id]
 
 
-def llm_api_is_supported(api: llm.API) -> bool:
+def llm_api_requires_admin(api: llm.API) -> bool:
     """
-    Return whether this integration offers, indexes and loads ``api``.
+    Return whether only an admin's turn can load ``api`` (#918).
 
-    Home Assistant 2026.11 added an admin-only LLM API, "Home Assistant"
-    (``homeassistant``), that manages Home Assistant itself (registries, logs,
-    automations, config entries) and is not bounded by entity exposure. Its
-    tools have not been checked against the Critical Action PIN gate, so an
-    API that requires an admin is left out everywhere until they are: not
-    offered in the options form, not indexed, and not loaded for a turn.
-    ``requires_admin`` does not exist before 2026.11, hence the default.
+    Home Assistant 2026.11 added such an API, "Home Assistant"
+    (``homeassistant``): it manages Home Assistant itself (logs, config
+    entries, any action) and is not bounded by entity exposure. Home
+    Assistant refuses to load it for a turn with no user, such as a voice
+    satellite's, or with a user who is not an admin. ``requires_admin`` does
+    not exist before 2026.11, hence the default.
     """
-    return not getattr(api, "requires_admin", False)
+    return getattr(api, "requires_admin", False) is True
+
+
+def admin_only_selection(hass: HomeAssistant, selected: list[str]) -> list[llm.API]:
+    """
+    Return the selected APIs when every one is registered and admin-only.
+
+    Such a selection loads nothing for a voice satellite or a user who is not
+    an admin, so those conversations fail with "No LLM APIs could be loaded".
+    Empty otherwise: when the selection is empty, when any selected API loads
+    for everyone, or when any selected id is not registered (often a
+    transient MCP outage, kept on purpose, #568). The Options form refuses
+    such a selection (#998) and setup raises a repair issue for a stored one
+    (#1037), both through this one rule.
+    """
+    if not selected:
+        return []
+    registered = {api.id: api for api in llm.async_get_apis(hass)}
+    apis = [registered.get(api_id) for api_id in selected]
+    if any(api is None or not llm_api_requires_admin(api) for api in apis):
+        return []
+    return [api for api in apis if api is not None]
 
 
 def normalize_tool_exclusions(raw: Any) -> dict[str, list[str]]:
@@ -1286,6 +1306,25 @@ def _refuse(
         )
 
 
+def _carried_counts(
+    pending_actions: Mapping[str, Mapping[str, Any]], replaced: list[str]
+) -> dict[str, int]:
+    """
+    Return the counts a request carries from the prompts it replaces.
+
+    The failed attempts carry over, and so do the PIN checks another voice's
+    sentences took (see the conversation agent's _async_turn_thread), so
+    repeating the request does not give them a fresh budget. Each is the
+    highest of the prompts replaced, so replacing one never lowers it.
+    """
+    if not replaced:
+        return {}
+    return {
+        name: max(int(pending_actions[key].get(name, 0) or 0) for key in replaced)
+        for name in ("attempts", "sentence_checks")
+    }
+
+
 def register_pending_action(
     pending_actions: dict[str, dict[str, Any]],
     action: dict[str, Any],
@@ -1330,14 +1369,22 @@ def register_pending_action(
     only announce an action no PIN can confirm, while no longer blocking
     another voice's), or of one another turn is still handling: its line not
     delivered yet, or its PIN reply in progress (#1001). Each refusal returns
-    None and records its reason on `pin_reply` (`PinReply.refusal`).
+    None and records its reason on `pin_reply` (`PinReply.refusal`). Every
+    prompt the request would replace is checked before any is dropped, so a
+    refusal leaves the store as it found it.
+
+    The same request re-issued keeps its prompt's id (#1004): a refusal that
+    names the prompt by id (`PinReply.waiting_action_id`) still finds it, and
+    a model holding the id still confirms the same request.
     """
     now = dt_util.utcnow()
     thread_id = action.get("thread_id")
     carried: dict[str, Any] = {}
-    for key, existing in list(pending_actions.items()):
-        if pending_action_expired(existing, now):
-            pending_actions.pop(key, None)
+    replaced: list[str] = []
+    kept_id: str | None = None
+    expired = [k for k, a in pending_actions.items() if pending_action_expired(a, now)]
+    for key in expired:
+        pending_actions.pop(key, None)
     waiting = waiting_voice_prompt(pending_actions, action, pin_owner=pin_owner)
     if waiting is not None:
         _refuse(pin_reply, PIN_REFUSED_OTHER_VOICE, action, waiting)
@@ -1367,6 +1414,7 @@ def register_pending_action(
                 "voice_thread": existing.get("voice_thread"),
             }
             if _same_request(existing, action) and existing.get("turn_id"):
+                kept_id = key
                 reissued_in_reply = bool(
                     existing.get("reply_turn")
                     and existing.get("reply_turn") == action.get("turn_id")
@@ -1394,17 +1442,17 @@ def register_pending_action(
             elif existing.get("turn_id") == action.get("turn_id"):
                 _refuse(pin_reply, PIN_REFUSED_ONE_AT_A_TIME)
                 return None
-            carried["attempts"] = int(existing.get("attempts", 0) or 0)
-            # The PIN checks another voice's sentences took (see the
-            # conversation agent's _async_turn_thread) are kept the same way,
-            # so repeating the request does not give them a fresh budget.
-            carried["sentence_checks"] = int(existing.get("sentence_checks", 0) or 0)
-            pending_actions.pop(key, None)
+            replaced.append(key)
 
+    carried.update(_carried_counts(pending_actions, replaced))
+    for key in replaced:
+        pending_actions.pop(key, None)
     while len(pending_actions) >= MAX_PENDING_ACTIONS:
         pending_actions.pop(next(iter(pending_actions)), None)
 
-    action_id = ulid.ulid_now()
+    # Stored again at the end either way: the newest prompt is the one a PIN
+    # said next is followed to (`newest_pin_prompt`).
+    action_id = kept_id or ulid.ulid_now()
     pending_actions[action_id] = {
         **action,
         "attempts": 0,
@@ -2172,6 +2220,83 @@ class IntentResults(NamedTuple):
     # The failed devices by name, when HA's names can be trusted; may be
     # fewer than `failed`.
     names: tuple[str, ...]
+    # False when HA's success and failed lists may name the wrong devices,
+    # so neither the names nor the lists reach the model.
+    names_known: bool = True
+
+
+def loads_or_none(text: str) -> Any | None:
+    """
+    Return the JSON in a tool's text, or None if it cannot be decoded.
+
+    Not only malformed JSON: a number past Python's digit limit raises a
+    plain ValueError and deep nesting a RecursionError, and a tool's
+    unreadable text must not fail a call that ran (#1007 review).
+    """
+    try:
+        return json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+
+
+def _mcp_text_json(response: Any) -> Any | None:
+    """
+    Return the JSON a remote MCP tool sent as its only text item, or None.
+
+    Home Assistant's MCP server sends an intent response as JSON text, and its
+    MCP client hands it on nested, as ``{"content": [{"type": "text", "text":
+    "{...}"}], "isError": false}`` (#1007). Its other keys differ by release
+    (``_meta`` from 2026.11, ``meta`` before), so they are not checked: the
+    text must still read as an action intent to count.
+    """
+    if not isinstance(response, dict):
+        return None
+    content = response.get("content")
+    if not isinstance(content, list) or len(content) != 1:
+        return None
+    item = content[0]
+    if not isinstance(item, dict) or item.get("type") != "text":
+        return None
+    text = item.get("text")
+    # Only an intent response is read, so a large result (a remote
+    # GetLiveContext) is not decoded on every call.
+    if not isinstance(text, str) or '"action_done"' not in text:
+        return None
+    decoded = loads_or_none(text)
+    try:
+        # What is read here is sent on re-encoded; what cannot be is not read.
+        json.dumps(decoded, default=str)
+    except (ValueError, RecursionError):
+        return None
+    return decoded
+
+
+def _action_intent_response(response: Any) -> tuple[dict[str, Any], bool] | None:
+    """
+    Return an action intent's response and whether it came over MCP, or None.
+
+    Only that shape counts (``response_type`` "action_done" with ``success``
+    and ``failed`` lists), here or inside a remote MCP tool's text, so a
+    tool's arbitrary result is never taken for one.
+    """
+    if isinstance(response, str):
+        response = loads_or_none(response)
+    remote = False
+    inner = _mcp_text_json(response)
+    if inner is not None:
+        response, remote = inner, True
+    if not isinstance(response, dict) or response.get("response_type") != (
+        "action_done"
+    ):
+        return None
+    data = response.get("data")
+    if not isinstance(data, dict):
+        return None
+    if not isinstance(data.get("success"), list) or not isinstance(
+        data.get("failed"), list
+    ):
+        return None
+    return response, remote
 
 
 def intent_results(response: Any) -> IntentResults | None:
@@ -2188,26 +2313,17 @@ def intent_results(response: Any) -> IntentResults | None:
     succeeded (#948 review). Names are one line, bounded; a blank name, or
     one another device of the call shares (failed or not), gives way to the
     entity id, so the failed device can be told apart. No names on a Home
-    Assistant that may have paired them wrongly.
+    Assistant that may have paired them wrongly, which includes a remote one
+    reached over MCP: its version is not known here (#1007).
     """
-    if isinstance(response, str):
-        try:
-            response = json.loads(response)
-        except json.JSONDecodeError:
-            return None
-    if not isinstance(response, dict) or response.get("response_type") != (
-        "action_done"
-    ):
+    found = _action_intent_response(response)
+    if found is None:
         return None
-    data = response.get("data")
-    if not isinstance(data, dict):
-        return None
-    success, failed = data.get("success"), data.get("failed")
-    if not isinstance(success, list) or not isinstance(failed, list):
-        return None
+    payload, remote = found
+    success, failed = payload["data"]["success"], payload["data"]["failed"]
     acted = [t for t in success if isinstance(t, dict) and t.get("type") == "entity"]
-    if not INTENT_RESULTS_NAME_THEIR_TARGETS:
-        return IntentResults(len(acted), len(failed), ())
+    if remote or not INTENT_RESULTS_NAME_THEIR_TARGETS:
+        return IntentResults(len(acted), len(failed), (), names_known=False)
 
     def _label(value: Any) -> str:
         # As the fixed line shows it, so two names that read alike there are
@@ -2233,9 +2349,7 @@ def intent_results(response: Any) -> IntentResults | None:
     return IntentResults(len(acted), len(failed), tuple(n for n in names if n))
 
 
-def with_failure_note(
-    payload: Mapping[str, Any], results: IntentResults
-) -> dict[str, Any]:
+def with_failure_note(response: Any, results: IntentResults) -> dict[str, Any]:
     """
     Return an action intent's result with a fixed note on what failed (#948).
 
@@ -2244,10 +2358,15 @@ def with_failure_note(
     names are taken out of the result itself (its success and failed lists,
     and the `action_performed` line built from them), and the note says
     which devices failed is not known, so the model cannot name the wrong
-    one (#948 review).
+    one (#948 review). A remote Home Assistant's result is read out of the
+    MCP text it came in (#1007).
     """
-    out = dict(payload)
-    if not INTENT_RESULTS_NAME_THEIR_TARGETS:
+    found = _action_intent_response(response)
+    if found is not None:
+        out = dict(found[0])
+    else:  # Not reached: callers pass what intent_results read.
+        out = dict(response) if isinstance(response, dict) else {}
+    if not results.names_known:
         out.pop("action_performed", None)
         data = out.get("data")
         if isinstance(data, dict):
@@ -2290,10 +2409,7 @@ def parse_tool_response(
     if isinstance(response, dict):
         parsed = response
     elif isinstance(response, str):
-        try:
-            decoded = json.loads(response)
-        except json.JSONDecodeError:
-            decoded = None
+        decoded = loads_or_none(response)
         # A JSON list, number or bool carries no status fields.
         parsed = decoded if isinstance(decoded, dict) else None
 
@@ -2301,6 +2417,10 @@ def parse_tool_response(
     content_str = json.dumps(response, default=str)
     if parsed is None:
         return content_str, status
+    # Before 2026.10 Home Assistant hands on a remote MCP result as a dict with
+    # its error flag in it, not as ToolResult.error (#1007 review).
+    if parsed.get("isError") is True and isinstance(parsed.get("content"), list):
+        return content_str, "error"
 
     warning = parsed.get("warning")
     success_val = parsed.get("success", True)

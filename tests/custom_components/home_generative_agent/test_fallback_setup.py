@@ -24,10 +24,16 @@ from custom_components.home_generative_agent.const import (
     CONF_FEATURE_MODEL_TEMPERATURE,
     CONF_GEMINI_API_KEY,
     CONF_NOTIFY_SERVICE,
+    CONF_OLLAMA_CHAT_CONTEXT_SIZE,
+    CONF_OLLAMA_CHAT_KEEPALIVE,
     CONF_OLLAMA_CHAT_MODEL,
     CONF_OLLAMA_EMBEDDING_MODEL,
     CONF_OLLAMA_EMBEDDING_URL,
+    CONF_OLLAMA_SUMMARIZATION_CONTEXT_SIZE,
+    CONF_OLLAMA_SUMMARIZATION_MODEL,
     CONF_OLLAMA_URL,
+    CONF_OLLAMA_VLM,
+    CONF_OLLAMA_VLM_CONTEXT_SIZE,
     CONF_OPENAI_CHAT_MODEL,
     CONF_OPENAI_COMPATIBLE_API_KEY,
     CONF_OPENAI_COMPATIBLE_BASE_URL,
@@ -52,8 +58,12 @@ from custom_components.home_generative_agent.const import (
     DOMAIN,
     GEMINI_3_RECOMMENDED_TEMPERATURE,
     RECOMMENDED_GEMINI_CHAT_MODEL,
+    RECOMMENDED_OLLAMA_CHAT_MODEL,
+    RECOMMENDED_OLLAMA_CONTEXT_SIZE,
+    RECOMMENDED_OPENAI_CHAT_MODEL,
     VIDEO_ANALYZER_MODE_DISABLE,
 )
+from custom_components.home_generative_agent.core import utils
 from custom_components.home_generative_agent.core.embedding_store import (
     EmbeddingsUnavailableError,
     UnavailableEmbeddings,
@@ -434,7 +444,6 @@ async def test_setup_configures_fallback_models_and_embedding_chain(
     """
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     _patch_setup_dependencies(hass, monkeypatch, data)
 
@@ -482,7 +491,6 @@ async def test_setup_keeps_embedding_fallbacks_of_the_primarys_type(
     """A second server of the primary's type embeds with its model, so it stays."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     data.options[CONF_EMBEDDING_MODEL_PROVIDER] = "ollama"
     ollama_provider = data.providers["ollama1"]
@@ -518,7 +526,6 @@ async def test_setup_raises_an_issue_for_a_chosen_other_model_fallback(
     """A fallback the user picked and setup leaves out is named in a repair."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     _patch_setup_dependencies(hass, monkeypatch, data)
     monkeypatch.setattr(
@@ -561,7 +568,6 @@ async def test_setup_leaves_out_a_chosen_fallback_of_a_non_ollama_type(
     """
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     data.options[CONF_EMBEDDING_MODEL_PROVIDER] = provider_type
 
@@ -616,7 +622,6 @@ async def test_setup_leaves_out_an_automatic_fallback_of_a_non_ollama_type(
     caplog.set_level("INFO")
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     second_openai = ModelProviderConfig(
         entry_id="openai2",
@@ -650,7 +655,6 @@ async def test_the_left_out_issue_clears_once_nothing_is_left_out(
     """Saving the form drops the fallback; the next setup clears the issue."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     data.fallback_chains["embedding"] = [data.providers["openai1"]]
     ir.async_create_issue(
@@ -703,7 +707,6 @@ async def test_another_ollama_server_embeds_with_the_configured_model(
     fallback_url = "http://ollama-fallback:11434"
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     data.options[CONF_EMBEDDING_MODEL_PROVIDER] = "ollama"
     data.options[CONF_OLLAMA_EMBEDDING_MODEL] = "configured-embed"
@@ -731,6 +734,267 @@ async def test_another_ollama_server_embeds_with_the_configured_model(
     ]
 
 
+def _ollama_primary_with_a_second_server(
+    second_settings: dict[str, Any] | None = None,
+) -> FallbackSetupData:
+    """Return setup data: chat and summarization on Ollama, a second one behind."""
+    data = _fallback_setup_data()
+    data.options.update(
+        {
+            CONF_CHAT_MODEL_PROVIDER: "ollama",
+            CONF_SUMMARIZATION_MODEL_PROVIDER: "ollama",
+            CONF_OLLAMA_CHAT_MODEL: "qwen3.5:4b-q4_K_M",
+            CONF_OLLAMA_CHAT_CONTEXT_SIZE: 8192,
+            CONF_OLLAMA_CHAT_KEEPALIVE: "10m",
+            CONF_OLLAMA_SUMMARIZATION_MODEL: "qwen3.5:4b-q4_K_M",
+            CONF_OLLAMA_SUMMARIZATION_CONTEXT_SIZE: 4096,
+        }
+    )
+    # A provider added in the UI stores only how to reach it.
+    second = ModelProviderConfig(
+        entry_id="ollama2",
+        name="Mac mini",
+        provider_type="ollama",
+        capabilities={"chat", "summarization"},
+        data={
+            "settings": {
+                "base_url": "http://mac-mini:11434",
+                **(second_settings or {}),
+            }
+        },
+        deployment="edge",
+    )
+    data.providers[second.entry_id] = second
+    primary = data.providers["ollama1"]
+    data.fallback_chains["chat"] = [primary, second]
+    data.fallback_chains["summarization"] = [primary, second]
+    return data
+
+
+async def _fallback_configurable(
+    hass: Any, monkeypatch: pytest.MonkeyPatch, data: FallbackSetupData, attr: str
+) -> dict[str, Any]:
+    entry = MockConfigEntry(domain=DOMAIN, data={})
+    entry.add_to_hass(hass)
+    _patch_setup_dependencies(hass, monkeypatch, data)
+    _capture_recheck(monkeypatch)
+
+    assert await cast("Any", hga_component).async_setup_entry(hass, entry)
+
+    model = getattr(entry.runtime_data, attr)
+    assert isinstance(model, FallbackChatModel)
+    assert [provider_id for _m, _d, provider_id in model.chain] == [
+        "ollama1",
+        "ollama2",
+    ]
+    return cast("FakeConfiguredModel", model.chain[1][0]).config["configurable"]
+
+
+@pytest.mark.asyncio
+async def test_a_second_ollama_server_runs_the_primarys_model_and_context(
+    hass: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A fallback of the primary's type runs what the feature is set to (#1022).
+
+    It used to ask the second server for the recommended model (gpt-oss) at
+    32K: a model it may not have, at a context an 8 GB machine cannot hold.
+    """
+    data = _ollama_primary_with_a_second_server()
+
+    chat = await _fallback_configurable(hass, monkeypatch, data, "chat_model")
+
+    assert chat["model"] == "qwen3.5:4b-q4_K_M"
+    assert chat["num_ctx"] == 8192
+    assert chat["keep_alive"] == "10m"
+
+
+@pytest.mark.asyncio
+async def test_a_second_ollama_server_summarizes_with_the_primarys_settings(
+    hass: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = _ollama_primary_with_a_second_server()
+
+    summary = await _fallback_configurable(
+        hass, monkeypatch, data, "summarization_model"
+    )
+
+    assert summary["model"] == "qwen3.5:4b-q4_K_M"
+    assert summary["num_ctx"] == 4096
+
+
+@pytest.mark.asyncio
+async def test_a_fallbacks_own_model_setting_still_comes_first(
+    hass: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provider that stores its own model and context (a legacy one) keeps them."""
+    data = _ollama_primary_with_a_second_server(
+        {"chat_model": "llama-own", "chat_context": 2048}
+    )
+
+    chat = await _fallback_configurable(hass, monkeypatch, data, "chat_model")
+
+    assert chat["model"] == "llama-own"
+    assert chat["num_ctx"] == 2048
+    assert chat["keep_alive"] == "10m"
+
+
+@pytest.mark.asyncio
+async def test_with_the_primary_down_at_setup_the_backup_runs_its_model(
+    hass: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The reporter's case: the laptop is away when Home Assistant starts (#1022).
+
+    The primary is then a placeholder, which used to drop the config it was
+    given, so the backup that answers was asked for gpt-oss at 32K again.
+    """
+    entry = MockConfigEntry(domain=DOMAIN, data={})
+    entry.add_to_hass(hass)
+    data = _ollama_primary_with_a_second_server()
+    _patch_setup_dependencies(hass, monkeypatch, data)
+    _capture_recheck(monkeypatch)
+
+    async def _laptop_away(_hass: Any, url: str, **_kwargs: Any) -> bool:
+        return "mac-mini" in url
+
+    monkeypatch.setattr(hga_component, "ollama_healthy", _laptop_away)
+    monkeypatch.setattr(
+        hga_component,
+        "configured_ollama_urls",
+        lambda *_args, **_kwargs: ["http://ollama", "http://mac-mini:11434"],
+    )
+
+    assert await cast("Any", hga_component).async_setup_entry(hass, entry)
+
+    backup = cast("FakeConfiguredModel", _only_member(entry.runtime_data.chat_model))
+    assert backup.config["configurable"]["model"] == "qwen3.5:4b-q4_K_M"
+    assert backup.config["configurable"]["num_ctx"] == 8192
+
+
+@pytest.mark.asyncio
+async def test_a_second_ollama_server_sees_with_the_primarys_vision_model(
+    hass: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """VLM reads its own primary, not the chat one."""
+    entry = MockConfigEntry(domain=DOMAIN, data={})
+    entry.add_to_hass(hass)
+    data = _ollama_primary_with_a_second_server()
+    data.options.update(
+        {
+            CONF_VLM_PROVIDER: "ollama",
+            CONF_OLLAMA_VLM: "qwen2.5vl:7b",
+            CONF_OLLAMA_VLM_CONTEXT_SIZE: 6144,
+        }
+    )
+    second = data.providers["ollama2"]
+    second.capabilities.add("vlm")
+    data.fallback_chains["vlm"] = [data.providers["ollama1"], second]
+    _patch_setup_dependencies(hass, monkeypatch, data)
+    _capture_recheck(monkeypatch)
+
+    assert await cast("Any", hga_component).async_setup_entry(hass, entry)
+
+    vision_model = entry.runtime_data.vision_model
+    assert isinstance(vision_model, FallbackVLM)
+    vlm = cast("FakeConfiguredModel", vision_model.chain[1][0]).config["configurable"]
+    assert vlm["model"] == "qwen2.5vl:7b"
+    assert vlm["num_ctx"] == 6144
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("primary_model", "expected"),
+    [
+        ("gpt-primary-chat", "gpt-primary-chat"),
+        # A fine-tune is the primary account's own (#1022 review).
+        ("ft:gpt-4o:acme::abc123", RECOMMENDED_OPENAI_CHAT_MODEL),
+    ],
+    ids=["public_model", "fine_tune"],
+)
+async def test_a_second_openai_account_runs_the_primarys_model(
+    hass: Any, monkeypatch: pytest.MonkeyPatch, primary_model: str, expected: str
+) -> None:
+    """OpenAI names its model `model_name`; the second account runs it too."""
+    entry = MockConfigEntry(domain=DOMAIN, data={})
+    entry.add_to_hass(hass)
+    data = _fallback_setup_data()
+    second = ModelProviderConfig(
+        entry_id="openai2",
+        name="OpenAI second account",
+        provider_type="openai",
+        capabilities={"chat"},
+        data={"settings": {"api_key": "sk-second"}},
+        deployment="cloud",
+    )
+    data.providers[second.entry_id] = second
+    data.fallback_chains["chat"] = [data.providers["openai1"], second]
+    data.options[CONF_OPENAI_CHAT_MODEL] = primary_model
+    _patch_setup_dependencies(hass, monkeypatch, data)
+
+    assert await cast("Any", hga_component).async_setup_entry(hass, entry)
+
+    chat_model = entry.runtime_data.chat_model
+    assert isinstance(chat_model, FallbackChatModel)
+    fallback = cast("FakeConfiguredModel", chat_model.chain[1][0])
+    assert fallback.config["configurable"]["model_name"] == expected
+
+
+@pytest.mark.asyncio
+async def test_another_compatible_server_keeps_its_own_model(
+    hass: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each OpenAI-compatible server serves its own models (#1022 review)."""
+    entry = MockConfigEntry(domain=DOMAIN, data={})
+    entry.add_to_hass(hass)
+    data = _fallback_setup_data()
+    server_a = _compatible("a", "http://a/v1", "key-a", {"chat"})
+    server_b = _compatible("b", "http://b/v1", "key-b", {"chat"})
+    data.providers = {server_a.entry_id: server_a, server_b.entry_id: server_b}
+    data.fallback_chains = {"chat": [server_a, server_b]}
+    data.options.update(
+        {
+            CONF_CHAT_MODEL_PROVIDER: "openai_compatible",
+            CONF_OPENAI_COMPATIBLE_BASE_URL: "http://a/v1",
+            CONF_OPENAI_COMPATIBLE_API_KEY: "key-a",
+            CONF_OPENAI_COMPATIBLE_CHAT_MODEL: "local-only-model",
+        }
+    )
+    _patch_setup_dependencies(hass, monkeypatch, data)
+
+    async def _healthy(*_args: Any, **_kwargs: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(hga_component, "openai_compatible_healthy", _healthy)
+
+    assert await cast("Any", hga_component).async_setup_entry(hass, entry)
+
+    chat_model = entry.runtime_data.chat_model
+    assert isinstance(chat_model, FallbackChatModel)
+    fallback = cast("FakeConfiguredModel", chat_model.chain[1][0])
+    assert fallback.config["configurable"]["model_name"] != "local-only-model"
+
+
+@pytest.mark.asyncio
+async def test_a_fallback_of_another_type_keeps_its_recommended_model(
+    hass: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An Ollama fallback behind an OpenAI primary cannot run the OpenAI model."""
+    entry = MockConfigEntry(domain=DOMAIN, data={})
+    entry.add_to_hass(hass)
+    data = _fallback_setup_data()
+    data.providers["ollama1"].data["settings"].pop("chat_model")
+    _patch_setup_dependencies(hass, monkeypatch, data)
+
+    assert await cast("Any", hga_component).async_setup_entry(hass, entry)
+
+    chat_model = entry.runtime_data.chat_model
+    assert isinstance(chat_model, FallbackChatModel)
+    fallback = cast("FakeConfiguredModel", chat_model.chain[1][0])
+    assert fallback.config["configurable"]["model"] == RECOMMENDED_OLLAMA_CHAT_MODEL
+    assert fallback.config["configurable"]["num_ctx"] == RECOMMENDED_OLLAMA_CONTEXT_SIZE
+
+
 @pytest.mark.asyncio
 async def test_a_primary_down_at_boot_keeps_the_store_indexed(
     hass: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -743,7 +1007,6 @@ async def test_a_primary_down_at_boot_keeps_the_store_indexed(
     """
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     data.openai_available = False
     data.fallback_chains["embedding"] = [data.providers["openai1"]]
@@ -776,7 +1039,6 @@ async def test_a_fallback_that_fails_to_build_still_keeps_the_index(
 
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     data.options[CONF_EMBEDDING_MODEL_PROVIDER] = "ollama"
     data.providers["ollama1"].data["settings"]["base_url"] = "http://ollama"
@@ -802,7 +1064,6 @@ async def test_a_fallback_that_is_the_primarys_client_is_no_fallback(
     """A second OpenAI provider, or Ollama at the primary's URL, is dropped."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     second_openai = ModelProviderConfig(
         entry_id="openai2",
@@ -837,7 +1098,6 @@ async def test_setup_embedding_chain_skips_unavailable_primary(
     """
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     data.openai_embeddings_available = False
     ollama_provider = data.providers["ollama1"]
@@ -874,7 +1134,6 @@ async def test_setup_model_fallback_skips_unavailable_primary(
     """Unavailable primary chat-like models must not short-circuit fallback."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     data.openai_available = False
     _patch_setup_dependencies(hass, monkeypatch, data)
@@ -915,7 +1174,6 @@ async def test_setup_model_fallback_sends_persistent_notification(
     """Setup-selected fallbacks notify even when no mobile notify service exists."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     calls: list[dict[str, Any]] = []
     _register_capture_service(hass, "persistent_notification", "create", calls)
     data = _fallback_setup_data()
@@ -943,7 +1201,6 @@ async def test_runtime_cloud_model_fallback_sends_mobile_notification_once(
     """Runtime cloud fallbacks notify once and include the cost warning."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     calls: list[dict[str, Any]] = []
     _register_capture_service(hass, "notify", "mobile_app_phone", calls)
     data = _fallback_setup_data()
@@ -988,7 +1245,6 @@ async def test_model_fallback_notification_strips_role_prefixes(
     """Provider role prefixes should not be repeated in fallback notifications."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     calls: list[dict[str, Any]] = []
     _register_capture_service(hass, "notify", "mobile_app_phone", calls)
     data = _fallback_setup_data()
@@ -1051,7 +1307,6 @@ async def test_setup_gemini3_chat_binds_recommended_temperature(
     """
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
 
     gemini_primary = ModelProviderConfig(
@@ -1155,7 +1410,6 @@ async def test_setup_primes_the_anthropic_client_before_publishing_it(
     """The SDK client is primed once, off the loop, on the instance the chain uses."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _anthropic_primary_setup_data()
     _patch_setup_dependencies(hass, monkeypatch, data)
     prime = AsyncMock()
@@ -1178,7 +1432,6 @@ async def test_setup_drops_the_anthropic_provider_when_priming_fails(
     """A client that cannot be built off the loop is never built on it (#618)."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _anthropic_primary_setup_data()
     _patch_setup_dependencies(hass, monkeypatch, data)
     prime = AsyncMock(side_effect=RuntimeError("executor down"))
@@ -1218,7 +1471,6 @@ async def test_setup_schedules_a_recheck_for_providers_that_failed(
     """
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     data.openai_available = False
     data.options[CONF_GEMINI_API_KEY] = "gm-spare"
@@ -1254,7 +1506,6 @@ async def test_setup_rechecks_a_failed_ollama_url_only_when_a_chain_uses_it(
 
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     if not uses_ollama:
         del data.providers["ollama1"]
@@ -1294,7 +1545,6 @@ async def test_setup_rechecks_each_failed_openai_compatible_url_once(
     """Each URL is probed once, only for the chains that use it, without creds."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     compatible = ModelProviderConfig(
         entry_id="oc1",
@@ -1352,7 +1602,6 @@ async def test_setup_checks_embeddings_with_their_own_key_on_a_shared_url(
     """
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     compatible = ModelProviderConfig(
         entry_id="oc1",
@@ -1423,7 +1672,6 @@ async def test_setup_builds_a_fallback_only_ollama_provider_at_its_own_url(
 
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     del data.options[CONF_OLLAMA_URL]
     data.options[CONF_OLLAMA_EMBEDDING_MODEL] = "configured-embed"
@@ -1474,7 +1722,6 @@ async def test_setup_rechecks_a_fallback_only_ollama_url_that_failed(
 
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     del data.options[CONF_OLLAMA_URL]
     data.providers["ollama1"].data["settings"]["base_url"] = fallback_url
@@ -1514,7 +1761,6 @@ async def test_setup_continues_when_fallback_ollama_embeddings_fail_to_build(
 
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     data.options[CONF_EMBEDDING_MODEL_PROVIDER] = "ollama"
     secondary_ollama = ModelProviderConfig(
@@ -1562,7 +1808,6 @@ async def test_setup_continues_when_a_fallback_ollama_chat_client_fails_to_build
 
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     del data.options[CONF_OLLAMA_URL]
     data.providers["ollama1"].data["settings"]["base_url"] = fallback_url
@@ -1591,7 +1836,6 @@ async def test_setup_rechecks_one_server_spelled_two_ways_once(
 
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     data.options[CONF_OLLAMA_URL] = "ollama-fallback:11434/"
     data.providers["ollama1"].data["settings"]["base_url"] = (
@@ -1624,7 +1868,6 @@ async def test_setup_survives_a_malformed_fallback_ollama_url(
 
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     del data.options[CONF_OLLAMA_URL]
     data.providers["ollama1"].data["settings"]["base_url"] = broken_url
@@ -1656,7 +1899,6 @@ async def test_setup_describes_only_ollama_servers_a_chain_uses(
 
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     del data.options[CONF_OLLAMA_URL]
     data.providers["ollama1"].data["settings"]["base_url"] = fallback_url
@@ -1691,7 +1933,6 @@ async def test_setup_rechecks_a_down_ollama_embedding_head_once(
 
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     data.options[CONF_EMBEDDING_MODEL_PROVIDER] = "ollama"
     data.options[CONF_OLLAMA_EMBEDDING_URL] = "http://ollama-emb:11434/"
@@ -1723,7 +1964,6 @@ async def test_setup_describes_an_ollama_primary_only_when_it_answered(
 
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     data.options[CONF_CHAT_MODEL_PROVIDER] = "ollama"
     data.fallback_chains["chat"] = [
@@ -1764,7 +2004,6 @@ async def test_no_embedding_provider_still_means_no_index(
 
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     data.options[CONF_EMBEDDING_MODEL_PROVIDER] = "ollama"
     del data.fallback_chains["embedding"]
@@ -1796,7 +2035,6 @@ async def test_a_healthy_fallback_is_chosen_over_a_down_primary(
 
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     data.options[CONF_EMBEDDING_MODEL_PROVIDER] = "ollama"
     data.providers["ollama1"].data["settings"]["base_url"] = "http://ollama"
@@ -1840,7 +2078,6 @@ async def test_setup_picks_the_openai_api_for_every_category(
     """
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     data.options[CONF_OPENAI_CHAT_MODEL] = model
     data.options[CONF_OPENAI_VLM] = model
@@ -1954,7 +2191,6 @@ async def test_each_category_uses_its_own_providers_key(
     """
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     _, embedding_keys = _two_openai_accounts(hass, monkeypatch)
 
     assert await cast("Any", hga_component).async_setup_entry(hass, entry)
@@ -1974,7 +2210,6 @@ async def test_a_second_key_that_fails_is_rechecked_on_its_own(
     """Each key is checked, and a failed one re-checked, by its provider (#970)."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     _two_openai_accounts(hass, monkeypatch)
     checked: list[str] = []
 
@@ -2001,7 +2236,6 @@ async def test_two_openai_compatible_servers_each_get_their_own_client(
     """Conversation on one server, camera analysis on another (#970)."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
 
     def _server(entry_id: str, url: str, key: str) -> ModelProviderConfig:
@@ -2069,7 +2303,6 @@ async def test_a_provider_with_no_key_never_runs_on_anothers(
     """A keyless OpenAI provider is unavailable, not billed to Work (#970)."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data, _ = _two_openai_accounts(hass, monkeypatch)
     keyless = ModelProviderConfig(
         entry_id="keyless",
@@ -2102,7 +2335,6 @@ async def test_an_empty_compatible_key_never_borrows_another_servers(
     """
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     server_a = _compatible("a", "http://a/v1", "secret-a", {"vlm"})
     server_b = _compatible("b", "http://b/v1", "", {"chat"})
@@ -2138,7 +2370,6 @@ async def test_token_counting_uses_the_conversation_providers_gemini_key(
     """Conversation on Gemini A is counted on A, not the key written last (#970)."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
 
     def _gemini(entry_id: str, key: str) -> ModelProviderConfig:
@@ -2192,7 +2423,6 @@ async def test_token_counting_never_uses_another_key_for_a_keyless_head(
     """A keyless Gemini Conversation head leaves no key to count with (#970)."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     keyless = ModelProviderConfig(
         entry_id="a",
@@ -2221,7 +2451,6 @@ async def test_a_keyless_embedding_provider_never_embeds_on_anothers_key(
     """Household memory is not embedded on Personal's key (#970)."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data, embedding_keys = _two_openai_accounts(hass, monkeypatch)
     keyless = ModelProviderConfig(
         entry_id="keyless",
@@ -2251,7 +2480,6 @@ async def test_an_unused_type_key_is_not_rechecked(
     """
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     openai = next(iter(data.providers.values()))
     server_a = _compatible("a", "http://a/v1", "ka", {"chat"})
@@ -2282,7 +2510,6 @@ async def test_two_compatible_servers_are_two_servers_for_the_gpu_gates(
     """Sentinel on a server of its own is isolated from chat's (#877, #970)."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     chat_server = _compatible("chat", "http://chat:8000/v1", "kc", {"chat"})
     sentinel_server = _compatible("sentinel", "http://sent:8000/v1", "ks", {"chat"})
@@ -2341,7 +2568,6 @@ async def test_a_second_anthropic_key_gets_its_own_client_left_open_on_unload(
     """
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
 
     def _anthropic(entry_id: str, key: str) -> ModelProviderConfig:
@@ -2397,7 +2623,6 @@ async def test_a_second_compatible_server_that_fails_is_rechecked(
     """A down second server is re-probed on its own and skipped meanwhile."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     chat_server = _compatible("chat-server", "http://chat/v1", "k1", {"chat"})
     vlm_server = _compatible("vlm-server", "http://vlm/v1", "k2", {"vlm"})
@@ -2446,7 +2671,6 @@ async def test_each_features_top_p_reaches_its_primary_and_fallback(
     """
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     data.options[CONF_CHAT_MODEL_TOP_P] = 0.91
     data.options[CONF_VLM_TOP_P] = 0.92
@@ -2472,7 +2696,6 @@ async def test_an_empty_top_p_keeps_the_default_on_openai_and_ollama(
 ) -> None:
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     _patch_setup_dependencies(hass, monkeypatch, data)
 
@@ -2490,7 +2713,6 @@ async def test_a_gpt5_primary_gets_no_top_p(
     """GPT-5 on Chat Completions rejects any but the default (#1000 review)."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     data.options[CONF_OPENAI_CHAT_MODEL] = "gpt-5"
     data.options[CONF_CHAT_MODEL_TOP_P] = 0.9
@@ -2547,7 +2769,6 @@ async def test_an_openai_compatible_chain_sends_only_a_set_top_p(
     """With none set, the server keeps the model's own value (vLLM's 0.95)."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _openai_compatible_chat_data()
     if top_p is not None:
         data.options[CONF_CHAT_MODEL_TOP_P] = top_p
@@ -2577,7 +2798,6 @@ async def test_the_sentinel_top_p_reaches_its_primary_and_fallback(
     """Sentinel's own Top P, not Conversation's, reaches its models (#1000)."""
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _fallback_setup_data()
     openai, ollama = data.fallback_chains["chat"]
     data.fallback_chains["sentinel"] = [openai, ollama]
@@ -2643,7 +2863,6 @@ async def test_an_openai_compatible_feature_sends_only_its_own_set_top_p(  # noq
     """
     entry = MockConfigEntry(domain=DOMAIN, data={})
     entry.add_to_hass(hass)
-    hass.data.setdefault(DOMAIN, {})["http_registered"] = True
     data = _openai_compatible_chat_data()
     data.fallback_chains[category] = list(data.fallback_chains["chat"])
     data.deployments[category] = "edge"
@@ -2670,3 +2889,47 @@ async def test_an_openai_compatible_feature_sends_only_its_own_set_top_p(  # noq
             assert "top_p" not in configurable
         else:
             assert configurable["top_p"] == top_p
+
+
+@pytest.mark.asyncio
+async def test_an_unconfigured_provider_type_logs_no_startup_warning(
+    hass: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    No Gemini key and no OpenAI-compatible URL: nothing to warn about.
+
+    Each type's check warned about its missing setting on every startup, which
+    read as a misconfiguration on an install that never used the type (#1018).
+    """
+    entry = MockConfigEntry(domain=DOMAIN, data={})
+    entry.add_to_hass(hass)
+    data = _fallback_setup_data()
+    _patch_setup_dependencies(hass, monkeypatch, data)
+    # The real checks, which return early on a missing setting.
+    monkeypatch.setattr(hga_component, "gemini_healthy", utils.gemini_healthy)
+    monkeypatch.setattr(
+        hga_component, "openai_compatible_healthy", utils.openai_compatible_healthy
+    )
+    caplog.set_level("DEBUG")
+
+    assert await cast("Any", hga_component).async_setup_entry(hass, entry)
+
+    skipped = [r for r in caplog.records if "health check skipped" in r.message]
+    assert len(skipped) == 2
+    assert all(r.levelname == "DEBUG" for r in skipped)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "check",
+    [utils.openai_healthy, utils.gemini_healthy, utils.openai_compatible_healthy],
+)
+async def test_a_check_with_nothing_configured_logs_at_debug(
+    hass: Any, caplog: pytest.LogCaptureFixture, check: Any
+) -> None:
+    """A type nobody set up is not a warning (#1018)."""
+    caplog.set_level("DEBUG")
+
+    assert await check(hass, "") is False
+
+    assert [r.levelname for r in caplog.records] == ["DEBUG"]

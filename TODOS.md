@@ -2,13 +2,65 @@
 
 ## Agent
 
-### No test proves the handler passes a followed PIN prompt's owner into the run
+### An always-included short name is not checked against exclusions after the lookup
 
-**What:** `_async_handle_message_active` (`conversation.py`) sets `user_id` to the speaker's memory user and `pin_owner` to the prompt's owner, but no test runs the handler: the check only searches the source text. Renaming the config key, or setting `user_id` from the prompt's owner (the leak #941's review closed), would still pass every test.
+**What:** `_append_included_tools` (`agent/graph.py`) runs `is_tool_excluded` on the stored name only. A stored `HassTurnOff` with `intent__HassTurnOff` excluded skips that tool only because the live tool list and the fallback set were stripped of exclusions earlier; the fetched tool's own name is never checked. The other force-injection site checks the fetched name.
 
-**Why:** Testing specialist, third review of #941 (2026-11-09). The wiring is right today, confirmed by reading it.
+**Why:** Claude adversarial pass, review of the #950 inclusion labels (2026-11-21). Predates that change. Not shown to be reachable: whether every source `_get_tool_by_name` reads is always filtered was not traced. The function's docstring says the exclusion must not depend on an optional filter.
 
-**How to apply:** Run the handler with a stub compiled app that captures the config, or extract a helper that builds it. For a guest's `1234` while another voice's prompt waits, assert `user_id` is the guest's, `pin_owner` is the prompt's owner and `thread_id` is the prompt's thread. Add a logged-in case with `pin_owner` None.
+**How to apply:** After the fetch, `continue` when `is_tool_excluded(fetched["name"], excluded_names.get(api_id, ()))`; add a test with `live_tool_ids=None` and an unfiltered fallback set.
+
+**Effort:** S
+**Priority:** P2
+**Depends on:** None
+
+### An always-included short name ticked beside its renamed tool fetches that tool twice
+
+**What:** `_append_included_tools` (`agent/graph.py`) records what it bound under the stored name (`bound.add((api_id, name))`), not the fetched tool's name. With `HassTurnOff` and `intent__HassTurnOff` both ticked, `intent__HassTurnOff` is fetched and appended twice and the later dedupe in `_format_and_dedupe_tools` drops the copy.
+
+**Why:** Claude adversarial pass, review of the #950 inclusion labels (2026-11-21). Not caused by that change and harmless today: one extra store read per turn, no duplicate reaches the model.
+
+**How to apply:** Record `(fetched["api_id"], fetched["name"])` in `bound` and `bound_api_by_name` as well, and add a test with both names ticked that counts the candidates.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** None
+
+### An empty reply with a PIN line leaves the round's other results unsaid
+
+**What:** When the model's reply after a tool round is empty and a fixed PIN line will be the reply, `_empty_reply_fallback` (`agent/graph.py`) adds nothing, so the line alone is the reply. The round's other results go unmentioned: in "turn on the porch light and unlock the front door", a failed light is never told, only "say your PIN to unlock the front door".
+
+**Why:** Claude adversarial, Codex and red team, review of #1013 (2026-11-15). Kept by Lindo's choice: the reply must end on the PIN question for a satellite to keep listening, and the apology ("Please try again") next to a PIN prompt contradicts it. Before #1013 the reply said "Done." for all of it. Needs both an empty model reply and a mixed round.
+
+**How to apply:** Add a fixed, translated line to `pin_messages.py` ("Part of that request did not work.") and have `_pin_lines` (`conversation.py`) put it before the prompt's line when a non-PIN result of the turn's last round failed; the graph would pass that fact on through the config, as `pin_reply` does. Test the mixed round for a waiting prompt, a confirmed action and a refusal line.
+
+**Effort:** M
+**Priority:** P3
+**Depends on:** None
+
+### Empty-reply fallback: review findings left unfixed (#1013)
+
+**What:** Four findings from the third review cycle of #1013, all in `_empty_reply_fallback` / `_result_succeeded` (`agent/graph.py`):
+1. A read-only result (GetLiveContext, history) counts as "acted", so a read plus a failed action gets the partial line ("Some of that may not have worked") when nothing acted. Counting only actuation results was left out: `is_actuation_tool` matches name prefixes and may miss scripts or remote tools, which would then get "Please try again" and run twice.
+2. The graph decides a PIN line is the reply from `pending_actions` at the model call; conversation.py reads it again after the summarize node. A prompt evicted in between leaves the turn with the streaming failure text ("try again") after tools that may have acted. The round-limit guard has the same window.
+3. An HA intent result with `response_type: "error"` that a handler returns rather than raises reads as success. Not confirmed that any handler does.
+4. Pre-existing: an add_automation that times out (`_LC_TOOL_TIMEOUT_S`) after `_async_write_automation` appended to automations.yaml reads as failed, and the apology's "try again" can add it twice.
+
+**Why:** Claude adversarial pass and Codex, review cycle 3 of #1013 (2026-11-15). Each needs an empty model reply first; none fails a test or loses data.
+
+**How to apply:** (1) Mark read-only tools by their `read_only` annotation or tool kind and leave them out of the any/all choice. (2) Pass the graph's decision to conversation.py on the config, as `pin_reply` is, instead of re-reading the store. (3) Treat `response_type == "error"` as failed in `_result_succeeded` once a returning handler is found. (4) Make the write idempotent per call, or have the timeout result say the automation may have been added.
+
+**Effort:** S each
+**Priority:** P3
+**Depends on:** None
+
+### A cloud fallback running the primary's model drops the primary's flat thinking setting
+
+**What:** Since #1022 a second OpenAI, Gemini or Anthropic account behind a primary of its type runs the primary's model. Its thinking settings still come from `_chat_thinking_for_model(..., default_to_flat=False)` (`__init__.py`, `_configured_cloud_model` and the Anthropic branch), so the Conversation feature's flat reasoning setting and budget are not sent unless a per-model entry is stored: the fallback answers without reasoning while the primary reasons.
+
+**Why:** Claude adversarial pass, review of #1022 (2026-11-15). Low: it needs two accounts of one cloud type and a failover; the answer still comes.
+
+**How to apply:** Pass `default_to_flat=True` when the fallback's model is the inherited primary model (mark it when `_with_primary_settings` fills `{category}_model`). Test: an Anthropic primary with reasoning on and a second Anthropic account; the fallback's configurable carries the thinking block.
 
 **Effort:** S
 **Priority:** P3
@@ -118,6 +170,28 @@
 
 **Effort:** S
 **Priority:** P2
+**Depends on:** None
+
+---
+
+### PIN prompt store: states left untested and a claim that trusts the id after #1004
+
+**What:** Since #1004, `register_pending_action` keeps a re-issued request's id, so a prompt replaced by the same request has the same key as the one it replaced. Two follow-ups.
+
+1. `_claim_pending_action` (`agent/tools.py`) claims by id alone, so it can no longer tell the stored prompt from the one a confirmation loaded and checked. A confirmation's attempt increment (`_validate_pin_for_action`) also lands on the dict it loaded. Neither can happen today: nothing is awaited between loading the action and claiming it.
+2. Three cells of the review's state table have no test:
+   - a different request while another running turn's prompt is not yet delivered (refused "in progress");
+   - another voice asking for the same request while the owner's PIN reply is being handled (refused, with the in-progress line);
+   - two prompts for one user on one thread replaced by a different request (both dropped, new id, highest counts carried; no path creates two such prompts today).
+
+**Why:** gstack review of #1004 (2026-11-16): Claude adversarial (cycle 2, Low, not reachable) and the state-machines specialist (cycle 2). The maintainer chose to log the cells instead of adding a third review cycle. None is a bug today.
+
+**How to apply:**
+1. Pass the loaded dict to `_claim_pending_action` and claim only when `pending_actions.get(action_id) is action`, so an await added later between load and claim cannot run a replaced prompt.
+2. Add the three cases to `tests/custom_components/home_generative_agent/test_pin_routing_gaps.py`. The matrix is at `.gstack/tmp/state-machines.c2e2a67a7841.md` while it lasts.
+
+**Effort:** S
+**Priority:** P3
 **Depends on:** None
 
 ---
@@ -733,6 +807,32 @@ v3.41.1 rather than deferred; see the TODO above.
 **Effort:** S
 **Priority:** P3
 **Depends on:** None
+
+---
+
+### A failed summarization request fails a turn that was already answered
+
+**What:** `_summarize_and_remove_messages` (`agent/graph.py`) does not catch the `HomeAssistantError` that `_invoke_model` raises on a timeout or provider error. The node runs after the chat model has answered, so the turn fails anyway, and every later turn past the context limit retries and fails the same way. An empty reply is handled (#1048: the earlier summary is kept); a raised error is not.
+
+**Why:** Found by the review of the #1048 fix. It was there before that change and is left out of it to keep the fix small.
+
+**How to apply:** Catch the error in the node, log it, and return the earlier summary. Decide whether the messages are removed (history stays bounded, those turns are lost) or kept for a bounded number of retries.
+
+**Effort:** S
+**Priority:** P2
+
+---
+
+### The conversation summary can keep `add_automation` bound for a whole conversation
+
+**What:** `_conversation_has_automation_context` (`agent/graph.py`) runs `_query_wants_automation` over the summary as well as the last few user turns. Since #1048 the summary is asked to record what the user asked for and earlier notes are kept until the summary is shortened, so one automation request early on may match on every later turn, past the `_AUTOMATION_CONTEXT_HUMAN_TURNS` window.
+
+**Why:** Found by the review of the #1048 fix; not confirmed against real summaries. The cost is the extra tool description on each turn and a chance that unrelated conditional phrasing is routed to `add_automation`.
+
+**How to apply:** Check real summaries against the regex first. If they match, stop scanning the summary once the request is older than the turn window, or scan only for an automation still in progress.
+
+**Effort:** S
+**Priority:** P3
 
 ---
 
@@ -1994,6 +2094,19 @@ label pair ("Server URL" vs "Base URL").
 
 ## Model Providers
 
+### Direct embedding callers with a short limit never fail over
+
+**What:** Two callers call the embedding chain directly, not through the store, and bound it with a limit no longer than a provider's in `FallbackEmbeddings` (30 s plus 0.25 s per text, #969): the camera caption scan (`_RECENT_CAPTION_SCAN_TIMEOUT_SEC`, 10 s, `core/video_analyzer.py`, its `embeddings.aembed_documents`) and the embedding-size probe (`_PROBE_TIMEOUT_S`, 15 s, `core/embedding_store.py`). With a frozen primary and a healthy fallback, the caller cancels the call before the primary's limit fires. A cancel is not a failure, so nothing is recorded, no hold starts and the fallback is never tried there; the caption scan's dedup then fails open. This was already true before #969; it is not a regression. Calls through the store (memory and tool search, the tool-index top-up, caption writes) are not affected: LangGraph's batched store runs them in its own task, so a caller's limit only stops it waiting and the chain carries on.
+
+**Why:** Red team and Codex, review of #969 (2026-11-18). Lindo chose to narrow the docs instead of passing budgets in that PR.
+
+**How to apply:** Wrap those two direct calls in `model_call_budget(...)` and have `_through_chain` take `min(timeout_s, member_timeout(last=...))` for each member, as the chat chain does (`core/provider_stall.py`). Short budgets are not split (`SPLIT_MIN_BUDGET_S`), so the caption scan would need its own rule. A store-routed call would not see such a budget (the store's task keeps the context it started with). Test a frozen primary and a healthy fallback on the caption scan.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** None
+
+
 ### The Responses API's assistant phase is not kept between turns
 
 **What:** Newer OpenAI models (codex models from `gpt-5.3-codex`) tag assistant output with a `phase` (`commentary` vs `final_answer`) and expect it replayed. The `v0` output format drops it on a streamed reply, and `agent/graph.py` `_call_model` checkpoints each reply as text plus tool calls, so the next request loses the distinction between intermediate commentary and the final answer.
@@ -2186,20 +2299,6 @@ label pair ("Server URL" vs "Base URL").
 **Depends on:** None
 
 ## Config Entry Lifecycle
-
-### Decide whether face enrollment should be admin-only
-
-**What:** `EnrollPersonView` (`http.py`) has `requires_auth = True` but no admin check, and the `hga.enroll_person` service is likewise callable by any user context — so any authenticated HA user (or a leaked limited-scope long-lived token) can enroll faces into the gallery that feeds security-relevant recognition (Sentinel unknown-person rules, recognized-people sensors). Poisoning shape: enroll an arbitrary face under a trusted resident's name and the phantom becomes "recognized". Reserved-label refusal still applies; this is about *who*, not *what*.
-
-**Why:** Security-specialist finding during the v3.30.10 ship (confidence 5 — a deliberate-decision flag, not a demonstrated exploit). Pre-existing behavior, not introduced by that ship's view rewiring. Deferred by user decision (2026-08-21): gating changes which household members can use the enroll card, so it deserves its own PR, docs update, and release note rather than riding a lifecycle batch.
-
-**How to apply:** If admin-only: check `request[KEY_HASS_USER].is_admin` in `post()` (mirroring HA's admin-gated views) and require admin context in `_handle_enroll_person` for parity; update `docs/camera-entities.md` and the enroll card docs; release-note the behavior change. If open-by-design: document explicitly that any authenticated user may enroll.
-
-**Effort:** S
-**Priority:** P2
-**Depends on:** —
-
----
 
 ### A Sentinel write already under way when its stop gives up still lands
 

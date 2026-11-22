@@ -33,6 +33,7 @@ from langchain_core.messages import (
     HumanMessage,
     RemoveMessage,
     SystemMessage,
+    ToolCall,
     ToolMessage,
 )
 from langchain_core.messages.utils import trim_messages
@@ -65,15 +66,20 @@ from custom_components.home_generative_agent.const import (
     MAX_AFFIRMATIVE_FOLLOW_UP_WORDS,
     MAX_REFERENTIAL_FOLLOW_UP_WORDS,
     NO_REPLY_APOLOGY,
+    NO_REPLY_PARTIAL,
+    NO_REPLY_REFUSED,
     NON_OPEN_ACTUATION_KEYWORDS_REGEX,
     OPEN_AS_STATE_REGEX,
     OPEN_COMMAND_CLAUSE_REGEX,
+    PAST_SUMMARY_NOTE,
     READ_ONLY_STATE_QUERY_REGEX,
     REFERENTIAL_FOLLOW_UP_REGEX,
     SECURITY_AUDIT_INTENT_REGEX,
-    SUMMARIZATION_INITIAL_PROMPT,
-    SUMMARIZATION_PROMPT_TEMPLATE,
+    SUMMARIZATION_COMPACT_PROMPT,
+    SUMMARIZATION_PROMPT,
     SUMMARIZATION_SYSTEM_PROMPT,
+    SUMMARY_COMPACT_ABOVE_CHARS,
+    SUMMARY_COMPACT_MIN_CHARS,
     TOOL_CALL_ERROR_TEMPLATE,
     TOOL_CALL_TRANSIENT_ERROR_TEMPLATE,
     TOOL_INCLUSIONS_MAX_PER_TURN,
@@ -100,12 +106,18 @@ from ..core.prompt_cache import (  # noqa: TID252
 from ..core.provider_stall import model_call_budget  # noqa: TID252
 from ..core.utils import extract_final  # noqa: TID252
 from .automation_pin import STEP_TARGET_KEYS
-from .automation_targets import AUTOMATION_REFUSAL_PREFIX
+from .automation_targets import (
+    AUTOMATION_ADDED_PREFIX,
+    AUTOMATION_MAY_BE_INSTALLED,
+    AUTOMATION_PUSHES_LEFT_ORDINARY,
+    AUTOMATION_REFUSAL_PREFIX,
+)
 from .helpers import (
     ALARM_DOMAIN,
     CONFIRM_TOOL_NAME,
     INTENT_NAME_ALL,
     PIN_ANSWER_KWARG,
+    PIN_AWAITING_USER_REPLY,
     PIN_REFUSAL_ENDS_TURN,
     REMOTE_TOOL,
     PinReply,
@@ -125,6 +137,7 @@ from .helpers import (
     is_on_off_intent,
     is_tool_excluded,
     langchain_tool_parameters_json,
+    loads_or_none,
     matches_critical_rule,
     maybe_fill_lock_entity,
     minimal_payload_for_domain,
@@ -150,6 +163,7 @@ from .helpers import (
 )
 from .indirect_pin import (
     BUILTIN_INTENT,
+    CALL_ACTION_TOOL,
     OTHER_INTENT,
     RUN_SERVICES,
     SCENE_DOMAIN,
@@ -162,6 +176,7 @@ from .indirect_pin import (
     calls_a_service,
     collect_started_automations,
     has_service,
+    has_templated_key,
     intent_scripts_are_critical,
     is_script_like_tool,
     named_services,
@@ -186,6 +201,7 @@ from .pin_messages import describe_pending_action, pin_msg, refused_pin_request
 from .rule_entities import expand_critical_rules
 from .template_actions import entities_of
 from .token_counter import count_tokens_cross_provider
+from .tool_failure import TOOL_REFUSAL_KWARG, ToolFailure, is_tool_refusal
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -222,7 +238,8 @@ _OPEN_STATE_RETRY_PHRASES: frozenset[str] = frozenset(
 class State(MessagesState):
     """Extend MessagesState."""
 
-    summary: str
+    # Not required: a turn's input leaves it out so the checkpoint's is kept.
+    summary: NotRequired[str]
     chat_model_usage_metadata: dict[str, Any]
     messages_to_remove: list[AnyMessage]
     selected_tools: list[dict[str, Any]]
@@ -424,6 +441,11 @@ async def _run_langchain_tool(
             raw_content = lc_result.content
             status = None
             result_str = _stringify(raw_content)
+        elif isinstance(lc_result, ToolFailure):
+            # Our tool's refusal in plain text (#1023): LangChain would call
+            # any string a success. A plain str for the checkpoint.
+            status = "error"
+            result_str = str(lc_result)
         elif isinstance(lc_result, str):
             status = None
             result_str = lc_result
@@ -431,26 +453,27 @@ async def _run_langchain_tool(
             status = None
             result_str = _stringify(lc_result)
 
-        if tool_name == "alarm_control":
-            try:
-                parsed = json.loads(result_str)
-                if isinstance(parsed, dict):
-                    warning = parsed.get("warning")
-                    success_val = bool(parsed.get("success", True))
-                    if warning or not success_val:
-                        status = "error"
-                        if parsed.get("result_text"):
-                            result_str = parsed["result_text"]
-                        elif warning:
-                            result_str = str(warning)
-            except json.JSONDecodeError:
-                status = None
+        refusal = isinstance(lc_result, ToolFailure)
+        # Plain text is not parsed: a ToolFailure keeps its error status.
+        parsed = loads_or_none(result_str) if tool_name == "alarm_control" else None
+        if isinstance(parsed, dict):
+            warning = parsed.get("warning")
+            success_val = bool(parsed.get("success", True))
+            if warning or not success_val:
+                status = "error"
+                # Not tagged as a refusal: a warning can follow a completed
+                # call while the panel is still arming (#1023 review).
+                if parsed.get("result_text"):
+                    result_str = parsed["result_text"]
+                elif warning:
+                    result_str = str(warning)
 
         return ToolMessage(
             content=result_str,
             name=tool_name,
             tool_call_id=tool_call.get("id") or "",
             status=status,
+            additional_kwargs={TOOL_REFUSAL_KWARG: True} if refusal else {},
         )
     except TimeoutError:
         return _make_transient_tool_error(
@@ -591,6 +614,9 @@ def _critical_action_guard(  # noqa: PLR0913
         # The tool's own name there, which a remote one's differs from (#843).
         "api_tool_name": origin.tool_name if origin is not None else None,
         "remote": origin is not None and origin.remote,
+        # A tool of Home Assistant's admin-only API (#918): one that is not
+        # its call-action tool names no device, so the line names the tool.
+        "admin_api": origin is not None and origin.admin_api,
     }
     action_id = register_pending_action(
         ctx.pending_actions,
@@ -956,8 +982,15 @@ class RawTool(TypedDict):
 
 def _get_allowed_api_ids(config: RunnableConfig) -> set[str]:
     """Determine which API IDs are allowed based on configuration."""
-    opts = config.get("configurable", {}).get("options", {})
-    return set(active_llm_api_ids(opts)) | {"hga_local"}
+    configurable = config.get("configurable", {})
+    allowed = set(active_llm_api_ids(configurable.get("options", {})))
+    # An API this turn did not load has no tool to call: an admin-only one on
+    # a satellite's turn (#918), or one that failed to load. Its index rows
+    # would only take the places of tools the turn can use.
+    loaded = getattr(configurable.get("ha_llm_api"), "apis", None)
+    if isinstance(loaded, Mapping):
+        allowed &= set(loaded)
+    return allowed | {"hga_local"}
 
 
 def _get_live_tool_ids(config: RunnableConfig) -> set[tuple[str, str]] | None:
@@ -1116,6 +1149,12 @@ async def _get_rag_retrieved_tools(  # noqa: PLR0912, PLR0915
             results = await store.asearch(
                 ("system", "tools"), query=sub_query, limit=limit * 4
             )
+        except EmbeddingsUnavailableError as err:
+            # No provider can embed the query (#969): every later sub-query
+            # would fail the same way, after a wait. The keyword fallback
+            # ranks the tools instead; the chain logged the cause.
+            LOGGER.debug("RAG tool retrieval skipped: %s", err)
+            break
         except (
             InvalidNamespaceError,
             psycopg.OperationalError,
@@ -1408,14 +1447,7 @@ def _retrieval_query(messages: Sequence[BaseMessage]) -> str:
         # both in the agent's offer, so rank on it, the user's previous turn,
         # and the reply itself (each searched separately; best score wins).
         offer = _offer_text(messages[:-1])
-        previous = next(
-            (
-                _message_text(m).strip()
-                for m in reversed(messages[:-1])
-                if isinstance(m, HumanMessage)
-            ),
-            "",
-        )
+        previous = _previous_user_text(messages)
         parts = [p.rstrip(".!? ") for p in (previous, offer) if p]
         if parts:
             LOGGER.debug(
@@ -1426,18 +1458,14 @@ def _retrieval_query(messages: Sequence[BaseMessage]) -> str:
         return current
     if not _is_referential_follow_up(current):
         return current
-    for msg in reversed(messages[:-1]):
-        if not isinstance(msg, HumanMessage):
-            continue
-        previous = _message_text(msg).strip()
-        if not previous:
-            break
-        LOGGER.debug(
-            "Referential follow-up: widening the retrieval query with the "
-            "previous user turn (model input unchanged)"
-        )
-        return f"{previous.rstrip('.!?')}. {current}"
-    return current
+    previous = _previous_user_text(messages)
+    if not previous:
+        return current
+    LOGGER.debug(
+        "Referential follow-up: widening the retrieval query with the "
+        "previous user turn (model input unchanged)"
+    )
+    return f"{previous.rstrip('.!?')}. {current}"
 
 
 _MAX_ACTION_ROUNDS = 3
@@ -1773,6 +1801,16 @@ async def _append_turn_on_tool(  # noqa: PLR0913
 
 # At most this many of the previous turn's tools are kept bound (#920).
 _PRIOR_TURN_TOOLS_MAX = 3
+# At most this many of the tools the previous question ranks best (#1033).
+_PRIOR_QUESTION_TOOLS_MAX = 2
+
+
+def _previous_user_text(messages: Sequence[BaseMessage]) -> str:
+    """Return the user's message before the current one, or "" if none."""
+    for msg in reversed(messages[:-1]):
+        if isinstance(msg, HumanMessage):
+            return _message_text(msg).strip()
+    return ""
 
 
 def _prior_turn_tool_names(messages: Sequence[BaseMessage]) -> list[str]:
@@ -1781,7 +1819,9 @@ def _prior_turn_tool_names(messages: Sequence[BaseMessage]) -> list[str]:
 
     Only the turn just before the current message: its tool results sit
     between the previous user message and this one. A rejected or failed
-    call has an error status and is skipped, so a refusal is never carried.
+    call has an error status and is skipped, so a routing refusal is never
+    carried. One of our tools' own answers that it could not act (#1023) is
+    carried, as it was when those answers read as success.
     """
     if not messages or not isinstance(messages[-1], HumanMessage):
         return []
@@ -1791,7 +1831,9 @@ def _prior_turn_tool_names(messages: Sequence[BaseMessage]) -> list[str]:
             break
         if (
             isinstance(msg, ToolMessage)
-            and msg.status != "error"
+            # A tool that ran and answered it could not (a camera not found,
+            # #1023) is carried: the follow-up ("the front one") needs it.
+            and (msg.status != "error" or is_tool_refusal(msg))
             and msg.name
             and msg.name not in names
         ):
@@ -1856,6 +1898,89 @@ async def _append_prior_turn_tools(
     if added:
         LOGGER.debug(
             "Short follow-up: kept %d tool(s) the previous turn ran bound", added
+        )
+    return candidates
+
+
+def _prior_question(messages: Sequence[BaseMessage], *, widened: bool) -> str:
+    """
+    Return the previous question whose best tools a short follow-up binds.
+
+    Empty unless the current turn is short (the referential word cap) and its
+    ranking did not already search the previous question (a referential or
+    affirmative follow-up is widened by `_retrieval_query` instead).
+    """
+    if widened or not messages:
+        return ""
+    query = _message_text(messages[-1])
+    if not query.strip() or len(query.split()) > MAX_REFERENTIAL_FOLLOW_UP_WORDS:
+        return ""
+    return _previous_user_text(messages)
+
+
+async def _get_prior_question_tools(
+    store: BaseStore,
+    config: RunnableConfig,
+    question: str,
+    live_tool_ids: set[tuple[str, str]] | None,
+) -> list[RawTool]:
+    """
+    Rank the previous question's tools for a short follow-up (#1033).
+
+    Field report: "What do you see on the moon garden camera?" was answered
+    from the camera list in the prompt with no tool call, so the #920 carry
+    had nothing to keep, and "the backyard one then", ranked on its own
+    words, offered no camera tool: the agent said it could not look. The
+    camera tool ranked first on the previous question (0.580).
+
+    Read-only tools only: an actuation tool chosen by an earlier request is
+    never bound on a turn whose own words did not ask for one. This house's
+    own tools only, as in the #920 carry. Run beside the turn's own ranking,
+    so it adds no wait.
+    """
+    if not question:
+        return []
+    local_api_ids = _get_allowed_api_ids(config) - _remote_ids(config)
+    ranked, _dropped = await _get_rag_retrieved_tools(
+        store, config, question, local_api_ids, live_tool_ids
+    )
+    always_bound = _always_bound_local_tools(config)
+    return [
+        t
+        for t in ranked
+        if not t["is_actuation"] and not _is_always_bound_local_tool(t, always_bound)
+    ]
+
+
+def _append_prior_question_tools(
+    candidates: list[RawTool],
+    prior_question_tools: Sequence[RawTool],
+    facing: Callable[[str, str], str],
+) -> list[RawTool]:
+    """
+    Bind the previous question's best read-only tools (#1033).
+
+    Appended past the limit, like the #920 carry, so a tool this turn ranked
+    is never evicted. Nothing when ranking found no candidates: step 3's
+    keyword fallback then stands alone.
+    """
+    if not candidates:
+        return candidates
+    bound = {facing(t["api_id"], t["name"]) for t in candidates}
+    added = 0
+    for tool in prior_question_tools:
+        if added >= _PRIOR_QUESTION_TOOLS_MAX:
+            break
+        key = facing(tool["api_id"], tool["name"])
+        if key in bound:
+            continue
+        candidates = [*candidates, tool]
+        bound.add(key)
+        added += 1
+    if added:
+        LOGGER.debug(
+            "Short follow-up: bound %d tool(s) the previous question ranks best",
+            added,
         )
     return candidates
 
@@ -2075,6 +2200,13 @@ async def _get_actuation_safety_tools(
             query=query,
             filter={"is_actuation": True},
         )
+    except EmbeddingsUnavailableError as err:
+        # No provider can embed the query (down, held, or timed out, #969):
+        # with no ranked candidates the keyword fallback binds the tools,
+        # actuation ones first for an actuation query. An unranked page here
+        # would stand in for that ranking. The chain logged the cause.
+        LOGGER.debug("Deterministic safety tool filter skipped: %s", err)
+        results = []
     except (
         InvalidNamespaceError,
         psycopg.OperationalError,
@@ -2860,9 +2992,11 @@ def _has_pending_pin_confirmation(messages: Sequence[AnyMessage]) -> bool:
                     # Refused before the PIN was checked (not in the user's
                     # message, or the message already used) — still pending.
                     continue
-                if getattr(msg, "status", None) == "error":
+                if getattr(msg, "status", None) == "error" and not is_tool_refusal(msg):
                     # Routing or tool error on confirm_sensitive_action itself —
-                    # the PIN was never checked. Keep the action pending.
+                    # the PIN was never checked. Keep the action pending. The
+                    # tool's own refusals (a wrong PIN, an action gone, #1023)
+                    # are answers: resolved here, the store keeps a live one.
                     continue
                 return False
         return True
@@ -3210,12 +3344,14 @@ async def _retrieve_tools(  # noqa: PLR0915
     # drop dead rows *before* it cuts to the retrieval limit — step 1b below
     # runs after that cut and cannot give a stolen slot back.
     live_tool_ids = _get_live_tool_ids(config)
-    rag_result, safety_tools, pin_tools = await asyncio.gather(
+    prior_question = _prior_question(state["messages"], widened=ranking_query != query)
+    rag_result, safety_tools, pin_tools, prior_question_tools = await asyncio.gather(
         _get_rag_retrieved_tools(
             store, config, ranking_query, allowed_api_ids, live_tool_ids
         ),
         _get_actuation_safety_tools(store, config, ranking_query, allowed_api_ids),
         _get_pending_pin_tools(state["messages"], store, config),
+        _get_prior_question_tools(store, config, prior_question, live_tool_ids),
     )
     rag_tools, rag_dropped_not_live = rag_result
 
@@ -3268,6 +3404,14 @@ async def _retrieve_tools(  # noqa: PLR0915
     ]
     effective_limit = min(safety_cap + len(rag_only), safety_cap + limit)
     all_candidates = pin_tools + (safety_capped + rag_only)[:effective_limit]
+
+    # 2b. A short follow-up also gets the previous question's best read-only
+    # tools (#1033), before 3b and 3i so both still apply to them. Only when
+    # ranking found something: with no candidates, step 3's keyword fallback
+    # stands alone.
+    all_candidates = _append_prior_question_tools(
+        all_candidates, prior_question_tools, facing
+    )
 
     # 3. Fallback: vector store unavailable or index not yet ready.
     # Still apply the limit so the user-configured cap is always respected.
@@ -3553,7 +3697,9 @@ def _build_system_message(
         volatile += f"\n{memories}"
     if summary:
         volatile += (
-            f"\n<past_conversation_summary>\n{summary}\n</past_conversation_summary>"
+            "\n<past_conversation_summary>\n"
+            f"{PAST_SUMMARY_NOTE}\n{summary}\n"
+            "</past_conversation_summary>"
         )
     return build_system_message(base_prompt, volatile.strip("\n"))
 
@@ -3908,21 +4054,113 @@ def _pin_answered_later(messages: Sequence[AnyMessage], action_id: Any) -> bool:
     return False
 
 
-def _empty_reply_fallback(last_message: AnyMessage) -> str:
+# Keys of a tool result that say it did not act, or not fully: the error and
+# status fields tools return, and the notes `with_failure_note` (helpers.py)
+# adds to a half-done or failed action intent.
+_RESULT_FAILURE_KEYS = ("error", "warning", "failure", "partial_failure")
+
+
+def _result_succeeded(msg: ToolMessage) -> bool:
+    """Return True when a tool result says nothing failed or is still held."""
+    if msg.status == "error":
+        return False
+    if not isinstance(msg.content, str):
+        return True
+    if (msg.name or "").lower() == "add_automation":
+        # Ours, which runs by its bare name in any case (`_run_langchain_tool`).
+        # It reports a refusal, an invalid config or a PIN it needs in plain
+        # text; only an installed automation reads as done (#1013 review).
+        # Another server's tool of that name is read like any other.
+        return (
+            msg.content.startswith(AUTOMATION_ADDED_PREFIX)
+            and AUTOMATION_PUSHES_LEFT_ORDINARY not in msg.content
+        )
+    data = loads_or_none(msg.content)
+    if isinstance(data, str):
+        # An HA API tool's JSON-string result, encoded once more on the way
+        # (`parse_tool_response`).
+        data = loads_or_none(data)
+    if not isinstance(data, dict):
+        return True
+    if any(data.get(key) for key in _RESULT_FAILURE_KEYS):
+        return False
+    # A tool's own JSON can hold a dict or list under "status" (#1013 review).
+    status = data.get("status")
+    held = isinstance(status, str) and status in {
+        "error",
+        "requires_pin",
+        PIN_AWAITING_USER_REPLY,
+    }
+    return data.get("success") is not False and not held
+
+
+def _result_partly_acted(msg: ToolMessage) -> bool:
+    """Return True for an action that acted on some of its devices only."""
+    if (msg.name or "").lower() == "add_automation" and isinstance(msg.content, str):
+        # Maybe installed before the install failed (#1030): not "try again".
+        if msg.content.startswith(AUTOMATION_MAY_BE_INSTALLED):
+            return True
+        # Installed, but a safety alarm's pushes stay ordinary (#869, #1023):
+        # not "Done.", and not "try again", which would install a second.
+        if msg.content.startswith(AUTOMATION_ADDED_PREFIX):
+            return AUTOMATION_PUSHES_LEFT_ORDINARY in msg.content
+    data = loads_or_none(msg.content) if isinstance(msg.content, str) else None
+    return isinstance(data, dict) and bool(data.get("partial_failure"))
+
+
+def _empty_reply_fallback(
+    messages: Sequence[AnyMessage], config: RunnableConfig
+) -> str | None:
     """
     Return the text for a model reply with no text and no tool call.
 
     Qwen3 extended-thinking: Ollama strips <think>…</think> tokens from
     content, leaving content='' when all output was reasoning. After a tool
-    round a minimal acknowledgement keeps the conversation from going
-    silent. A first reply gets the apology instead: "Done." would claim an
-    action that never ran, and an empty AIMessage would stay in the
-    checkpoint for every later turn to read (#946).
+    round whose every result succeeded, a minimal acknowledgement keeps the
+    conversation from going silent. Otherwise the apology: "Done." would
+    claim an action that never ran (a first reply, #946), failed, or waits
+    for the PIN (#1013). A round where some calls acted gets a line that
+    does not ask to try again, which would repeat them, and so does one
+    where every call was our tool answering it could not act (#1023). An empty AIMessage
+    would stay in the checkpoint for every later turn to read.
+
+    None when a fixed PIN line will be the reply (conversation.py): the turn
+    then ends on the tool round, as the round-limit guard's does, and the
+    line alone is the reply, asking for the PIN when a prompt waits.
+    "Done." next to "say your PIN to unlock" said both (#1013). The other
+    results of that round then go unsaid, a failure among them: the reply
+    must end on the PIN question for a satellite to keep listening, and
+    saying more needs a fixed line of its own (TODOS.md).
     """
-    if isinstance(last_message, ToolMessage):
+    last_message = messages[-1] if messages else None
+    if not isinstance(last_message, ToolMessage):
+        LOGGER.warning("Model returned an empty reply; apologizing.")
+        return NO_REPLY_APOLOGY
+    if _pin_line_is_the_reply(config):
+        LOGGER.debug("Empty model response after tools; the PIN line is the reply.")
+        return None
+    responses = _last_round_responses(messages)
+    acted = [_result_succeeded(msg) for msg in responses]
+    if all(acted):
         LOGGER.debug("Empty model response after tool execution; injecting fallback.")
         return "Done."
-    LOGGER.warning("Model returned an empty reply; apologizing.")
+    # One call can act on some devices only: its note says so (#1013 review).
+    if any(acted) or any(_result_partly_acted(msg) for msg in responses):
+        LOGGER.warning(
+            "Model returned an empty reply after a tool round that partly "
+            "acted; saying so."
+        )
+        return NO_REPLY_PARTIAL
+    if all(is_tool_refusal(msg) for msg in responses):
+        # Every call answered it could not act: no "try again" (#1023 review).
+        LOGGER.warning(
+            "Model returned an empty reply after tools that refused; saying so."
+        )
+        return NO_REPLY_REFUSED
+    LOGGER.warning(
+        "Model returned an empty reply after a tool round that did not fully "
+        "act; apologizing."
+    )
     return NO_REPLY_APOLOGY
 
 
@@ -3983,8 +4221,8 @@ async def _call_model(
     # Model input = System + current messages.
     messages = [system_message, *state["messages"]]
 
-    trimmed_messages = await _trim_messages_for_model(
-        messages, opts, chat_model_options, hass
+    trimmed_messages = _with_interrupted_results(
+        await _trim_messages_for_model(messages, opts, chat_model_options, hass)
     )
 
     LOGGER.debug("Model call messages: %s", trimmed_messages)
@@ -4032,14 +4270,15 @@ async def _call_model(
 
     tool_calls = getattr(raw_response, "tool_calls", []) or []
 
-    if not response.strip() and not tool_calls:
-        response = _empty_reply_fallback(state["messages"][-1])
-
     # Create AI message, no need to include tool call metadata if there's none.
+    ai_response: AIMessage | None
     if tool_calls:
         ai_response = AIMessage(content=response, tool_calls=tool_calls)
-    else:
+    elif response.strip():
         ai_response = AIMessage(content=response)
+    else:
+        fallback = _empty_reply_fallback(state["messages"], config)
+        ai_response = None if fallback is None else AIMessage(content=fallback)
     LOGGER.debug("AI response: %s", ai_response)
 
     metadata: dict[str, str] = (
@@ -4051,11 +4290,184 @@ async def _call_model(
     LOGGER.debug("Messages to remove: %s", messages_to_remove)
 
     return {
-        "messages": ai_response,
+        "messages": [] if ai_response is None else ai_response,
         "chat_model_usage_metadata": metadata,
         "messages_to_remove": messages_to_remove,
         "turn_memories": memo,
     }
+
+
+# How much of a tool's result goes into the text sent to the summarization
+# model: its start, and its end, where a JSON result may carry its status.
+_SUMMARY_TOOL_RESULT_HEAD_CHARS = 200
+_SUMMARY_TOOL_RESULT_TAIL_CHARS = 100
+
+
+def _summary_excerpt(text: str) -> str:
+    """Return the text on one line, keeping only its start and end if long."""
+    flat = " ".join(text.split())
+    head, tail = _SUMMARY_TOOL_RESULT_HEAD_CHARS, _SUMMARY_TOOL_RESULT_TAIL_CHARS
+    if len(flat) <= head + tail:
+        return flat
+    return f"{flat[:head].rstrip()} … {flat[-tail:].lstrip()}"
+
+
+def _summary_tool_result_text(msg: ToolMessage, name: str | None) -> str:
+    """Say in a sentence that a tool was used and what it returned."""
+    tool = name or msg.name or "a tool"
+    content = msg.content if isinstance(msg.content, str) else _message_text(msg)
+    failed = " It failed." if msg.status == "error" else ""
+    excerpt = _summary_excerpt(content) or "nothing"
+    return f"(I used the tool {tool}.{failed} It returned this data: {excerpt})"
+
+
+def _messages_as_text_for_summary(messages: Sequence[AnyMessage]) -> list[AnyMessage]:
+    """
+    Return the messages as user and assistant text only (#1045).
+
+    OpenAI and Anthropic reject a tool call with no result after it, and the
+    messages being summarized may hold a call whose result is not among them.
+    So no tool call or tool result is sent as one: each is written out as a
+    sentence in the assistant's own text, and the assistant messages of one
+    turn become a single message. A call's arguments are left out, since they
+    can hold the Critical Action PIN or an alarm code in any slot; the user's
+    request and the tool's result say what it was for. A call with no result
+    (a stopped turn, #947) is said to have no known outcome.
+    """
+    rendered: list[AnyMessage] = []
+    unanswered: dict[str, str] = {}
+
+    def _say(text: str) -> None:
+        if not text.strip():
+            return
+        last = rendered[-1] if rendered else None
+        if isinstance(last, AIMessage):
+            rendered[-1] = AIMessage(content=f"{last.content}\n{text}")
+        else:
+            rendered.append(AIMessage(content=text))
+
+    def _close_round() -> None:
+        for name in unanswered.values():
+            _say(
+                f"(I asked to use the tool {name}, but no result was recorded: "
+                "it may or may not have run.)"
+            )
+        unanswered.clear()
+
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            _say(_summary_tool_result_text(msg, unanswered.pop(msg.tool_call_id, None)))
+            continue
+        _close_round()
+        if isinstance(msg, HumanMessage):
+            if not isinstance(msg.content, str) or msg.content.strip():
+                rendered.append(msg)
+        elif isinstance(msg, AIMessage):
+            _say(_message_text(msg))
+            for index, call in enumerate(msg.tool_calls):
+                call_id = str(call.get("id") or f"{id(msg)}-{index}")
+                unanswered[call_id] = str(call.get("name") or "a tool")
+    _close_round()
+    return rendered
+
+
+# The tags the summary request is built from. Text placed inside them (a tool
+# result, a user message, the earlier summary) must not be able to close one.
+_SUMMARY_REQUEST_TAG_RE = re.compile(
+    r"<\s*(/?)\s*(messages|notes)\b[^>]*>", re.IGNORECASE
+)
+
+
+def _summary_request_text(text: str) -> str:
+    """Return the text with the summary request's own tags made inert."""
+    return _SUMMARY_REQUEST_TAG_RE.sub(r"[\1\2]", text)
+
+
+def _summary_transcript(messages: Sequence[AnyMessage]) -> str:
+    """
+    Return the messages as "User:" and "Assistant:" lines of text.
+
+    A message's later lines are indented, so a line of it that starts with
+    "User:" does not read as a new turn. A user message with no text (an
+    image) still gets a line, so the reply after it has a question before it.
+    """
+    lines: list[str] = []
+    for msg in _messages_as_text_for_summary(messages):
+        is_user = isinstance(msg, HumanMessage)
+        text = _summary_request_text(_message_text(msg)).strip()
+        if not text:
+            if not is_user:
+                continue
+            text = "(sent something other than text)"
+        speaker = "User" if is_user else "Assistant"
+        lines.append(f"{speaker}: " + "\n  ".join(text.splitlines()))
+    return "\n".join(lines)
+
+
+async def _ask_summarization_model(config: RunnableConfig, request: str) -> str:
+    """Return the summarization model's reply to *request*, "" if it has none."""
+    messages: list[AnyMessage] = [
+        SystemMessage(content=SUMMARIZATION_SYSTEM_PROMPT),
+        HumanMessage(content=request),
+    ]
+    model = config.get("configurable", {})["summarization_model"]
+    LOGGER.debug("Summary messages: %s", messages)
+    raw_response = await _invoke_model(model, messages, {})
+    LOGGER.debug("Raw summary response: %s", raw_response)
+    # Keep the summary's own line breaks; it is fed back into the prompt. A
+    # model that is not available answers with a str, which has no content.
+    return extract_final(
+        getattr(raw_response, "content", "") or "", collapse_whitespace=False
+    ).strip()
+
+
+# Where notes may be cut: after a line, or after a sentence in any script.
+_SUMMARY_CUT_RE = re.compile(r"\n|[.!?]\s+|[\u3002\uff01\uff1f]")
+
+
+def _newest_notes(summary: str, limit: int) -> str:
+    """Return the end of the notes that fits *limit*, from a line or sentence."""
+    if len(summary) <= limit:
+        return summary
+    tail = summary[-limit:]
+    # The first place to cut, so as much as fits is kept.
+    for found in _SUMMARY_CUT_RE.finditer(tail):
+        rest = tail[found.end() :].strip()
+        if rest:
+            return rest
+    return tail
+
+
+async def _compact_summary(config: RunnableConfig, summary: str) -> str:
+    """
+    Return the notes shortened by the model once they are too long.
+
+    The only request that lets a model rewrite the notes, so its reply is
+    used only if it is shorter and not so short that it must have left most
+    of them out (a refusal, or the newest notes alone). Otherwise, and when
+    the request fails, the notes lose their oldest part instead: the summary
+    cannot grow without bound, and a failure here does not fail the turn.
+    """
+    if len(summary) <= SUMMARY_COMPACT_ABOVE_CHARS:
+        return summary
+    try:
+        shorter = await _ask_summarization_model(
+            config,
+            SUMMARIZATION_COMPACT_PROMPT.format(summary=_summary_request_text(summary)),
+        )
+    except HomeAssistantError as err:
+        LOGGER.warning("Shortening the conversation summary failed: %s", err)
+        shorter = ""
+    if SUMMARY_COMPACT_MIN_CHARS <= len(shorter) < len(summary):
+        summary = shorter
+    else:
+        LOGGER.warning(
+            "The summarization model did not shorten the conversation summary "
+            "(%d characters in, %d out); dropping its oldest part instead.",
+            len(summary),
+            len(shorter),
+        )
+    return _newest_notes(summary, SUMMARY_COMPACT_ABOVE_CHARS)
 
 
 async def _summarize_and_remove_messages(
@@ -4071,35 +4483,30 @@ async def _summarize_and_remove_messages(
     if not msgs_to_remove:
         return {"summary": summary}
 
-    summary_message = (
-        SUMMARIZATION_PROMPT_TEMPLATE.format(summary=summary)
-        if summary
-        else SUMMARIZATION_INITIAL_PROMPT
+    transcript = _summary_transcript(msgs_to_remove)
+    removals = [RemoveMessage(id=m.id) for m in msgs_to_remove if m.id is not None]
+    if not transcript:
+        # Nothing to add (messages with no text): no reason to ask a model.
+        return {"summary": summary, "messages": removals}
+
+    # The model writes notes for these messages only. They are added after
+    # the summary so far, which no reply can then leave out (#1048).
+    notes = await _ask_summarization_model(
+        config, SUMMARIZATION_PROMPT.format(transcript=transcript)
     )
+    if not notes:
+        # The messages still go, or the history would grow with every turn.
+        LOGGER.warning(
+            "The summarization model returned no text; keeping the earlier "
+            "summary without the %d messages it was asked to add.",
+            len(msgs_to_remove),
+        )
+        return {"summary": summary, "messages": removals}
 
-    # Build messages for the already-configured summarization model.
-    messages = cast(
-        "list[AnyMessage]",
-        [SystemMessage(content=SUMMARIZATION_SYSTEM_PROMPT)]
-        + [m for m in msgs_to_remove if isinstance(m, (HumanMessage, AIMessage))]
-        + [HumanMessage(content=summary_message)],
-    )
-
-    model = config["configurable"]["summarization_model"]
-    LOGGER.debug("Summary messages: %s", messages)
-    raw_response = await _invoke_model(model, messages, {})
-    LOGGER.debug("Raw summary response: %s", raw_response)
-
-    # Keep the summary's own line breaks; it is fed back into the prompt.
-    response = extract_final(
-        getattr(raw_response, "content", "") or "", collapse_whitespace=False
-    )
-
+    combined = f"{summary.rstrip()}\n{notes}" if summary.strip() else notes
     return {
-        "summary": response,
-        "messages": [
-            RemoveMessage(id=m.id) for m in msgs_to_remove if m.id is not None
-        ],
+        "summary": await _compact_summary(config, combined),
+        "messages": removals,
     }
 
 
@@ -4162,6 +4569,26 @@ def _is_critical_action(  # noqa: PLR0911, PLR0912
             origin.tool_name or tool_name, tool_args, read_only_hint=origin.read_only
         )
 
+    # Home Assistant's admin-only API (#918). A tool it marks read-only only
+    # reads. Its call-action tool runs the service its arguments name, so it
+    # is read by them alone: by its name it would read as a
+    # `homeassistant.call_action` service aimed at whatever it targets.
+    name_is_no_service = False
+    if origin is not None and origin.admin_api:
+        if origin.read_only:
+            return False
+        name_is_no_service = (origin.tool_name or tool_name) == CALL_ACTION_TOOL
+        if not name_is_no_service:
+            # A tool that changes something and names no service, such as
+            # `config__reload_config_entry`: reloading an entry makes its
+            # entities unavailable for a moment, and an automation may act
+            # on that. What it sets off cannot be read from its arguments.
+            return True
+        if not call_service_names(tool_args).dotted or has_templated_key(tool_args):
+            # Which service it runs, or which field a templated name
+            # becomes, cannot be read.
+            return True
+
     # An intent script's tool names no domain or service, and one may take
     # over a built-in intent's tool; what it runs is checked first, and only
     # ever adds a hold (#779).
@@ -4216,7 +4643,10 @@ def _is_critical_action(  # noqa: PLR0911, PLR0912
     if any(
         _named_service_is_critical(action, tool_args, entities, critical_actions, hass)
         for action in named_services(
-            tool_args, tool_name, hass, rule_domains(critical_actions)
+            tool_args,
+            "" if name_is_no_service else tool_name,
+            hass,
+            rule_domains(critical_actions),
         )
     ):
         return True
@@ -4802,6 +5232,33 @@ _ROUND_LIMIT_RESULT = (
 )
 
 
+# The result given to a tool call from an earlier turn that has none: the turn
+# was cancelled (a satellite that stopped listening, a client that left) after
+# the model asked for the call and before its result was saved (#947). The
+# call may have run, so the model is told not to assume either way.
+_INTERRUPTED_RESULT = (
+    "Unknown: the turn was stopped before this call's result was saved, so it "
+    "may or may not have run. Do not call it again unless the user asks."
+)
+
+
+def _tool_results(
+    tool_calls: Sequence[ToolCall],
+    content: str,
+    status: Literal["success", "error"] = "error",
+) -> list[ToolMessage]:
+    """Give each tool call a fixed result with ``content``."""
+    return [
+        ToolMessage(
+            content=content,
+            name=tool_call.get("name", ""),
+            tool_call_id=tool_call.get("id") or "",
+            status=status,
+        )
+        for tool_call in tool_calls
+    ]
+
+
 def _unanswered_calls(messages: Sequence[AnyMessage]) -> list[ToolMessage]:
     """
     Answer the tool calls the guard cuts off, so none is left dangling.
@@ -4814,15 +5271,88 @@ def _unanswered_calls(messages: Sequence[AnyMessage]) -> list[ToolMessage]:
     last = messages[-1] if messages else None
     if not isinstance(last, AIMessage) or not last.tool_calls:
         return []
-    return [
-        ToolMessage(
-            content=_ROUND_LIMIT_RESULT,
-            name=tool_call.get("name", ""),
-            tool_call_id=tool_call.get("id") or "",
-            status="error",
+    return _tool_results(last.tool_calls, _ROUND_LIMIT_RESULT)
+
+
+def _with_interrupted_results(messages: list[AnyMessage]) -> list[AnyMessage]:
+    """
+    Return the model input with a result after every tool call that has none.
+
+    A turn cancelled between the model asking for tools and their results
+    being saved leaves the call without a result in the checkpoint. OpenAI and
+    Anthropic reject such a history, so every later turn of the conversation
+    failed with a provider error until trimming dropped the call (#947). Each
+    such call gets ``_INTERRUPTED_RESULT`` in what is sent, right after the
+    results its message did get.
+
+    Only the input is changed, never the saved history: a turn still running
+    on the same conversation keeps its own results, and the PIN checks read
+    the history as it was. A call counts as answered only by the results right
+    after its own message, since some servers reuse ids such as ``call_0`` in
+    every response.
+    """
+    repaired: list[AnyMessage] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        repaired.append(message)
+        index += 1
+        if not isinstance(message, AIMessage) or not message.tool_calls:
+            continue
+        answered: set[str] = set()
+        while index < len(messages) and isinstance(messages[index], ToolMessage):
+            result = cast("ToolMessage", messages[index])
+            answered.add(result.tool_call_id)
+            repaired.append(result)
+            index += 1
+        missing = [
+            call
+            for call in message.tool_calls
+            if (call.get("id") or "") not in answered
+        ]
+        # Not an error: the call may have run, and Anthropic's is_error would
+        # read as "it failed" to the model.
+        repaired.extend(_tool_results(missing, _INTERRUPTED_RESULT, "success"))
+    if len(repaired) != len(messages):
+        LOGGER.debug(
+            "Answered %d tool call(s) an interrupted turn left without a result "
+            "(model input only).",
+            len(repaired) - len(messages),
         )
-        for tool_call in last.tool_calls
-    ]
+    return repaired
+
+
+def _guard_last_step_note(messages: Sequence[AnyMessage]) -> str:
+    """
+    Say which step the turn was on when the guard cut it off (#953).
+
+    The bare apology left the reason in the debug log only. When the round
+    before the cut-off had a failed result, the note names that tool and
+    offers to explain, which the next turn can do from the results in the
+    history; otherwise it names the tools the model was still asking for.
+    Only names: an error's text can be an instruction to the model or carry
+    home data, and the reply may be spoken aloud. Tool names come from the
+    model or a remote server, so they are sanitized.
+    """
+    cut_off = messages[-1] if messages else None
+    asked = (
+        cut_off.tool_calls
+        if isinstance(cut_off, AIMessage) and cut_off.tool_calls
+        else []
+    )
+    earlier = messages[:-1] if asked else messages
+    failed = [m for m in _last_round_responses(earlier) if not _result_succeeded(m)]
+    if failed and (name := _shown_tool_name(failed[-1].name or "")):
+        return f"\n\nThe last step that failed was {name}. Ask me what went wrong."
+    names = sorted({_shown_tool_name(call.get("name", "")) for call in asked} - {""})
+    if names:
+        return f"\n\nIt was still trying: {', '.join(names)}."
+    return ""
+
+
+def _shown_tool_name(name: str) -> str:
+    """Return a tool's name as the user is shown it: no namespace, made safe."""
+    return sanitize_tool_text(base_tool_name(name)).strip()
 
 
 async def _tool_loop_guard(state: State, config: RunnableConfig) -> dict[str, Any]:
@@ -4851,6 +5381,8 @@ async def _tool_loop_guard(state: State, config: RunnableConfig) -> dict[str, An
     )
     if last_tool is not None and _is_automation_refusal(last_tool):
         content += f"\n\nThe last problem was:\n{last_tool.content}"
+    else:
+        content += _guard_last_step_note(messages)
     return {"messages": [*answers, AIMessage(content=content)]}
 
 

@@ -40,8 +40,12 @@ from homeassistant.helpers.selector import (
 
 from .agent.helpers import (
     TOOL_KEY_SEP,
+    active_llm_api_ids,
+    admin_only_selection,
     api_id_is_form_representable,
-    llm_api_is_supported,
+    base_tool_name,
+    is_tool_excluded,
+    llm_api_requires_admin,
     normalize_api_tool_map,
     normalize_llm_api_value,
     normalize_pin,
@@ -242,12 +246,23 @@ def _list_as_tool_map(values: list[Any]) -> dict[str, list[str]]:
     return normalize_api_tool_map(grouped)
 
 
-# Suffixes marking a stored exclusion whose tool is not in the live list. They
+# Suffixes marking a stored selection whose tool is not in the live list. They
 # are distinct on purpose -- see the three-state comment in
-# `_tool_exclusion_choices`. Named so the wording lives in one place: the tests
-# import these rather than re-spelling them.
+# `_stale_selection_choices`. Named so the wording lives in one place: the
+# tests import these rather than re-spelling them.
 _SUFFIX_NOT_SELECTED = " (API not selected)"
 _SUFFIX_NOT_AVAILABLE = " (not currently available)"
+# A stored exclusion with no ``__`` that is not itself listed but still
+# excludes a listed tool by its base name, and the note on that tool -- see
+# `_exclusion_choices`. ``{name}`` is the stored name, already defanged.
+_SUFFIX_STILL_EXCLUDING = " (not listed, still excluding)"
+_NOTE_EXCLUDED_BY = " (excluded by {name})"
+# The notes for a stored always-included name -- see `_inclusion_choices`. They
+# state a name match and nothing about a turn, which can go another way.
+# ``{name}`` is the matching tool or the stored name, already defanged.
+_SUFFIX_MATCHES = " (not listed, matches {name})"
+_NOTE_MATCHES = " (matches {name})"
+_NOTE_MATCHED_BY = " (matched by {name})"
 
 
 def _label_text(text: str) -> str:
@@ -286,7 +301,9 @@ def _tool_choice(
     stay byte-identical to the real tool name or the exclusion it encodes would
     silently stop matching at runtime.  The suffix is trusted text appended
     *after* both remote halves have been through ``_label_text``, so it is the
-    only parenthesised run the label can contain.
+    only parenthesised run this function puts in a label.
+    ``_exclusion_choices`` may then swap it or add one trusted note of its
+    own, whose remote half goes through ``_label_text`` as well.
     """
     return SelectOptionDict(
         label=f"{_label_text(api_name)}: {_label_text(tool_name)}{suffix}",
@@ -298,7 +315,7 @@ async def _live_tool_choices(
     hass: HomeAssistant,
     selected_apis: list[str],
     indexed_keys: set[str] | None = None,
-) -> tuple[list[SelectOptionDict], set[str], dict[str, str]]:
+) -> tuple[list[SelectOptionDict], set[str], dict[str, str], set[str]]:
     """
     Enumerate the live tool choices shared by both tool pickers.
 
@@ -308,8 +325,10 @@ async def _live_tool_choices(
     ``_stale_selection_choices``. (For the Assist API, enumerating means
     sorting every exposed state plus a registry sweep; doing it once per
     picker would double that on every form open.) Returns the choices, the
-    set of composite values already offered, and the api id -> display name
-    map, which the stale pass needs to label what it re-adds.
+    set of composite values already offered, the api id -> display name
+    map, which the stale pass needs to label what it re-adds, and the subset
+    of offered values an API listed just now (the rest come from the tool
+    index and may be gone, or belong to a device or an admin turn).
 
     Enumeration is per API and failures are isolated: one unreachable MCP
     server -- or one malformed tool descriptor from an otherwise healthy one --
@@ -325,7 +344,12 @@ async def _live_tool_choices(
         assistant=_CONVERSATION_DOMAIN,
         device_id=None,
     )
-    api_names = {api.id: api.name for api in llm.async_get_apis(hass)}
+    registered = llm.async_get_apis(hass)
+    api_names = {api.id: api.name for api in registered}
+    # Home Assistant lists an admin-only API's tools for an admin's turn only,
+    # and the form has no user to give it. Its choices come from the tool
+    # index below, once an admin's turn has loaded it (#918).
+    admin_api_ids = {api.id for api in registered if llm_api_requires_admin(api)}
     selected_set = set(selected_apis)
 
     choices: list[SelectOptionDict] = []
@@ -346,6 +370,8 @@ async def _live_tool_choices(
                 api_id,
                 TOOL_KEY_SEP,
             )
+            continue
+        if api_id in admin_api_ids:
             continue
         try:
             instance = await llm.async_get_api(hass, api_id, llm_context)
@@ -386,6 +412,7 @@ async def _live_tool_choices(
                 continue
             seen.add(value)
             choices.append(_tool_choice(api_name, tool.name, value, suffix=""))
+    enumerated = set(seen)
 
     # Device-gated tools. Home Assistant exposes some Assist tools only when
     # the requesting device supports them -- the timer intents are gated on
@@ -417,7 +444,7 @@ async def _live_tool_choices(
             _tool_choice(api_names.get(api_id, api_id), tool_name, key, suffix="")
         )
 
-    return choices, seen, api_names
+    return choices, seen, api_names, enumerated
 
 
 def _stale_selection_choices(
@@ -465,6 +492,165 @@ def _stale_selection_choices(
     return choices
 
 
+def _exclusion_choices(
+    live_choices: list[SelectOptionDict],
+    stale_choices: list[SelectOptionDict],
+    selected: list[str],
+) -> list[SelectOptionDict]:
+    """
+    Label the Excluded tools options with what a short stored name covers.
+
+    ``is_tool_excluded`` matches a stored name that carries no ``__`` against a
+    tool's base name too, so an exclusion saved as ``HassTurnOff`` before Home
+    Assistant 2026.9 still excludes ``intent__HassTurnOff``. The picker knew
+    only exact names: it showed the stored name as "(not currently available)"
+    and the tool it excludes as not excluded (#950).
+
+    Labels only. The pre-filled selection and what a save stores are left
+    alone, because the stored short name is wider than any one listed tool: it
+    also covers a same-named tool this form cannot list (one a device or an
+    admin turn adds) and the tool under its short name if a server goes back to
+    it. Swapping it for the listed tool would drop those at the next save.
+
+    The covered tool's label names the stored entry, unless the tool is ticked
+    itself, and the stored entry's label says it is still excluding whether or
+    not the tool is ticked too. Coverage is the rule ``is_tool_excluded``
+    applies: same API, and the stored name is the tool's ``base_tool_name``.
+
+    Exclusions only. A short always-included name is looked up differently
+    (``_tool_lookup_targets`` binds the first match, and an exclusion beats
+    it), so that picker has its own labels: see ``_inclusion_choices``.
+    """
+    chosen = set(selected)
+    covering: set[str] = set()
+    labelled: list[SelectOptionDict] = []
+    for choice in live_choices:
+        value = choice["value"]
+        parts = split_tool_index_key(value)
+        short_name = base_tool_name(parts[1]) if parts else ""
+        short_key = tool_index_key(parts[0], short_name) if parts else ""
+        # Covered by a *different*, shorter stored name: the tool's own name
+        # does not count, or every ticked tool would be "covered" by itself.
+        if parts is None or short_name == parts[1] or short_key not in chosen:
+            labelled.append(choice)
+            continue
+        covering.add(short_key)
+        if value in chosen:
+            labelled.append(choice)
+            continue
+        note = _NOTE_EXCLUDED_BY.format(name=_label_text(short_name))
+        labelled.append(SelectOptionDict(label=choice["label"] + note, value=value))
+
+    for choice in stale_choices:
+        label = choice["label"]
+        if choice["value"] in covering:
+            label = label.removesuffix(_SUFFIX_NOT_AVAILABLE) + _SUFFIX_STILL_EXCLUDING
+        labelled.append(SelectOptionDict(label=label, value=choice["value"]))
+    return labelled
+
+
+def _inclusion_choices(
+    live_choices: list[SelectOptionDict],
+    stale_choices: list[SelectOptionDict],
+    selected: list[str],
+    excluded: list[str],
+    enumerated: set[str],
+) -> list[SelectOptionDict]:
+    """
+    Label the Always-included tools options with the tool a short name matches.
+
+    An inclusion saved as ``HassTurnOff`` before Home Assistant 2026.9 still
+    adds a tool: ``_tool_lookup_targets`` tries the stored name, then every
+    live tool of that API whose ``base_tool_name`` is the stored name, in name
+    order. The picker knew only exact names, so it showed the stored name as
+    "(not currently available)" beside a plain ``intent__HassTurnOff`` that a
+    turn was in fact adding (#950).
+
+    Unlike a short exclusion, which covers every such tool, a short inclusion
+    adds one. So one tool is named, the first in name order, on the stored
+    entry and on the tool itself unless that tool is ticked. A tool an API
+    listed just now (``enumerated``) is preferred over one known only from the
+    tool index, which may be gone or belong to a device turn. An exclusion
+    beats an inclusion: an excluded tool is passed over, as it is on a turn,
+    and so a stored name that is itself excluded matches nothing.
+
+    The notes say "matches", not "includes". A turn normally adds the named
+    tool, but not always: the lookup skips a tool with no index row and falls
+    back to API order when the index cannot be read, a tool only a device or
+    an admin turn has may sort first there, another API's same-named tool can
+    shadow it, and only ``TOOL_INCLUSIONS_MAX_PER_TURN`` entries are honoured.
+    Exclusions are read as stored when the form opens.
+
+    Labels only, for the reason ``_exclusion_choices`` gives.
+    """
+    chosen = set(selected)
+    excluded_by_api: dict[str, set[str]] = {}
+    for value in excluded:
+        parts = split_tool_index_key(value)
+        if parts:
+            excluded_by_api.setdefault(parts[0], set()).add(parts[1])
+
+    # stored composite value -> the listed tool it matches (value, tool name).
+    # Sorted with the enumerated tools first, then by name: the first hit wins.
+    matched: dict[str, tuple[str, str]] = {}
+    live_values = {choice["value"] for choice in live_choices}
+    enumerated_apis = {
+        parts[0] for value in enumerated if (parts := split_tool_index_key(value))
+    }
+    for choice in sorted(
+        live_choices, key=lambda c: (c["value"] not in enumerated, c["value"])
+    ):
+        value = choice["value"]
+        parts = split_tool_index_key(value)
+        if parts is None:
+            continue
+        api_id, tool_name = parts
+        short_name = base_tool_name(tool_name)
+        short_key = tool_index_key(api_id, short_name)
+        if (
+            not short_name
+            or short_name == tool_name
+            or short_key not in chosen
+            or short_key in matched
+            # A stored name an API lists is tried first on a turn and is that
+            # tool. One known only from the index may be a leftover row, but
+            # only where the API was listed: for an API the form could not
+            # list (unreachable, admin-only) every row is index-only, and a
+            # listed name is taken for the tool it names.
+            or short_key in enumerated
+            or (short_key in live_values and api_id not in enumerated_apis)
+            # Also true when the stored short name is itself excluded.
+            or is_tool_excluded(tool_name, excluded_by_api.get(api_id, ()))
+        ):
+            continue
+        matched[short_key] = (value, tool_name)
+
+    matched_by = {
+        value: split_tool_index_key(key) for key, (value, _name) in matched.items()
+    }
+
+    labelled: list[SelectOptionDict] = []
+    for choice in live_choices:
+        value = choice["value"]
+        note = ""
+        if (hit := matched.get(value)) is not None:
+            # A stored short name the index still lists.
+            note = _NOTE_MATCHES.format(name=_label_text(hit[1]))
+        elif (stored := matched_by.get(value)) is not None and value not in chosen:
+            note = _NOTE_MATCHED_BY.format(name=_label_text(stored[1]))
+        labelled.append(SelectOptionDict(label=choice["label"] + note, value=value))
+
+    for choice in stale_choices:
+        label = choice["label"]
+        hit = matched.get(choice["value"])
+        if hit is not None and label.endswith(_SUFFIX_NOT_AVAILABLE):
+            label = label.removesuffix(_SUFFIX_NOT_AVAILABLE) + _SUFFIX_MATCHES.format(
+                name=_label_text(hit[1])
+            )
+        labelled.append(SelectOptionDict(label=label, value=choice["value"]))
+    return labelled
+
+
 def _add_tool_picker(
     schema: VolDictType,
     conf_key: str,
@@ -499,37 +685,54 @@ def _add_tool_picker(
     )
 
 
+def _llm_api_selection_error(hass: HomeAssistant, raw: Any) -> str | None:
+    """
+    Return the error for an LLM API selection that leaves turns with none.
+
+    An empty selection fails every conversation with "No LLM APIs could be
+    loaded" (issue #949). One holding only admin-only APIs, such as HA
+    2026.11's "homeassistant" API, fails the same way for a voice satellite
+    and for every user who is not an admin (#918). A stored id that is no
+    longer registered is not counted against the selection: that is often a
+    transient MCP outage, kept on purpose (#568).
+    """
+    selected = normalize_llm_api_value(raw)
+    if not selected:
+        return "llm_api_required"
+    if admin_only_selection(hass, selected):
+        return "llm_api_admin_only"
+    return None
+
+
 async def _schema_for_options(
     hass: HomeAssistant,
     opts: Mapping[str, Any],
     indexed_keys: set[str] | None = None,
+    tool_api_ids: list[str] | None = None,
 ) -> VolDictType:
-    """Generate the options schema for non-provider settings."""
+    """
+    Generate the options schema for non-provider settings.
+
+    The tool pickers list the tools of ``tool_api_ids`` when given, else of
+    the selected APIs: a refused selection that loads nothing would leave them
+    with no choices, so its re-render passes the stored selection instead.
+    """
     # `api.name` is `entry.title` for an MCP API, which HA sets from the
     # server's own `serverInfo.name` -- remote text, in a label, in the same
     # form whose tool picker sanitizes the identical value.
     registered_apis = llm.async_get_apis(hass)
+    # An admin-only API (HA 2026.11's "Home Assistant") says so in its label:
+    # it loads only for a turn whose user is an admin (#918).
     hass_apis = [
-        SelectOptionDict(label=sanitize_tool_text(api.name), value=api.id)
+        SelectOptionDict(
+            label=sanitize_tool_text(api.name)
+            + (" (admin users only)" if llm_api_requires_admin(api) else ""),
+            value=api.id,
+        )
         for api in registered_apis
-        if llm_api_is_supported(api)
     ]
     valid_api_ids = {api["value"] for api in hass_apis}
-    unsupported_api_ids = {
-        api.id for api in registered_apis if not llm_api_is_supported(api)
-    }
     selected_apis = normalize_llm_api_value(opts.get(CONF_LLM_HASS_API, []))
-    # An admin-only API selected before this release stays selected, labeled,
-    # for the same reason a stale one does below: the form must stay saveable
-    # and deselecting it is the user's call. It is not loaded for a turn.
-    if unsupported := [
-        api_id for api_id in selected_apis if api_id in unsupported_api_ids
-    ]:
-        hass_apis.extend(
-            SelectOptionDict(label=f"{api_id} (not supported yet)", value=api_id)
-            for api_id in unsupported
-        )
-        valid_api_ids.update(unsupported)
     # Stored ids that are no longer registered (e.g. a removed MCP server)
     # stay selected but are re-added as labeled selector options: without
     # them the pre-filled value fails SelectSelector validation on submit,
@@ -548,19 +751,32 @@ async def _schema_for_options(
             for api_id in stale
         )
 
-    live_choices, live_seen, api_names = await _live_tool_choices(
+    picker_apis = (
+        selected_apis if tool_api_ids is None else normalize_llm_api_value(tool_api_ids)
+    )
+    live_choices, live_seen, api_names, enumerated = await _live_tool_choices(
         hass,
-        [api_id for api_id in selected_apis if api_id not in unsupported_api_ids],
+        picker_apis,
         indexed_keys,
     )
-    selected_api_set = set(selected_apis)
+    selected_api_set = set(picker_apis)
     selected_exclusions = _tool_map_as_list(opts.get(CONF_TOOL_EXCLUSIONS))
-    tool_exclusion_choices = live_choices + _stale_selection_choices(
-        selected_exclusions, live_seen, api_names, selected_api_set
+    tool_exclusion_choices = _exclusion_choices(
+        live_choices,
+        _stale_selection_choices(
+            selected_exclusions, live_seen, api_names, selected_api_set
+        ),
+        selected_exclusions,
     )
     selected_inclusions = _tool_map_as_list(opts.get(CONF_TOOL_INCLUSIONS))
-    tool_inclusion_choices = live_choices + _stale_selection_choices(
-        selected_inclusions, live_seen, api_names, selected_api_set
+    tool_inclusion_choices = _inclusion_choices(
+        live_choices,
+        _stale_selection_choices(
+            selected_inclusions, live_seen, api_names, selected_api_set
+        ),
+        selected_inclusions,
+        selected_exclusions,
+        enumerated,
     )
 
     video_analyzer_mode_opts: list[SelectOptionDict] = [
@@ -929,6 +1145,12 @@ class HomeGenerativeAgentOptionsFlow(OptionsFlowWithReload):
 
     def _base_options(self) -> dict[str, Any]:
         options = dict(DEFAULT_OPTIONS)
+        # Runtime lays entry.options over entry.data, so an LLM API selection
+        # kept in data is the one that runs; start from it, or the form shows
+        # the Assist default and saves it over that selection (issue #998).
+        # Only this key: other data keys are not options.
+        if CONF_LLM_HASS_API in self.config_entry.data:
+            options[CONF_LLM_HASS_API] = self.config_entry.data[CONF_LLM_HASS_API]
         options.update(self.config_entry.options)
         return options
 
@@ -939,7 +1161,7 @@ class HomeGenerativeAgentOptionsFlow(OptionsFlowWithReload):
         These carry the device-gated tools an options form can never enumerate
         for itself (timer intents and friends, exposed only when the requesting
         device supports them), so the picker unions them in — see the
-        device-gated block in ``_tool_exclusion_choices``.
+        device-gated block in ``_live_tool_choices``.
 
         Best effort by design: the entry may not be loaded when the form opens,
         in which case there is no ``runtime_data`` and the picker simply falls
@@ -1105,8 +1327,11 @@ class HomeGenerativeAgentOptionsFlow(OptionsFlowWithReload):
         form silently accepts a selection it will never honour. Checked on the
         submitted lists only: the merge-back of unrepresentable api ids cannot
         create an overlap, because those ids are never offered in either
-        picker, and a stored contradiction can only exist if this check let it
-        through in the first place.
+        picker. Exact names only: a short stored exclusion (``HassTurnOff``)
+        beside an always-included ``intent__HassTurnOff`` passes, as it always
+        has, and the exclusion wins at run time. The Excluded tools picker
+        says so in its labels (``_exclusion_choices``) rather than the form
+        refusing every save when it held the pair before.
         """
         excluded = user_input.get(CONF_TOOL_EXCLUSIONS)
         included = user_input.get(CONF_TOOL_INCLUSIONS)
@@ -1165,6 +1390,7 @@ class HomeGenerativeAgentOptionsFlow(OptionsFlowWithReload):
         if not user_input.get(CONF_SPEAKER_SENSORS):
             options.pop(CONF_SPEAKER_SENSORS, None)
         errors: dict[str, str] = {}
+        api_err = _llm_api_selection_error(self.hass, options.get(CONF_LLM_HASS_API))
 
         # Field-specific edits with validation/normalization
         # The PIN goes first: once it passes, it is kept for the next save
@@ -1183,21 +1409,30 @@ class HomeGenerativeAgentOptionsFlow(OptionsFlowWithReload):
             err = await self._maybe_edit_face_recognition_url(options, user_input)
         if not err:
             err = self._tool_picker_overlap_error(user_input)
-        if not err and not normalize_llm_api_value(options.get(CONF_LLM_HASS_API)):
-            # The agent cannot answer with no LLM API ("No LLM APIs could be
-            # loaded"), and storing nothing used to quietly mean Assist; say
-            # so instead of saving either (issue #949).
-            err = "llm_api_required"
+        if not err:
+            # The agent cannot answer with no LLM API it loads ("No LLM APIs
+            # could be loaded"), and storing nothing used to quietly mean
+            # Assist; say so instead of saving either (issue #949).
+            err = api_err
         if err:
             errors["base"] = err
 
         if errors:
-            # Re-render with the same options and show errors
+            # Re-render with the same options and show errors. A selection
+            # that loads nothing lists no tools, so the pickers keep the
+            # stored selection's tools until a save changes it.
             return self.async_show_form(
                 step_id="init",
                 data_schema=vol.Schema(
                     await _schema_for_options(
-                        self.hass, options, self._indexed_tool_keys()
+                        self.hass,
+                        options,
+                        self._indexed_tool_keys(),
+                        tool_api_ids=(
+                            active_llm_api_ids(self._base_options())
+                            if api_err
+                            else None
+                        ),
                     )
                 ),
                 errors=errors,

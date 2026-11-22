@@ -8,6 +8,7 @@ homeassistant.components.conversation import chain before importing conversation
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import dataclasses
@@ -16,22 +17,26 @@ import inspect
 import logging
 import re
 import sys
+import textwrap
 import types
 from datetime import timedelta
 from enum import IntFlag
+from time import monotonic
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
 from homeassistant.const import CONF_LLM_HASS_API
-from homeassistant.exceptions import HomeAssistantError, TemplateError
+from homeassistant.exceptions import HomeAssistantError, TemplateError, Unauthorized
 from homeassistant.helpers import llm as ha_llm
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from langchain_core.runnables import RunnableConfig
 
 from custom_components.home_generative_agent.const import (
@@ -44,6 +49,10 @@ from custom_components.home_generative_agent.const import (
     NO_REPLY_APOLOGY,
     SPEAKER_NAME_MAX_CHARS,
     TOOL_SUBSET_PROMPT,
+)
+from custom_components.home_generative_agent.core.fallback import (
+    EmbeddingsCircuitOpenError,
+    EmbeddingsTimedOutError,
 )
 from custom_components.home_generative_agent.core.utils import (
     gather_store_puts_in_chunks,
@@ -174,6 +183,13 @@ _ensure_trace_symbols()
 from homeassistant.components import conversation as ha_conversation  # noqa: E402
 from homeassistant.util import dt as dt_util  # noqa: E402
 
+from custom_components.home_generative_agent import (  # noqa: E402
+    conversation as conv_module,
+)
+from custom_components.home_generative_agent.agent.graph import (  # noqa: E402
+    State,
+    _always_bound_local_tools,
+)
 from custom_components.home_generative_agent.agent.helpers import (  # noqa: E402
     ENDED_PROMPT_REOPEN_WINDOW,
     PENDING_ACTION_TTL,
@@ -205,6 +221,7 @@ from custom_components.home_generative_agent.conversation import (  # noqa: E402
     _recommit_final_assistant_content,
     _run_tool_index_background,
     _streaming_failure_content,
+    _turn_input,
 )
 
 # ---------------------------------------------------------------------------
@@ -427,20 +444,51 @@ def _plain_api(api_id: str) -> Any:
     return types.SimpleNamespace(id=api_id, name=api_id)
 
 
+def _refusing_all_but(instance: Any, *loadable: str) -> AsyncMock:
+    """Load the named APIs; refuse any other the way HA refuses a non-admin."""
+
+    async def _get_api(_hass: Any, api_id: str, _context: Any) -> Any:
+        if api_id in loadable:
+            return instance
+        raise Unauthorized
+
+    return AsyncMock(side_effect=_get_api)
+
+
 @pytest.mark.asyncio
-async def test_init_llm_apis_never_loads_an_admin_only_api(
+async def test_init_llm_apis_loads_an_admin_only_api_when_ha_allows_it() -> None:
+    """Home Assistant decides who is an admin; an admin's turn gets the API (#918)."""
+    entity = _excl_entity({CONF_LLM_HASS_API: ["assist", "homeassistant"]})
+    instance = _excl_api_instance(["HassTurnOn"])
+    context = MagicMock()
+    get_api = AsyncMock(return_value=instance)
+
+    with (
+        patch(
+            f"{_CONV}.llm.async_get_apis",
+            return_value=[_plain_api("assist"), _admin_api("homeassistant")],
+        ),
+        patch(f"{_CONV}.llm.async_get_api", new=get_api),
+    ):
+        multi = await entity._async_init_llm_apis(context)
+
+    assert list(multi.apis) == ["assist", "homeassistant"]
+    # Asked with the turn's own context, which carries the user HA checks.
+    assert all(call.args[2] is context for call in get_api.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_init_llm_apis_leaves_out_an_admin_only_api_ha_refuses(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
-    An admin-only API stored before the options form hid it is not loaded.
+    A turn with no admin user goes on with the other APIs, quietly.
 
-    Its tools manage Home Assistant itself and have not been checked against
-    the Critical Action PIN gate, so it is skipped for every user, admin or
-    not, with a warning that says how to clear it.
+    A voice satellite's turn has no user at all, so a warning here would be
+    logged on every one of them.
     """
     entity = _excl_entity({CONF_LLM_HASS_API: ["assist", "homeassistant"]})
-    instance = _excl_api_instance(["HassTurnOn"])
-    get_api = AsyncMock(return_value=instance)
+    get_api = _refusing_all_but(_excl_api_instance(["HassTurnOn"]), "assist")
 
     with (
         patch(
@@ -453,44 +501,65 @@ async def test_init_llm_apis_never_loads_an_admin_only_api(
         multi = await entity._async_init_llm_apis(MagicMock())
 
     assert list(multi.apis) == ["assist"]
-    assert [call.args[1] for call in get_api.await_args_list] == ["assist"]
-    assert "Not loading LLM API homeassistant" in caplog.text
+    assert "homeassistant" not in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_init_llm_apis_only_an_admin_only_api_fails_loudly() -> None:
-    """With nothing else configured the turn fails, naming the skipped API."""
+async def test_init_llm_apis_only_an_admin_only_api_fails_naming_it() -> None:
+    """With nothing else configured a non-admin's turn fails, and says why."""
     entity = _excl_entity({CONF_LLM_HASS_API: ["homeassistant"]})
 
     with (
         patch(
             f"{_CONV}.llm.async_get_apis", return_value=[_admin_api("homeassistant")]
         ),
-        patch(f"{_CONV}.llm.async_get_api", new=AsyncMock()) as get_api,
-        pytest.raises(HomeAssistantError, match="Failed: homeassistant"),
+        patch(f"{_CONV}.llm.async_get_api", new=_refusing_all_but(None)),
+        pytest.raises(HomeAssistantError, match="For admin users only: homeassistant"),
     ):
         await entity._async_init_llm_apis(MagicMock())
 
-    get_api.assert_not_awaited()
+
+@pytest.mark.asyncio
+async def test_init_llm_apis_another_api_refusing_is_a_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Only an admin-only API's refusal is expected; any other is reported."""
+    entity = _excl_entity({CONF_LLM_HASS_API: ["assist", "mcp-abc"]})
+    get_api = _refusing_all_but(_excl_api_instance(["HassTurnOn"]), "assist")
+
+    with (
+        patch(
+            f"{_CONV}.llm.async_get_apis",
+            return_value=[_plain_api("assist"), _plain_api("mcp-abc")],
+        ),
+        patch(f"{_CONV}.llm.async_get_api", new=get_api),
+        caplog.at_level(logging.WARNING),
+    ):
+        multi = await entity._async_init_llm_apis(MagicMock())
+
+    assert list(multi.apis) == ["assist"]
+    assert "Could not load LLM API: mcp-abc" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_index_tools_skips_an_admin_only_api() -> None:
+async def test_index_tools_leaves_an_admin_only_api_to_the_turn_that_loads_it() -> None:
     """
-    Background indexing never asks for an admin-only API.
+    The full pass never asks for an admin-only API, and drops its old rows.
 
-    It runs with no user, so Home Assistant 2026.11 refuses it with
-    Unauthorized, which logged "Failed to index tool provider homeassistant"
-    on every startup; and a turn never loads it, so it has nothing to index.
+    It may run with no user, and Home Assistant then refuses the API. Its
+    tools are indexed by the top-up of an admin's turn; counting it as
+    discovered here evicts its rows, so a tool it no longer has does not stay
+    in the index (#918).
     """
     entity = _index_entity()
     rd = _index_runtime_data(tool_index_ready=False, tool_content_hashes={})
     discover = AsyncMock()
+    evict = AsyncMock()
 
     with (
         patch.object(entity, "_async_discover_provider_tools", new=discover),
         patch.object(entity, "_async_discover_local_tools", new=AsyncMock()),
-        patch.object(entity, "_async_evict_stale_tool_index_rows", new=AsyncMock()),
+        patch.object(entity, "_async_evict_stale_tool_index_rows", new=evict),
         patch(
             f"{_CONV}.llm.async_get_apis",
             return_value=[_plain_api("assist"), _admin_api("homeassistant")],
@@ -501,6 +570,79 @@ async def test_index_tools_skips_an_admin_only_api() -> None:
 
     assert discover.await_args is not None
     assert discover.await_args.args[2] == ["assist"]
+    assert evict.await_args is not None
+    assert "homeassistant" in evict.await_args.args[2]
+
+
+@pytest.mark.asyncio
+async def test_index_tools_full_pass_on_an_admins_turn_indexes_its_tools() -> None:
+    """
+    A full pass run by a turn that loaded the admin-only API indexes it.
+
+    Its rows are then kept by the pass's eviction, and the next turn needs
+    no top-up (#918 review).
+    """
+    entity = _index_entity()
+    rd = _index_runtime_data(tool_index_ready=False, tool_content_hashes={})
+    admin_instance = MagicMock()
+    assist_instance = MagicMock()
+    llm_api = MagicMock()
+    llm_api.apis = {"assist": assist_instance, "homeassistant": admin_instance}
+    queue = MagicMock()
+    evict = AsyncMock()
+
+    with (
+        patch.object(entity, "_async_discover_provider_tools", new=AsyncMock()),
+        patch.object(entity, "_async_discover_local_tools", new=AsyncMock()),
+        patch.object(entity, "_async_evict_stale_tool_index_rows", new=evict),
+        patch.object(entity, "_queue_api_instance_tools", new=queue),
+        patch(
+            f"{_CONV}.llm.async_get_apis",
+            return_value=[_plain_api("assist"), _admin_api("homeassistant")],
+        ),
+        patch(f"{_CONV}.async_dispatcher_send"),
+    ):
+        await entity._async_index_tools(MagicMock(), rd, llm_api)
+
+    assert [call.args[:2] for call in queue.call_args_list] == [
+        ("homeassistant", admin_instance)
+    ]
+    # Handed the pass's seen keys, which is what keeps its rows from eviction.
+    assert evict.await_args is not None
+    assert queue.call_args.args[5] is evict.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_index_tools_full_pass_keeps_admin_rows_when_reading_them_fails() -> None:
+    """
+    An admin API whose tools could not all be read keeps its rows.
+
+    The pass did not see every tool, so evicting the API's unseen rows would
+    drop live ones (#918 review).
+    """
+    entity = _index_entity()
+    rd = _index_runtime_data(tool_index_ready=False, tool_content_hashes={})
+    llm_api = MagicMock()
+    llm_api.apis = {"homeassistant": MagicMock()}
+    evict = AsyncMock()
+
+    with (
+        patch.object(entity, "_async_discover_provider_tools", new=AsyncMock()),
+        patch.object(entity, "_async_discover_local_tools", new=AsyncMock()),
+        patch.object(entity, "_async_evict_stale_tool_index_rows", new=evict),
+        patch.object(
+            entity, "_queue_api_instance_tools", new=MagicMock(side_effect=ValueError)
+        ),
+        patch(
+            f"{_CONV}.llm.async_get_apis",
+            return_value=[_plain_api("assist"), _admin_api("homeassistant")],
+        ),
+        patch(f"{_CONV}.async_dispatcher_send"),
+    ):
+        await entity._async_index_tools(MagicMock(), rd, llm_api)
+
+    assert evict.await_args is not None
+    assert "homeassistant" not in evict.await_args.args[2]
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +703,55 @@ async def test_run_tool_index_background_failure_sets_flag() -> None:
     assert rd.tool_index_failed is True
     assert rd.tool_index_ready is False
     assert rd.tool_indexing_in_progress is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("circuit_open", [False, True])
+async def test_run_tool_index_background_timeout_is_retried_not_failed(
+    *, circuit_open: bool
+) -> None:
+    """
+    A slow model load or a frozen server leaves the index to build again (#969).
+
+    So does a breaker between tries: one chunk's call is refused while
+    another tries the member that just came back.
+    """
+    rd = MagicMock()
+    rd.tool_index_ready = False
+    rd.tool_indexing_in_progress = True
+    rd.tool_index_failed = False
+    rd.tool_index_rearmed = False
+    rd.tool_content_hashes = {}
+    hass = MagicMock()
+
+    with (
+        patch(
+            "custom_components.home_generative_agent.conversation.gather_store_puts_in_chunks",
+            new=AsyncMock(
+                side_effect=(
+                    EmbeddingsCircuitOpenError("refused")
+                    if circuit_open
+                    else EmbeddingsTimedOutError("timed out")
+                )
+            ),
+        ),
+        patch(
+            "custom_components.home_generative_agent.conversation.async_dispatcher_send"
+        ) as send,
+    ):
+        await _run_tool_index_background(
+            index_tasks=[AsyncMock()],
+            tool_hashes={"key": "hash"},
+            rd=rd,
+            hass=hass,
+        )
+
+    assert rd.tool_index_failed is False
+    assert rd.tool_index_ready is False
+    assert rd.tool_indexing_in_progress is False
+    assert rd.tool_content_hashes == {}
+    assert send.call_args.args[2] == "stale"
+    assert rd.tool_index_retry_after > monotonic(), "no new pass right away"
 
 
 @pytest.mark.asyncio
@@ -1009,6 +1200,7 @@ def _index_runtime_data(**overrides: Any) -> Any:
         embedding_fingerprint=None,
         tool_indexing_in_progress=False,
         tool_index_failed=False,
+        tool_index_retry_after=0.0,
         tool_content_hashes={},
         tool_index_houses={},
         store=MagicMock(),
@@ -1204,6 +1396,66 @@ async def test_index_tools_failed_short_circuits_delta() -> None:
         )
 
     provider_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_index_tools_waits_out_a_timed_out_pass() -> None:
+    """No new pass, discovery included, until the retry time (#969)."""
+    entity = _index_entity()
+    rd = _index_runtime_data(tool_index_ready=False, tool_content_hashes={})
+    rd.tool_index_retry_after = monotonic() + 60
+
+    with patch.object(
+        entity, "_async_discover_provider_tools", new=AsyncMock()
+    ) as provider_mock:
+        await entity._async_index_tools(MagicMock(), rd, _loaded_llm_api("HassTurnOn"))
+
+    provider_mock.assert_not_called()
+    entity.hass.async_create_background_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_index_tools_retry_time_does_not_hold_back_a_ready_top_up() -> None:
+    """A ready index still writes a missing tool inline (#969)."""
+    entity = _index_entity()
+    rd = _index_runtime_data(tool_content_hashes={})
+    rd.tool_index_retry_after = monotonic() + 60
+
+    with (
+        patch(f"{_CONV}.async_dispatcher_send"),
+        patch(f"{_CONV}.gather_store_puts_in_chunks", new=AsyncMock()) as gather_mock,
+    ):
+        await entity._async_index_tools(
+            MagicMock(), rd, _loaded_llm_api("HassStartTimer")
+        )
+
+    gather_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "traceback"),
+    [(EmbeddingsTimedOutError("timed out"), False), (RuntimeError("boom"), True)],
+)
+async def test_a_top_up_an_unavailable_chain_refused_logs_no_traceback(
+    caplog: pytest.LogCaptureFixture, error: Exception, *, traceback: bool
+) -> None:
+    """The chain logged why; other write failures keep their traceback (#969)."""
+    entity = _index_entity()
+    rd = _index_runtime_data(tool_content_hashes={})
+
+    with (
+        patch(f"{_CONV}.async_dispatcher_send") as send,
+        patch(f"{_CONV}.gather_store_puts_in_chunks", new=AsyncMock(side_effect=error)),
+        caplog.at_level(logging.DEBUG),
+    ):
+        await entity._async_index_tools(
+            MagicMock(), rd, _loaded_llm_api("HassStartTimer")
+        )
+
+    assert any(r.exc_info for r in caplog.records) is traceback
+    assert send.call_args.args[2] == "ready"
+    assert "assist::HassStartTimer" not in rd.tool_content_hashes
 
 
 @pytest.mark.asyncio
@@ -3014,6 +3266,72 @@ async def test_a_turn_that_ends_on_a_refused_confirmation_gets_no_failure_text()
     assert len(chat_log.content) == 3
 
 
+async def test_streamed_text_the_graph_dropped_is_not_kept_before_the_pin_line() -> (
+    None
+):
+    """
+    A reply streamed after the tool round, which the graph did not keep (#1013).
+
+    A reasoning-only reply whose stray text streamed before a bare `</think>`
+    is empty once cleaned, and with a PIN line to follow the graph ends the
+    turn on the tool round. The streamed text must not stay as the reply, or
+    the PIN line goes in front of it: "...unlock... Unlocked. What is your PIN?".
+    """
+    from langchain_core.messages import ToolMessage  # noqa: PLC0415
+
+    chat_log = _refusal_turn_chat_log()
+    chat_log.content.append(
+        _mk_content(
+            ha_conversation.AssistantContent,
+            agent_id=HGA_AGENT_ID,
+            content="Unlocked.",
+            tool_calls=None,
+        )
+    )
+    held = ToolMessage(
+        content='{"status": "requires_pin", "action_id": "a1"}',
+        name="HassTurnOff",
+        tool_call_id="c1",
+    )
+
+    await _run_astream(chat_log, _ended_app(held), lambda: True)
+
+    assert len(chat_log.content) == 3
+    assert all(getattr(c, "content", None) != "Unlocked." for c in chat_log.content)
+    assert chat_log.heard == []
+
+
+@pytest.mark.parametrize("failed", [False, True], ids=["no_pin_line", "stream_failed"])
+async def test_streamed_text_is_kept_unless_a_pin_line_follows_a_clean_stream(
+    *, failed: bool
+) -> None:
+    """A partial answer streamed before a failure, or with no PIN line, stays."""
+    from langchain_core.messages import ToolMessage  # noqa: PLC0415
+
+    chat_log = _refusal_turn_chat_log()
+    partial = _mk_content(
+        ha_conversation.AssistantContent,
+        agent_id=HGA_AGENT_ID,
+        content="The kitchen light is",
+        tool_calls=None,
+    )
+    chat_log.content.append(partial)
+    result = ToolMessage(content="{}", name="GetLiveContext", tool_call_id="c1")
+    app = _ended_app(result)
+    if failed:
+
+        async def _boom(**_kwargs: Any) -> Any:
+            msg = "Model invocation failed: 503"
+            raise HomeAssistantError(msg)
+            yield  # pragma: no cover - makes this an async generator
+
+        app.astream_events = _boom
+
+    await _run_astream(chat_log, app, (lambda: True) if failed else None)
+
+    assert partial in chat_log.content
+
+
 async def test_a_turn_that_ends_on_a_tool_call_without_a_pin_line_still_fails_aloud() -> (
     None
 ):
@@ -3412,6 +3730,223 @@ def test_an_in_progress_refusal_names_the_request_being_handled() -> None:
     assert line is not None
     assert "Front Door" in line
     assert line.endswith(".")
+
+
+def test_another_voices_prompt_being_answered_is_named_in_progress() -> None:
+    """
+    A third voice's PIN reply for the waiting prompt is already running (#1004).
+
+    No PIN can be followed to it now, so "is waiting for a PIN" would be
+    wrong: the line says its reply is being handled.
+    """
+    from custom_components.home_generative_agent.agent.helpers import (  # noqa: PLC0415
+        PIN_REFUSED_OTHER_VOICE,
+        PinReply,
+    )
+    from custom_components.home_generative_agent.agent.pin_messages import (  # noqa: PLC0415
+        describe_pending_action,
+        pin_msg,
+    )
+
+    reply = PinReply("unlock the back door")
+    reply.refusal = PIN_REFUSED_OTHER_VOICE
+    reply.waiting_action_id = "anna"
+    reply.waiting_conversation = "conv1"
+    being_answered = _voice_prompt("Front Door")
+    being_answered["reply_turn"] = "clara's turn"
+    entity = _pin_entity()
+
+    line = entity._refusal_line({"anna": being_answered}, reply)
+
+    assert line == pin_msg(
+        None,
+        "pin_in_progress_line",
+        action=describe_pending_action(entity.hass, being_answered),
+    )
+    # Still waiting: named as waiting for a PIN, as before.
+    waiting = _voice_prompt("Front Door")
+    assert "is waiting for a PIN" in str(entity._refusal_line({"anna": waiting}, reply))
+
+
+def _schema_first_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    pending: dict[str, Any],
+    thread_id: str,
+    run: Any,
+) -> tuple[Any, Any]:
+    """
+    Build an entity whose schema-first turn runs the real handler.
+
+    Everything the handler calls out to is stubbed except the PIN wiring:
+    start_pin_turn, keep_pin_prompts, _refusal_line and end_pin_turn run as
+    they do on a satellite. `run` stands in for the graph (`_async_run_ainvoke`).
+    """
+    from custom_components.home_generative_agent import (  # noqa: PLC0415
+        conversation as conv_module,
+    )
+    from custom_components.home_generative_agent.const import (  # noqa: PLC0415
+        CONF_SCHEMA_FIRST_YAML,
+    )
+
+    @contextlib.asynccontextmanager
+    async def _no_session(*_args: Any, **_kwargs: Any) -> AsyncIterator[None]:
+        yield
+
+    monkeypatch.setattr(conv_module, "local_chat_session", _no_session)
+    monkeypatch.setattr(conv_module.workflow, "compile", MagicMock())
+    # Whichever stub of the HA conversation module the suite loaded first
+    # (test_conversation_stream.py's has neither) gets what the handler reads.
+    monkeypatch.setattr(
+        conv_module.conversation,
+        "ConversationResult",
+        types.SimpleNamespace,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        conv_module.conversation, "DOMAIN", "conversation", raising=False
+    )
+
+    entity = _pin_entity()
+    entity.hass.auth = types.SimpleNamespace(
+        async_get_user=AsyncMock(return_value=None)
+    )
+    entity.entry = types.SimpleNamespace(
+        subentries={},
+        runtime_data=types.SimpleNamespace(
+            options={CONF_SCHEMA_FIRST_YAML: True},
+            pending_actions=pending,
+            ended_pin_prompts={},
+            model_deployments={},
+            chat_model=types.SimpleNamespace(bind_tools=MagicMock()),
+            chat_model_options={},
+            vision_model=None,
+            summarization_model=None,
+            store=None,
+            checkpointer=None,
+            tool_index_ready=True,
+            tool_indexing_in_progress=False,
+            tool_index_failed=False,
+        ),
+    )
+    entity._async_get_message_history = MagicMock(return_value=[])
+    entity._async_speaker = AsyncMock(return_value=None)
+    entity._async_turn_thread = AsyncMock(return_value=(thread_id, None))
+    entity._async_init_llm_apis = AsyncMock(return_value=types.SimpleNamespace(apis=[]))
+    entity._async_index_tools = AsyncMock()
+    entity._async_get_all_tools = MagicMock(return_value=([], []))
+    entity._async_render_system_prompt = MagicMock(return_value=("prompt", ""))
+    entity._async_run_ainvoke = AsyncMock(side_effect=run)
+    chat_log = types.SimpleNamespace(conversation_id="conv1", content=[])
+    return entity, chat_log
+
+
+def _user_input(text: str) -> Any:
+    return types.SimpleNamespace(
+        text=text,
+        language="en",
+        context=None,
+        device_id=None,
+        agent_id=None,
+        satellite_id=None,
+    )
+
+
+async def test_a_schema_first_error_reply_names_the_waiting_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The error is the whole schema-first reply, so it says why (#1001, #1004).
+
+    Boris asks to unlock the garage while Anna's unlock waits for her PIN;
+    the run then fails. Run through the handler, not read from its source.
+    """
+    from custom_components.home_generative_agent.agent.helpers import (  # noqa: PLC0415
+        PIN_REFUSED_OTHER_VOICE,
+        register_pending_action,
+    )
+
+    pending: dict[str, Any] = {"anna": _voice_prompt("Front Door")}
+
+    async def _run(_app: Any, _input: Any, config: Any, *_args: Any) -> None:
+        reply = config["configurable"]["pin_reply"]
+        held = register_pending_action(
+            pending,
+            {
+                "tool_name": "HassTurnOff",
+                "tool_args": {"domain": ["lock"], "name": "Garage Door"},
+                "user": "robot",
+                "thread_id": "conv1:boris",
+                "voice_conversation": "conv1",
+                "voice_thread": "conv1:boris",
+                "turn_id": reply.turn_id,
+            },
+            pin_reply=reply,
+        )
+        assert held is None
+        assert reply.refusal == PIN_REFUSED_OTHER_VOICE
+        msg = "The model backend failed."
+        raise HomeAssistantError(msg)
+
+    entity, chat_log = _schema_first_turn(monkeypatch, pending, "conv1:boris", _run)
+
+    result = await HGAConversationEntity._async_handle_message(
+        entity, _user_input("unlock the garage door"), chat_log
+    )
+
+    speech = result.response.speech["plain"]["speech"]
+    assert speech.startswith("A request to unlock")
+    assert "Front Door" in speech
+    assert "is waiting for a PIN" in speech
+    assert speech.endswith("The model backend failed.")
+    assert "anna" in pending
+
+
+async def test_a_failed_turn_hands_its_prompt_to_the_next_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The turn ends with the id it started with, however it fails (#1001).
+
+    Anna's PIN reply turn fails; her prompt is kept for her next message and
+    handed over as the turn ends. Were start_pin_turn given another id than
+    end_pin_turn, or the end skipped, the prompt would stay marked in
+    progress and block every other voice until it expired.
+    """
+    prompt = _voice_prompt("Front Door")
+    pending: dict[str, Any] = {"anna": prompt}
+    seen: list[str] = []
+
+    async def _run(_app: Any, _input: Any, config: Any, *_args: Any) -> None:
+        reply = config["configurable"]["pin_reply"]
+        seen.append(reply.turn_id)
+        assert prompt["reply_turn"] == reply.turn_id
+        msg = "The model backend failed."
+        raise HomeAssistantError(msg)
+
+    entity, chat_log = _schema_first_turn(monkeypatch, pending, "conv1:anna", _run)
+
+    await HGAConversationEntity._async_handle_message(
+        entity, _user_input("1234"), chat_log
+    )
+
+    assert seen
+    assert pending["anna"] is prompt
+    assert prompt["reply_turn"] is None
+    assert prompt["replies"] == 1
+
+    # And a turn that raises past the handler still ends.
+    async def _crash(_app: Any, _input: Any, config: Any, *_args: Any) -> None:
+        seen.append(config["configurable"]["pin_reply"].turn_id)
+        raise RuntimeError
+
+    entity._async_run_ainvoke = AsyncMock(side_effect=_crash)
+    with pytest.raises(RuntimeError):
+        await HGAConversationEntity._async_handle_message(
+            entity, _user_input("1234"), chat_log
+        )
+    assert seen[1] != seen[0]
+    # Not kept for another message: dropped as the turn ended.
+    assert "anna" not in pending
 
 
 async def test_a_refusal_with_a_prompt_of_its_own_keeps_the_question_last(
@@ -4311,12 +4846,165 @@ def test_handler_passes_the_speaker_to_thread_memory_and_prompt() -> None:
     """The resolved speaker has to reach everything it is meant to change."""
     src = inspect.getsource(HGAConversationEntity._async_handle_message_active)
     assert "conversation_id, speaker, user_input.text" in src
-    assert "self._memory_namespace(user_name, speaker)" in src
-    # The every-turn memory tool keys on this flag (#1015).
-    assert '"has_memory_user": has_memory_user,' in src
-    assert '"user_id": clean_user_name,' in src
-    assert "self._pin_owner(user_name, waiting_prompt)" in src
+    # The one _turn_identity call gets each argument from the variable of its
+    # own name: two are strings, and swapped every voice shares one thread.
+    tree = ast.parse(textwrap.dedent(src))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_turn_identity"
+    ]
+    assert len(calls) == 1
+    assert not calls[0].args
+    names = (
+        "conversation_id",
+        "speaker",
+        "thread_id",
+        "waiting_prompt",
+        "user_name",
+    )
+    assert {k.arg: ast.unparse(k.value) for k in calls[0].keywords} == {
+        name: name for name in names
+    }
     assert "self._speaker_prompt(speaker)" in src
+
+
+def test_a_guest_pin_for_another_voices_prompt_runs_as_the_guest() -> None:
+    """
+    A guest's "1234" while another voice's prompt waits (#941 review).
+
+    The turn joins the prompt's thread and is owner-checked as the prompt's
+    owner, but reads and writes the guest's own memories, never the owner's.
+    """
+    action = _waiting_action("conv:Пётр")
+    entity = _turn_entity(action)
+    guest = Speaker(name="Мария", person="person.maria", user="Maria")
+    thread_id, waiting = entity._turn_thread("conv", guest, "1234")
+
+    identity = HGAConversationEntity._turn_identity(
+        conversation_id="conv",
+        speaker=guest,
+        thread_id=thread_id,
+        waiting_prompt=waiting,
+        user_name=None,
+    )
+
+    assert identity == {
+        "thread_id": "conv:Пётр",
+        "voice_conversation": "conv",
+        "voice_thread": "conv:person.maria",
+        "user_id": "Maria",
+        "has_memory_user": True,
+        "pin_owner": "ivan",
+    }
+
+
+def test_an_unknown_voice_pin_for_another_voices_prompt_runs_as_robot() -> None:
+    """
+    The #941 case: an unrecognized voice says the PIN for another's prompt.
+
+    It is owner-checked as the prompt's owner, but its memories stay the
+    shared "robot" ones, never the owner's.
+    """
+    action = _waiting_action("conv:Пётр")
+    entity = _turn_entity(action)
+    unknown = Speaker(name=None)
+    thread_id, waiting = entity._turn_thread("conv", unknown, "1234")
+
+    identity = HGAConversationEntity._turn_identity(
+        conversation_id="conv",
+        speaker=unknown,
+        thread_id=thread_id,
+        waiting_prompt=waiting,
+        user_name=None,
+    )
+
+    assert identity == {
+        "thread_id": "conv:Пётр",
+        "voice_conversation": "conv",
+        "voice_thread": "conv:unknown",
+        "user_id": "robot",
+        "has_memory_user": False,
+        "pin_owner": "ivan",
+    }
+
+
+def test_a_logged_in_turn_keeps_its_own_identity() -> None:
+    """
+    A logged-in user is never someone else: no PIN owner, its own thread.
+
+    Given a waiting prompt as well, so pin_owner is None because the user
+    is logged in, not because nothing was waiting.
+    """
+    action = _waiting_action("conv:Пётр")
+    entity = _turn_entity(action)
+    thread_id, _waiting = entity._turn_thread("conv", None, "1234")
+
+    identity = HGAConversationEntity._turn_identity(
+        conversation_id="conv",
+        speaker=None,
+        thread_id=thread_id,
+        waiting_prompt=action,
+        user_name="Logged",
+    )
+
+    assert identity == {
+        "thread_id": "conv",
+        "voice_conversation": None,
+        "voice_thread": None,
+        "user_id": "Logged",
+        "has_memory_user": True,
+        "pin_owner": None,
+    }
+
+
+def test_the_agent_reads_the_turn_identity_it_is_given() -> None:
+    """
+    Feed _turn_identity's keys to the readers that act on them.
+
+    The PIN owner check (tools.py) reads pin_owner and user_id; the
+    every-turn memory tools (graph.py) key on has_memory_user. A key renamed
+    on either side leaves a reader on its default, and these fail.
+    """
+    action = _waiting_action("conv:Пётр")
+    entity = _turn_entity(action)
+    unknown = Speaker(name=None)
+    thread_id, waiting = entity._turn_thread("conv", unknown, "1234")
+    unknown_turn = HGAConversationEntity._turn_identity(
+        conversation_id="conv",
+        speaker=unknown,
+        thread_id=thread_id,
+        waiting_prompt=waiting,
+        user_name=None,
+    )
+    guest = Speaker(name="Мария", person="person.maria", user="Maria")
+    guest_turn = HGAConversationEntity._turn_identity(
+        conversation_id="conv",
+        speaker=guest,
+        thread_id="conv:person.maria",
+        waiting_prompt=None,
+        user_name=None,
+    )
+
+    # The followed prompt's owner may answer it; nobody else's prompt.
+    assert _is_wrong_user(unknown_turn, action) is False
+    assert _is_wrong_user(unknown_turn, {**action, "user": "Maria"}) is True
+    # Without a followed prompt, the guest is checked as herself.
+    assert _is_wrong_user(guest_turn, {**action, "user": "Maria"}) is False
+    assert _is_wrong_user(guest_turn, action) is True
+    # Only a turn with a memory user binds the memory tools every turn.
+    assert _always_bound_local_tools(
+        cast("RunnableConfig", {"configurable": unknown_turn})
+    ) == ("get_entity_history",)
+    assert _always_bound_local_tools(
+        cast("RunnableConfig", {"configurable": guest_turn})
+    ) == (
+        "get_entity_history",
+        "upsert_memory",
+        "list_memories",
+    )
 
 
 def test_recognized_voice_skips_foreign_turns() -> None:
@@ -5012,3 +5700,412 @@ def test_memory_namespace_marks_only_a_users_own_memories(
 ) -> None:
     """The every-turn memory tool keys on this flag; "robot" must never get it."""
     assert HGAConversationEntity._memory_namespace(user_name, speaker) == expected
+
+
+# --- The summary of trimmed turns survives to the next turn (#1048) ---------
+# Every turn started with "summary": "" in the graph input, and an input key
+# replaces what the conversation's checkpoint holds. So the summary written at
+# the end of one turn was wiped at the start of the next, before the agent
+# read it: the trimmed turns were forgotten.
+
+
+def test_a_turn_input_does_not_set_the_summary() -> None:
+    turn = _turn_input([HumanMessage(content="Hello", id="h1")])
+
+    assert "summary" not in turn
+    # The per-turn fields are still reset.
+    assert turn["messages_to_remove"] == []
+    assert turn["selected_tools"] == []
+    assert turn.get("turn_memories") == {}
+
+
+@pytest.mark.asyncio
+async def test_the_summary_written_in_one_turn_is_read_in_the_next() -> None:
+    seen: list[str] = []
+
+    def _agent(state: State) -> dict[str, Any]:
+        seen.append(state.get("summary", ""))
+        return {}
+
+    def _summarize(state: State) -> dict[str, Any]:
+        earlier = state.get("summary", "")
+        return {"summary": f"{earlier}\nnote {len(seen)}".strip()}
+
+    graph = StateGraph(State)
+    graph.add_node("agent", _agent)
+    graph.add_node("summarize", _summarize)
+    graph.add_edge(START, "agent")
+    graph.add_edge("agent", "summarize")
+    graph.add_edge("summarize", END)
+    app = graph.compile(checkpointer=MemorySaver())
+    config: Any = {"configurable": {"thread_id": "one conversation"}}
+
+    for number in range(3):
+        await app.ainvoke(
+            _turn_input([HumanMessage(content="Hi", id=f"h{number}")]), config
+        )
+
+    # Each turn's agent reads what the turns before it wrote.
+    assert seen == ["", "note 1", "note 1\nnote 2"]
+
+
+# ---------------------------------------------------------------------------
+# A spoken "No" to the agent's closing question needs no model call (#954)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "language", "reply"),
+    [
+        ("No", "en", "OK."),
+        ("no.", "en", "OK."),
+        (" No, thanks! ", "en", "OK."),
+        ("No. Thank you.", "en", "OK."),
+        ("No thank you", "en-GB", "OK."),
+        ("Nope", "en", "OK."),
+        ("no, that's all", "en", "OK."),
+        ("No, that’s all", "en", "OK."),  # noqa: RUF001
+        ("No I'm good", "en", "OK."),
+        ("Ne, díky", "cs", "Dobře."),
+        ("Нет, спасибо", "ru", "Хорошо."),
+        ("Hayır", "tr", "Tamam."),  # noqa: RUF001
+        ("HAYIR", "tr", "Tamam."),
+        # Something more than a decline is the model's to answer.
+        ("No, the kitchen one", "en", None),
+        ("No turn on the fan instead", "en", None),
+        ("Not the garage", "en", None),
+        ("Yes", "en", None),
+        ("November", "en", None),
+        ("", "en", None),
+        # "Ne" is "what" in Turkish and "no" only in Czech.
+        ("Ne", "tr", None),
+        ("Ne", "cs", "Dobře."),
+        # A language with no pattern, or none given.
+        ("Nein", "de", None),
+        ("No", None, None),
+    ],
+)
+def test_decline_reply(text: str, language: str | None, reply: str | None) -> None:
+    assert conv_module._decline_reply(text, language) == reply
+
+
+@pytest.mark.parametrize(
+    ("text", "language", "closing"),
+    [
+        ("Is there anything else I can help with?", "en", True),
+        ("The light is off. Anything else?  ", "en", True),
+        ("Done. Would you like me to do something else?", "en", True),
+        ("Do you need further assistance?", "en", True),
+        ("Mohu pro vás udělat ještě něco?", "cs", True),
+        ("Могу ли я помочь чем-нибудь ещё?", "ru", True),  # noqa: RUF001
+        ("Başka bir şey var mı?", "tr", True),  # noqa: RUF001
+        # A "No" to these is an instruction, or an answer a task waits for.
+        ("The garage door is open. Should I leave it open?", "en", False),
+        ("Do you want a condition on the automation?", "en", False),
+        ("Want me to turn it off?", "en", False),
+        ("Did you mean the kitchen light?", "en", False),
+        # The closing words are not in the sentence that asks.
+        ("I found nothing else. Should I keep looking?", "en", False),
+        ("Is there anything else? I can also lock up.", "en", False),
+        ("Anything else is fine.", "en", False),
+        # The other language's words, a language with none, and no reply.
+        ("Anything else?", "cs", False),
+        ("Sonst noch etwas?", "de", False),
+        (None, "en", False),
+    ],
+)
+def test_asks_if_there_is_more(
+    text: str | None, language: str, *, closing: bool
+) -> None:
+    assert conv_module._asks_if_there_is_more(text, language) is closing
+
+
+@pytest.mark.parametrize(
+    ("message", "text"),
+    [
+        (AIMessage(content="Anything else?"), "Anything else?"),
+        (
+            AIMessage(content=[{"type": "text", "text": "Anything else?"}]),
+            "Anything else?",
+        ),
+        (
+            AIMessage(
+                content="Anything else?",
+                tool_calls=[{"name": "t", "args": {}, "id": "1"}],
+            ),
+            None,
+        ),
+        (HumanMessage(content="Anything else?"), None),
+        (ToolMessage(content="Anything else?", tool_call_id="1"), None),
+    ],
+)
+def test_message_text(message: Any, text: str | None) -> None:
+    assert conv_module._message_text(message) == text
+
+
+_DECLINE_THREAD = "conv1"
+_DECLINE_AGENT = "conversation.hga"
+_CLOSER = "The porch light is on. Is there anything else I can help with?"
+
+
+def _entry(role: str, content: str, agent_id: str | None = None) -> Any:
+    return types.SimpleNamespace(role=role, content=content, agent_id=agent_id)
+
+
+def _decline_chat_log(
+    heard: str | None = _CLOSER, *, agent_id: str = _DECLINE_AGENT, text: str = "No"
+) -> Any:
+    """Return a chat log whose last reply is ``heard``, then this turn's text."""
+    content = [_entry("user", "Is the porch light on?")]
+    if heard is not None:
+        content.append(_entry("assistant", heard, agent_id))
+    content.append(_entry("user", text))
+    return types.SimpleNamespace(conversation_id=_DECLINE_THREAD, content=content)
+
+
+async def _decline_entity(
+    last_reply: str | None = _CLOSER, pending: dict[str, Any] | None = None
+) -> tuple[Any, Any, Any]:
+    """Return an entity whose thread ends with ``last_reply``, and its app."""
+    saver = MemorySaver()
+    app = conv_module.workflow.compile(checkpointer=saver)
+    config: Any = {"configurable": {"thread_id": _DECLINE_THREAD}}
+    if last_reply is not None:
+        await app.aupdate_state(
+            config,
+            {
+                "messages": [
+                    HumanMessage(content="Is the porch light on?", id="h1"),
+                    AIMessage(content=last_reply, id="a1"),
+                ]
+            },
+            as_node="summarize_and_remove_messages",
+        )
+    entity = HGAConversationEntity.__new__(HGAConversationEntity)
+    entity.hass = MagicMock()
+    entity.entity_id = _DECLINE_AGENT
+    entity.entry = cast(
+        "Any",
+        types.SimpleNamespace(
+            runtime_data=types.SimpleNamespace(
+                pending_actions=pending or {},
+                ended_pin_prompts={},
+                store=None,
+                checkpointer=saver,
+            )
+        ),
+    )
+    entity._async_add_spoken_reply = AsyncMock()
+    return entity, app, config
+
+
+@pytest.fixture
+def decline_result(monkeypatch: pytest.MonkeyPatch) -> object:
+    """Stand in for the result Home Assistant builds from the chat log."""
+    result = object()
+    monkeypatch.setattr(
+        conv_module.conversation,
+        "async_get_result_from_chat_log",
+        MagicMock(return_value=result),
+        raising=False,
+    )
+    return result
+
+
+def _spoken(text: str, *, satellite: str | None = "assist_satellite.kitchen") -> Any:
+    user_input = _user_input(text)
+    user_input.satellite_id = satellite
+    return user_input
+
+
+async def test_a_spoken_no_to_a_closing_question_is_answered_and_saved(
+    decline_result: object,
+) -> None:
+    """The fixed line is spoken, and the thread holds the exchange."""
+    entity, app, config = await _decline_entity()
+    chat_log = _decline_chat_log(text="No thanks.")
+
+    answered = await entity._async_answer_bare_decline(
+        _spoken("No thanks."), chat_log, _DECLINE_THREAD
+    )
+
+    assert answered is decline_result
+    entity._async_add_spoken_reply.assert_awaited_once_with(chat_log, "OK.")
+    state = await app.aget_state(config)
+    assert [(m.type, m.content) for m in state.values["messages"]] == [
+        ("human", "Is the porch light on?"),
+        ("ai", _CLOSER),
+        ("human", "No thanks."),
+        ("ai", "OK."),
+    ]
+    # Nothing is left waiting to run on the thread.
+    assert state.next == ()
+
+
+@pytest.mark.usefixtures("decline_result")
+async def test_a_second_no_goes_to_the_model() -> None:
+    """After the fixed line neither the log nor the thread ends with a question."""
+    entity, _app, _config = await _decline_entity()
+    assert await entity._async_answer_bare_decline(
+        _spoken("No"), _decline_chat_log(), _DECLINE_THREAD
+    )
+
+    assert not await entity._async_answer_bare_decline(
+        _spoken("No"), _decline_chat_log("OK."), _DECLINE_THREAD
+    )
+
+
+_OFFER = "Yes. Want me to turn it off?"
+
+
+@pytest.mark.parametrize(
+    ("thread_reply", "chat_log", "text", "satellite"),
+    [
+        # A question whose "No" may be an instruction.
+        (_OFFER, _decline_chat_log(_OFFER), "No", "assist_satellite.kitchen"),
+        # Nothing was asked.
+        (
+            "The porch light is on.",
+            _decline_chat_log("The porch light is on."),
+            "No",
+            "assist_satellite.kitchen",
+        ),
+        # A new conversation.
+        (None, _decline_chat_log(None), "No", "assist_satellite.kitchen"),
+        # More than a decline.
+        (_CLOSER, _decline_chat_log(), "No, dim it", "assist_satellite.kitchen"),
+        # A typed turn costs no microphone and gets the model's answer.
+        (_CLOSER, _decline_chat_log(), "No", None),
+        # Another agent on the pipeline spoke last.
+        (
+            _CLOSER,
+            _decline_chat_log("Anything else?", agent_id="conversation.home_assistant"),
+            "No",
+            "assist_satellite.kitchen",
+        ),
+        # Another voice's thread asked; this speaker's did not.
+        (
+            "The porch light is on.",
+            _decline_chat_log(),
+            "No",
+            "assist_satellite.kitchen",
+        ),
+        # A fixed line followed the model's question, so the reply heard
+        # ended with a statement.
+        (
+            _CLOSER,
+            _decline_chat_log(f"{_CLOSER} A request to unlock is waiting for a PIN."),
+            "No",
+            "assist_satellite.kitchen",
+        ),
+    ],
+)
+async def test_other_turns_are_left_to_the_model(
+    thread_reply: str | None, chat_log: Any, text: str, satellite: str | None
+) -> None:
+    entity, app, config = await _decline_entity(thread_reply)
+    before = (await app.aget_state(config)).values.get("messages", [])
+
+    answered = await entity._async_answer_bare_decline(
+        _spoken(text, satellite=satellite), chat_log, _DECLINE_THREAD
+    )
+
+    assert answered is None
+    entity._async_add_spoken_reply.assert_not_awaited()
+    assert (await app.aget_state(config)).values.get("messages", []) == before
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        {"thread_id": _DECLINE_THREAD},
+        {"thread_id": "conv1:anna", "voice_thread": _DECLINE_THREAD},
+        {"thread_id": "conv1:anna", "voice_conversation": _DECLINE_THREAD},
+    ],
+)
+async def test_a_no_while_an_action_is_held_goes_to_the_model(
+    action: dict[str, Any],
+) -> None:
+    """A held action's PIN prompt is never answered from here."""
+    entity, _app, _config = await _decline_entity(pending={"held": action})
+
+    assert not await entity._async_answer_bare_decline(
+        _spoken("No"), _decline_chat_log(), _DECLINE_THREAD
+    )
+    entity._async_add_spoken_reply.assert_not_awaited()
+
+
+async def test_a_turn_cut_short_is_left_to_the_model() -> None:
+    """The thread still owes the last turn's trimming, which a write would skip."""
+    entity, app, config = await _decline_entity(None)
+    await app.aupdate_state(
+        config,
+        {
+            "messages": [
+                HumanMessage(content="Is the porch light on?", id="h1"),
+                AIMessage(content=_CLOSER, id="a1"),
+            ]
+        },
+        as_node="tool_loop_guard",
+    )
+    assert (await app.aget_state(config)).next
+
+    assert not await entity._async_answer_bare_decline(
+        _spoken("No"), _decline_chat_log(), _DECLINE_THREAD
+    )
+
+
+async def test_a_thread_that_cannot_be_read_leaves_the_turn_to_the_model() -> None:
+    entity, _app, _config = await _decline_entity()
+    entity.entry.runtime_data.checkpointer = types.SimpleNamespace()
+
+    assert not await entity._async_answer_bare_decline(
+        _spoken("No"), _decline_chat_log(), _DECLINE_THREAD
+    )
+    entity._async_add_spoken_reply.assert_not_awaited()
+
+
+async def test_the_handler_answers_a_decline_before_anything_else_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No API load, no acknowledgement and no model run for a bare decline."""
+    ran = AsyncMock()
+    entity, chat_log = _schema_first_turn(monkeypatch, {}, "conv1", ran)
+    result = object()
+    entity._async_answer_bare_decline = AsyncMock(return_value=result)
+    entity._async_speak_turn_start_ack = AsyncMock()
+
+    assert (
+        await HGAConversationEntity._async_handle_message(
+            entity, _spoken("No"), chat_log
+        )
+        is result
+    )
+    entity._async_answer_bare_decline.assert_awaited_once()
+    entity._async_init_llm_apis.assert_not_awaited()
+    entity._async_speak_turn_start_ack.assert_not_awaited()
+    ran.assert_not_awaited()
+
+
+async def test_the_handler_leaves_a_decline_after_another_agents_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Another agent's turn is still to be read in, so the model gets this one."""
+    ran = AsyncMock()
+    entity, chat_log = _schema_first_turn(monkeypatch, {}, "conv1", ran)
+    entity._async_get_message_history = MagicMock(
+        return_value=[HumanMessage(content="x"), AIMessage(content="Which one?")]
+    )
+    entity._async_answer_bare_decline = AsyncMock()
+    entity._async_finish_reply = AsyncMock()
+    monkeypatch.setattr(
+        conv_module.conversation,
+        "async_get_result_from_chat_log",
+        MagicMock(),
+        raising=False,
+    )
+
+    await HGAConversationEntity._async_handle_message(entity, _spoken("No"), chat_log)
+
+    entity._async_answer_bare_decline.assert_not_awaited()
+    ran.assert_awaited_once()

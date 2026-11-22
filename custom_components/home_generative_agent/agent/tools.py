@@ -87,6 +87,7 @@ from ..core.memories import (  # noqa: TID252
     memory_limit,
     memory_line,
     memory_namespace,
+    store_available,
 )
 from ..core.utils import extract_final, verify_pin  # noqa: TID252
 from ..sentinel.network_audit import (  # noqa: TID252
@@ -106,6 +107,9 @@ from ..sentinel.notifier_messages import notif_msg  # noqa: TID252
 from ..sentinel.redaction import redact_network_identifiers  # noqa: TID252
 from .automation_pin import find_critical_automation_calls
 from .automation_targets import (
+    AUTOMATION_ADDED_PREFIX,
+    AUTOMATION_MAY_BE_INSTALLED,
+    AUTOMATION_PUSHES_LEFT_ORDINARY,
     AUTOMATION_REFUSAL_PREFIX,
     describe_missing_targets,
     exposed_to_assist,
@@ -156,6 +160,7 @@ from .indirect_pin import (
 from .on_off_direction import with_action_performed
 from .pin_messages import describe_pending_action, pin_msg, refused_pin_request
 from .rule_entities import expand_critical_rules
+from .tool_failure import ToolFailure
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -669,7 +674,7 @@ async def get_and_analyze_camera_image(  # noqa: D417
 
     """
     if "configurable" not in config:
-        return "Configuration not found. Please check your setup."
+        return ToolFailure("Configuration not found. Please check your setup.")
 
     hass = config["configurable"]["hass"]
     vlm_model = config["configurable"]["vlm_model"]
@@ -681,13 +686,15 @@ async def get_and_analyze_camera_image(  # noqa: D417
         )
         available = _available_camera_names(hass)
         if available:
-            return (
+            return ToolFailure(
                 f"Camera '{camera_name}' was not found. Available cameras: {available}."
             )
-        return f"Camera '{camera_name}' was not found. No cameras are available."
+        return ToolFailure(
+            f"Camera '{camera_name}' was not found. No cameras are available."
+        )
     image = await _get_camera_image(hass, camera_entity_id)
     if image is None:
-        return "Error getting image from camera."
+        return ToolFailure("Error getting image from camera.")
     try:
         overrides = VLMPromptOverrides(
             response_language=options.get(
@@ -697,7 +704,7 @@ async def get_and_analyze_camera_image(  # noqa: D417
                 CONF_VLM_PROMPT_EXTRA, RECOMMENDED_VLM_PROMPT_EXTRA
             ),
         )
-        return await analyze_image(
+        caption = await analyze_image(
             vlm_model, image, detection_keywords, overrides=overrides
         )
     except (OllamaResponseError, TimeoutError, ProviderRefusedError) as err:
@@ -706,7 +713,19 @@ async def get_and_analyze_camera_image(  # noqa: D417
         else:
             # A timeout or a refused call: the reason, without a traceback.
             LOGGER.warning("%s %s", VLM_ERROR_CAPTION, err)
-        return VLM_ERROR_CAPTION
+        return ToolFailure(VLM_ERROR_CAPTION)
+    # analyze_image answers a Home Assistant error with the same caption.
+    return ToolFailure(caption) if caption == VLM_ERROR_CAPTION else caption
+
+
+# The memory tools' answer when no Database subentry is set up (#1016): the
+# store is a NullStore that keeps nothing, so a save must not read as done.
+NO_MEMORY_DATABASE = (
+    "Long-term memory is not available: no database is set up for this "
+    "integration, so nothing can be saved, listed or forgotten. Tell the user "
+    "you cannot remember this, and that long-term memory needs the Database "
+    "to be set up in this integration."
+)
 
 
 @tool(parse_docstring=True)
@@ -741,7 +760,9 @@ async def upsert_memory(  # noqa: D417
 
     """
     if "configurable" not in config:
-        return "Configuration not found. Please check your setup."
+        return ToolFailure("Configuration not found. Please check your setup.")
+    if not store_available(store):
+        return ToolFailure(f"Not stored. {NO_MEMORY_DATABASE}")
 
     mem_id = memory_id or ulid.ulid_now()
 
@@ -750,7 +771,7 @@ async def upsert_memory(  # noqa: D417
     limit = memory_limit(config["configurable"].get("options", {}))
     is_update = bool(memory_id) and await store.aget(namespace, memory_id) is not None
     if not is_update and await memories_full(store, user_id, limit):
-        return (
+        return ToolFailure(
             f"Not stored: this person's memory is full ({limit} of {limit}). "
             "Tell the user nothing was saved, and that they can ask you to "
             "forget something first."
@@ -777,7 +798,9 @@ async def list_memories(
 
     """
     if "configurable" not in config:
-        return "Configuration not found. Please check your setup."
+        return ToolFailure("Configuration not found. Please check your setup.")
+    if not store_available(store):
+        return ToolFailure(NO_MEMORY_DATABASE)
     # One row past what is shown says whether older memories were left out.
     found = await store.asearch(
         memory_namespace(config["configurable"]["user_id"]),
@@ -810,10 +833,12 @@ async def forget_memory(  # noqa: D417
 
     """
     if "configurable" not in config:
-        return "Configuration not found. Please check your setup."
+        return ToolFailure("Configuration not found. Please check your setup.")
+    if not store_available(store):
+        return ToolFailure(f"Nothing was deleted. {NO_MEMORY_DATABASE}")
     namespace = memory_namespace(config["configurable"]["user_id"])
     if await store.aget(namespace, memory_id) is None:
-        return f"No memory with id {memory_id}. Nothing was deleted."
+        return ToolFailure(f"No memory with id {memory_id}. Nothing was deleted.")
     await store.adelete(namespace, memory_id)
     # The memories shown to you this turn were read before the delete.
     return (
@@ -859,7 +884,7 @@ async def add_automation(  # noqa: D417
 
     """
     if "configurable" not in config:
-        return "Configuration not found. Please check your setup."
+        return ToolFailure("Configuration not found. Please check your setup.")
 
     hass = config["configurable"]["hass"]
     raw_push_service = config["configurable"]["options"].get(CONF_NOTIFY_SERVICE)
@@ -873,7 +898,7 @@ async def add_automation(  # noqa: D417
         # here: a phone that was renamed would otherwise install a camera
         # automation whose push silently fails.
         if mobile_push_service and not service_exists(hass, mobile_push_service):
-            return (
+            return ToolFailure(
                 f"{AUTOMATION_REFUSAL_PREFIX}: the mobile push service configured for "
                 f"this integration, '{sanitize_tool_text(mobile_push_service)}', "
                 "is not a Home Assistant service, so the camera automation's "
@@ -912,7 +937,7 @@ async def add_automation(  # noqa: D417
             warn_on_errors=False,
         )
     except (HomeAssistantError, MultipleInvalid) as err:
-        return f"Invalid automation configuration {err}"
+        return ToolFailure(f"Invalid automation configuration {err}")
 
     # Schema validation passes an automation whose trigger names an entity
     # that does not exist or whose action calls a service that does not, and
@@ -927,7 +952,7 @@ async def add_automation(  # noqa: D417
             sanitize_tool_text(str(ha_automation_config.get("alias", "<unnamed>"))),
             ", ".join(item.name or item.kind for item in missing),
         )
-        return describe_missing_targets(missing)
+        return ToolFailure(describe_missing_targets(missing))
 
     # A leak, smoke, gas or CO alert must not sit unseen in a notification
     # group or behind a Focus mode (#869). Rewrite the config that is written
@@ -957,7 +982,27 @@ async def add_automation(  # noqa: D417
     if pin_challenge:
         return pin_challenge
 
-    return await _async_write_automation(hass, ha_automation_config) + install_note
+    return await _install_automation(hass, ha_automation_config, install_note)
+
+
+async def _install_automation(
+    hass: HomeAssistant, ha_automation_config: dict[str, Any], install_note: str
+) -> str:
+    """Install an automation that needs no PIN; no retry once the append began."""
+    try:
+        result = await _async_write_automation(hass, ha_automation_config)
+    except AutomationMayBeInstalledError as err:
+        # The file may hold it already (a failed reload, a disk error): a
+        # retry could install it twice (#1030), as on the PIN path. The
+        # install note says it is installed, so it is left off.
+        LOGGER.exception("add_automation ended with an error")
+        # The error type only: its message can hold paths or tokens.
+        return (
+            f"{AUTOMATION_MAY_BE_INSTALLED}, but the install ended with an "
+            f"unexpected error: {err}. Do not add it again; tell the user to "
+            "check their automations first."
+        )
+    return result + install_note
 
 
 def _critical_push_note(critical_push: CriticalPushResult) -> str:
@@ -982,8 +1027,8 @@ def _critical_push_note(critical_push: CriticalPushResult) -> str:
         # in the automation, so the note names no editor.
         note += (
             ". This automation fires on a leak, smoke, gas, carbon monoxide or "
-            f"safety alarm, but {reason} critical alerts. It is installed as "
-            "written; do not add it again. Tell the user, who can switch those "
+            f"safety alarm, but {reason} critical alerts. "
+            f"{AUTOMATION_PUSHES_LEFT_ORDINARY} Tell the user, who can switch those "
             "notifications to a phone's notify.mobile_app_* service"
         )
     return f"{note}." if note else ""
@@ -1026,12 +1071,14 @@ def _maybe_require_pin_for_automation(
             "Set a PIN in the integration options to enforce confirmation.",
             ", ".join(call.describe() for call in critical_calls),
         )
-        return pin_msg(cfg.get("hass"), "automation_pin_unset")
+        return ToolFailure(pin_msg(cfg.get("hass"), "automation_pin_unset"))
 
     pending_actions = cfg.get("pending_actions")
     if pending_actions is None:
         LOGGER.error("Cannot gate critical automation: no pending action store.")
-        return pin_msg(cfg.get("hass"), "automation_pending_store_unavailable")
+        return ToolFailure(
+            pin_msg(cfg.get("hass"), "automation_pending_store_unavailable")
+        )
 
     action = {
         "tool_name": "add_automation",
@@ -1053,7 +1100,7 @@ def _maybe_require_pin_for_automation(
         pending_actions, action, pin_owner=cfg.get("pin_owner"), pin_reply=pin_reply
     )
     if action_id is None:
-        return refused_pin_request(cfg.get("hass"), pin_reply)
+        return ToolFailure(refused_pin_request(cfg.get("hass"), pin_reply))
     return json.dumps(
         {
             "status": "requires_pin",
@@ -1069,36 +1116,50 @@ def _maybe_require_pin_for_automation(
     )
 
 
+class AutomationMayBeInstalledError(Exception):
+    """An install failed once the append to automations.yaml had started."""
+
+
 async def _async_write_automation(
     hass: HomeAssistant, ha_automation_config: dict[str, Any]
 ) -> str:
-    """Append a validated automation to automations.yaml and reload."""
+    """
+    Append a validated automation to automations.yaml and reload.
+
+    An error before the append leaves the file as it was and is raised as is.
+    Once the append starts, any error is raised as
+    `AutomationMayBeInstalledError` (#1030): the automation may be in the
+    file, so a retry could install it twice.
+    """
     async with aiofiles.open(
         Path(hass.config.config_dir) / AUTOMATION_CONFIG_PATH, encoding="utf-8"
     ) as f:
         ha_exsiting_automation_configs = await f.read()
         ha_exsiting_automations_yaml = yaml.safe_load(ha_exsiting_automation_configs)
-
-    async with aiofiles.open(
-        Path(hass.config.config_dir) / AUTOMATION_CONFIG_PATH,
-        "a" if ha_exsiting_automations_yaml else "w",
-        encoding="utf-8",
-    ) as f:
-        ha_automation_config_raw = yaml.dump(
-            [ha_automation_config], allow_unicode=True, sort_keys=False
-        )
-        await f.write("\n" + ha_automation_config_raw)
-
-    await hass.services.async_call(AUTOMATION_DOMAIN, SERVICE_RELOAD)
-    hass.bus.async_fire(
-        AUTOMATION_TOOL_EVENT_REGISTERED,
-        {
-            "automation_config": ha_automation_config,
-            "raw_config": ha_automation_config_raw,
-        },
+    ha_automation_config_raw = yaml.dump(
+        [ha_automation_config], allow_unicode=True, sort_keys=False
     )
 
-    return f"Added automation {ha_automation_config['id']}"
+    try:
+        async with aiofiles.open(
+            Path(hass.config.config_dir) / AUTOMATION_CONFIG_PATH,
+            "a" if ha_exsiting_automations_yaml else "w",
+            encoding="utf-8",
+        ) as f:
+            await f.write("\n" + ha_automation_config_raw)
+
+        await hass.services.async_call(AUTOMATION_DOMAIN, SERVICE_RELOAD)
+        hass.bus.async_fire(
+            AUTOMATION_TOOL_EVENT_REGISTERED,
+            {
+                "automation_config": ha_automation_config,
+                "raw_config": ha_automation_config_raw,
+            },
+        )
+    except Exception as err:
+        raise AutomationMayBeInstalledError(type(err).__name__) from err
+
+    return f"{AUTOMATION_ADDED_PREFIX}{ha_automation_config['id']}"
 
 
 @tool(parse_docstring=True)
@@ -1117,7 +1178,7 @@ async def write_yaml_file(  # noqa: D417
 
     """
     if "configurable" not in config:
-        return "Configuration not found. Please check your setup."
+        return ToolFailure("Configuration not found. Please check your setup.")
 
     hass = config["configurable"]["hass"]
     config_dir = Path(hass.config.config_dir)
@@ -1175,7 +1236,7 @@ async def confirm_sensitive_action(  # noqa: D417
 
     """
     if "configurable" not in config:
-        return "Configuration not found. Please check your setup."
+        return ToolFailure("Configuration not found. Please check your setup.")
     cfg = cast("ConfigurableData", config.get("configurable", {}))
     return await confirm_pending_action(cfg, action_id, pin)
 
@@ -1212,11 +1273,11 @@ async def confirm_pending_action(
         pending_actions, requested_action_id, cfg.get("thread_id")
     )
     if resolved_action_id is None:
-        return pin_msg(hass, "pending_action_not_found_or_expired")
+        return ToolFailure(pin_msg(hass, "pending_action_not_found_or_expired"))
 
     action, action_err = _load_pending_action(pending_actions, resolved_action_id, hass)
     if action_err or not action:
-        return action_err or pin_msg(hass, "pending_action_not_found")
+        return ToolFailure(action_err or pin_msg(hass, "pending_action_not_found"))
 
     refusal, pin_not_in_message = _confirmation_refusal(
         cfg, action, resolved_action_id, provided_pin
@@ -1267,12 +1328,16 @@ async def confirm_pending_action(
         else:
             # The request's last attempt: the prompt is gone with it.
             hint = "pin_request_again"
-        return f"{pin_err} {pin_msg(hass, hint)}"
+        return ToolFailure(f"{pin_err} {pin_msg(hass, hint)}")
 
     result, exec_err = await _execute_pending_action(
         resolved_action_id, action, cfg, deadline
     )
-    return result or exec_err or pin_msg(hass, "confirmation_unable_to_process")
+    return (
+        result
+        or exec_err
+        or ToolFailure(pin_msg(hass, "confirmation_unable_to_process"))
+    )
 
 
 def _resolve_action_id(
@@ -1287,9 +1352,9 @@ def _resolve_action_id(
         action = pending_actions.get(requested_action_id)
         if action and action.get("thread_id") == thread_id:
             return requested_action_id
-    # Without an id, or with one this conversation no longer holds (a
-    # re-issued request replaces its action under a new id, and the model may
-    # still hold the old one), take the conversation's only pending action.
+    # Without an id, or with one this conversation no longer holds (a new
+    # request replaces its action under a new id, and the model may still
+    # hold the old one), take the conversation's only pending action.
     # The store is shared by every conversation, and satellites and
     # automations share one user, so another conversation's action must
     # never be picked up here: its id reads as missing like any other. This
@@ -1391,12 +1456,12 @@ def _confirmation_refusal(
     """
     hass = cfg.get("hass")
     if _is_wrong_user(cfg, action):
-        return pin_msg(hass, "pending_action_wrong_user"), False
+        return ToolFailure(pin_msg(hass, "pending_action_wrong_user")), False
     thread_id = cfg.get("thread_id")
     if not thread_id or action.get("thread_id") != thread_id:
         # _resolve_action_id already refuses another conversation's action;
         # kept so this check never depends on how the id was resolved.
-        return pin_msg(hass, "pending_action_not_found_or_expired"), False
+        return ToolFailure(pin_msg(hass, "pending_action_not_found_or_expired")), False
     # Refused before the PIN is checked, so no attempt is counted.
     pin_reply = cfg.get("pin_reply")
     not_in_message = False
@@ -1578,9 +1643,8 @@ def _completed_reply(
     )
     result = data
     if partial and results is not None:
-        payload = json.loads(data) if isinstance(data, str) else data
         # The same note, names withheld the same way, as the normal path's.
-        result = with_failure_note(payload, results)
+        result = with_failure_note(data, results)
     # default=str: a result the JSON encoder cannot take must not raise after
     # the action ran.
     return json.dumps(
@@ -1600,7 +1664,9 @@ async def _execute_pending_action(  # noqa: PLR0911, PLR0912
     if not isinstance(raw_tool_name, str) or not raw_tool_name:
         # Nothing can ever run it, so do not keep it until the TTL sweep.
         cfg.get("pending_actions", {}).pop(resolved_action_id, None)
-        return None, pin_msg(cfg.get("hass"), "pending_action_missing_tool_name")
+        return None, ToolFailure(
+            pin_msg(cfg.get("hass"), "pending_action_missing_tool_name")
+        )
     tool_name = raw_tool_name
 
     if tool_name == "add_automation":
@@ -1610,7 +1676,7 @@ async def _execute_pending_action(  # noqa: PLR0911, PLR0912
 
     ha_llm_api, api_err = _ensure_api(cfg)
     if api_err or ha_llm_api is None:
-        return None, pin_msg(cfg.get("hass"), "ha_llm_api_unavailable")
+        return None, ToolFailure(pin_msg(cfg.get("hass"), "ha_llm_api_unavailable"))
 
     tool_args = action.get("tool_args") or {}
     # The call runs as it was held: it was normalized and its lock filled in
@@ -1639,7 +1705,9 @@ async def _execute_pending_action(  # noqa: PLR0911, PLR0912
         # PIN was asked for: the line no longer names what would run, so the
         # request is dropped and has to be asked again (#836 review).
         cfg.get("pending_actions", {}).pop(resolved_action_id, None)
-        return None, pin_msg(cfg.get("hass"), "pending_action_not_found_or_expired")
+        return None, ToolFailure(
+            pin_msg(cfg.get("hass"), "pending_action_not_found_or_expired")
+        )
     if kind == BUILTIN_INTENT:
         tool_args = normalize_intent_for_alarm(tool_name, tool_args, None)
         tool_args = normalize_intent_for_lock(tool_name, tool_args, None)
@@ -1655,10 +1723,14 @@ async def _execute_pending_action(  # noqa: PLR0911, PLR0912
     if target_api is None:
         # The API that would have run it is gone.
         cfg.get("pending_actions", {}).pop(resolved_action_id, None)
-        return None, pin_msg(cfg.get("hass"), "pending_action_not_found_or_expired")
+        return None, ToolFailure(
+            pin_msg(cfg.get("hass"), "pending_action_not_found_or_expired")
+        )
 
     if not _claim_pending_action(cfg, resolved_action_id):
-        return None, pin_msg(cfg.get("hass"), "pending_action_not_found_or_expired")
+        return None, ToolFailure(
+            pin_msg(cfg.get("hass"), "pending_action_not_found_or_expired")
+        )
 
     reply_key, outcome = "action_execute_failed", PIN_OUTCOME_FAILED
     try:
@@ -1696,7 +1768,10 @@ async def _execute_pending_action(  # noqa: PLR0911, PLR0912
             content if status == "error" else json.dumps(response.data, default=str)
         )
     _record_confirmed(cfg, action, outcome)
-    return None, pin_msg(cfg.get("hass"), reply_key, err=failure)
+    reply = pin_msg(cfg.get("hass"), reply_key, err=failure)
+    # "May have run" is no failure to retry (#1023 review): only a call that
+    # did not act is a ToolFailure.
+    return None, reply if outcome == PIN_OUTCOME_UNKNOWN else ToolFailure(reply)
 
 
 async def _execute_pending_automation(
@@ -1709,10 +1784,10 @@ async def _execute_pending_automation(
     hass = cfg.get("hass")
     automation_config = action.get("automation_config")
     if hass is None or not isinstance(automation_config, dict):
-        return None, pin_msg(hass, "pending_automation_invalid")
+        return None, ToolFailure(pin_msg(hass, "pending_automation_invalid"))
 
     if not _claim_pending_action(cfg, resolved_action_id):
-        return None, pin_msg(hass, "pending_action_not_found_or_expired")
+        return None, ToolFailure(pin_msg(hass, "pending_action_not_found_or_expired"))
 
     try:
         async with asyncio.timeout_at(deadline):
@@ -1724,7 +1799,13 @@ async def _execute_pending_automation(
         LOGGER.exception("PIN-confirmed automation ended with an error")
         _record_confirmed(cfg, action, PIN_OUTCOME_UNKNOWN)
         # The type only: the message can hold paths or tokens.
-        return None, pin_msg(hass, "automation_outcome_unknown", err=type(err).__name__)
+        # Claimed and maybe written: not a failure to retry (#1023 review).
+        name = (
+            str(err)
+            if isinstance(err, AutomationMayBeInstalledError)
+            else type(err).__name__
+        )
+        return None, pin_msg(hass, "automation_outcome_unknown", err=name)
 
     _record_confirmed(cfg, action, PIN_OUTCOME_DONE)
     install_note = action.get("install_note")
@@ -1759,7 +1840,7 @@ async def alarm_control(  # noqa: D417, PLR0913
 
     """
     if "configurable" not in config:
-        return "Configuration not found. Please check your setup."
+        return ToolFailure("Configuration not found. Please check your setup.")
 
     hass: HomeAssistant = config["configurable"]["hass"]
     tool_args: dict[str, Any] = {
@@ -1775,7 +1856,7 @@ async def alarm_control(  # noqa: D417, PLR0913
     try:
         result = await _perform_alarm_control(hass, "alarm_control", tool_args)
     except HomeAssistantError as err:
-        return f"Error controlling alarm: {err}"
+        return ToolFailure(f"Error controlling alarm: {err}")
     return json.dumps(result)
 
 
@@ -2328,7 +2409,7 @@ async def get_camera_last_events(  # noqa: D417
 
     """
     if "configurable" not in config:
-        return "Configuration not found. Please check your setup."
+        return ToolFailure("Configuration not found. Please check your setup.")
 
     hass = config["configurable"]["hass"]
     results = get_camera_last_events_from_states(hass, camera_entity_id)
@@ -2418,7 +2499,7 @@ async def audit_home_security(
     runtime_data = configurable.get("hga_runtime_data")
     sentinel = getattr(runtime_data, "sentinel", None)
     if sentinel is None:
-        return (
+        return ToolFailure(
             "Sentinel is not enabled, so no security checks can run. Enable "
             "Sentinel in the Home Generative Agent integration's Sentinel "
             "settings (Advanced setup) to audit this home."
@@ -2426,7 +2507,9 @@ async def audit_home_security(
     report = await sentinel.async_audit_network()
     if report["status"] != "ok":
         # The engine owns the wording for both "disabled" and "unavailable".
-        return "The security audit could not run: " + "; ".join(report["notes"])
+        return ToolFailure(
+            "The security audit could not run: " + "; ".join(report["notes"])
+        )
     # Fails closed: a sentinel object that cannot say details may be shared
     # (a wrapper, a renamed property) gets the digest, never the details.
     if getattr(sentinel, "network_audit_share_details", False) is not True:

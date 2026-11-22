@@ -12,7 +12,8 @@ import json
 import logging
 import re
 from collections import deque
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
+from time import monotonic
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict, cast
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -29,7 +30,7 @@ from homeassistant.components.conversation import (
 )
 from homeassistant.components.conversation.models import AbstractConversationAgent
 from homeassistant.const import MATCH_ALL, STATE_UNAVAILABLE, STATE_UNKNOWN
-from homeassistant.exceptions import HomeAssistantError, TemplateError
+from homeassistant.exceptions import HomeAssistantError, TemplateError, Unauthorized
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import intent, llm, template
@@ -62,7 +63,7 @@ from .agent.helpers import (
     is_actuation_tool,
     keep_pin_prompts,
     langchain_tool_parameters_json,
-    llm_api_is_supported,
+    llm_api_requires_admin,
     newest_pin_prompt,
     pending_action_expired,
     pin_length_number,
@@ -127,6 +128,7 @@ from .const import (
     CONF_VOICE_TOOL_ACK,
     CONF_VOICE_TOOL_ACK_TIMING,
     CRITICAL_ACTION_PROMPT,
+    DECLINE_FOLLOW_UPS,
     DEFAULT_STT_HALLUCINATION_EXACT_PATTERNS,
     DEFAULT_STT_HALLUCINATION_PATTERNS,
     DOMAIN,
@@ -148,12 +150,19 @@ from .const import (
     VOICE_ACK_TIMING_TOOL_CALL,
     VOICE_ACK_TIMING_TURN_START,
     VOICE_ACK_TIMINGS,
+    VOICE_TURN_PROMPT,
 )
 from .core.conversation_helpers import (
     _convert_schema_json_to_yaml,
     _fix_entity_ids_in_text,
     _is_dashboard_request,
     _maybe_fix_dashboard_entities,
+)
+from .core.fallback import (
+    EMBEDDING_TIMEOUT_HOLD_S,
+    EmbeddingsCircuitOpenError,
+    EmbeddingsUnavailableError,
+    skipping_unreachable_providers,
 )
 from .core.memories import memory_user as memory_store_user
 from .core.pipeline_guard import async_check_pin_pipeline_conflict
@@ -691,6 +700,91 @@ def _voice_tool_acknowledgement(
     return VoiceAck(text, str(timing))
 
 
+def _voice_turn_prompt(user_input: conversation.ConversationInput) -> str:
+    """
+    Return the instruction for a spoken turn; empty for a typed one.
+
+    Only a satellite turn counts, as for the acknowledgement: there a reply
+    ending in a question reopens the microphone (#954). It changes between
+    turns of one conversation, so it goes in the volatile part of the prompt.
+    """
+    return VOICE_TURN_PROMPT if user_input.satellite_id else ""
+
+
+def _decline_entry(language: str | None) -> tuple[str, str, str] | None:
+    """Return the turn's language's entry of DECLINE_FOLLOW_UPS, if it has one."""
+    return DECLINE_FOLLOW_UPS.get((language or "").split("-")[0].lower())
+
+
+def _decline_reply(text: str, language: str | None) -> str | None:
+    """
+    Return the fixed line for a reply that only declines; None for any other.
+
+    The pattern is the turn's language's, and the whole reply has to match,
+    so "No, the kitchen one" is left for the model (#954).
+    """
+    entry = _decline_entry(language)
+    if entry is None:
+        return None
+    return (
+        entry[2]
+        if re.fullmatch(rf"\W*(?:{entry[0]})\W*", text, flags=re.IGNORECASE)
+        else None
+    )
+
+
+def _asks_if_there_is_more(text: object, language: str | None) -> bool:
+    """
+    Return True for a reply that ends by asking only whether there is more.
+
+    "Is there anything else I can help with?" is closed by a "No"; any other
+    question may need the "No" for something, and is the model's (#954).
+    """
+    entry = _decline_entry(language)
+    if entry is None or not isinstance(text, str):
+        return False
+    text = text.rstrip()
+    if not text.endswith(_CONTINUE_MARKS):
+        return False
+    last_sentence = re.split(r"[.!?;\uff1f\n]", text[:-1])[-1]
+    return bool(re.search(entry[1], last_sentence, flags=re.IGNORECASE))
+
+
+def _message_text(message: object) -> str | None:
+    """Return the text of a reply of the agent's that calls no tool."""
+    if not isinstance(message, AIMessage) or message.tool_calls:
+        return None
+    content = message.content
+    if isinstance(content, str):
+        return content
+    return " ".join(
+        str(part.get("text", ""))
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "text"
+    )
+
+
+def _reply_before_this_turn(
+    chat_log: conversation.ChatLog, agent_id: str
+) -> str | None:
+    """
+    Return what the conversation last heard, when this agent said it.
+
+    The chat log holds what was spoken, fixed lines included, by every agent
+    on the pipeline; its last entry is this turn's request.
+    """
+    for entry in reversed(chat_log.content):
+        if getattr(entry, "role", None) == "user":
+            continue
+        if (
+            getattr(entry, "role", None) == "assistant"
+            and getattr(entry, "agent_id", None) == agent_id
+        ):
+            return getattr(entry, "content", None)
+        return None
+    return None
+
+
 def _get_stt_hallucination_patterns(
     options: dict[str, Any],
 ) -> tuple[str, ...]:
@@ -789,6 +883,12 @@ class _ThinkStreamFilter:
     possible tag prefix at the end of a delta is held until the next one.
     An unclosed block runs to the end of the model turn, like extract_final.
 
+    A bare ``</think>`` before any ``<think>`` (the opening tag was in the
+    prompt, as with Qwen3 templates) drops whatever text is still held before
+    it. Text already sent cannot be taken back: a voice satellite may have
+    spoken it, and the cleaned final reply replaces it in the chat only on a
+    turn that ends in text.
+
     Whitespace follows extract_final(collapse_whitespace=False): once a block
     has been removed, the reply's outer whitespace is stripped and nothing
     inside it is touched. Leading whitespace is dropped until the first
@@ -806,6 +906,9 @@ class _ThinkStreamFilter:
         self._removed = False
         self._emitted = False
         self._held_space = ""
+        # A bare </think> ends prompt-opened reasoning only before any <think>
+        # and only once, as in extract_final.
+        self._bare_close_possible = True
 
     def _visible(self, text: str) -> str:
         """Apply the outer-whitespace rule to text outside any block."""
@@ -836,13 +939,30 @@ class _ThinkStreamFilter:
                 self._inside = False
                 continue
             opening = _THINK_OPEN_RE.search(self._pending)
+            closing = (
+                _THINK_CLOSE_RE.search(self._pending)
+                if self._bare_close_possible
+                else None
+            )
+            if closing is not None and (
+                opening is None or closing.start() < opening.start()
+            ):
+                # A bare </think> ends reasoning whose <think> was in the
+                # prompt (Qwen3 templates, #1017): drop what is still held.
+                self._pending = self._pending[closing.end() :]
+                self._removed = True
+                self._bare_close_possible = False
+                continue
             if opening is not None:
                 out.append(self._visible(self._pending[: opening.start()]))
                 self._pending = self._pending[opening.end() :]
                 self._inside = True
                 self._removed = True
+                self._bare_close_possible = False
                 continue
             keep = _partial_tag_len(self._pending, _THINK_OPEN)
+            if self._bare_close_possible:
+                keep = max(keep, _partial_tag_len(self._pending, _THINK_CLOSE))
             out.append(self._visible(self._pending[: len(self._pending) - keep]))
             self._pending = self._pending[len(self._pending) - keep :]
             break
@@ -1177,6 +1297,17 @@ async def _run_tool_index_background(
     except asyncio.CancelledError:
         _LOGGER.debug("Tool index write cancelled by the entry unload.")
         raise
+    except EmbeddingsCircuitOpenError as err:
+        # A slow model load or a frozen server (#969), or a breaker between
+        # tries (one chunk's call refused while another tries the member), is
+        # not a failed index: it is built again once the provider is tried.
+        rd.tool_index_retry_after = monotonic() + EMBEDDING_TIMEOUT_HOLD_S
+        _LOGGER.warning(
+            "Tool index not built yet; built again on a turn after %.0f s: %s",
+            EMBEDDING_TIMEOUT_HOLD_S,
+            err,
+        )
+        async_dispatcher_send(hass, SIGNAL_TOOL_INDEX_UPDATED, "stale", 0)
     except Exception:
         _LOGGER.exception("Global tool index background task failed")
         if rd.tool_index_rearmed:
@@ -1215,6 +1346,17 @@ def _clean_speaker_name(value: str) -> str:
     return name[:SPEAKER_NAME_MAX_CHARS].strip()
 
 
+class TurnIdentity(TypedDict):
+    """Who a turn runs as: the run config's identity keys (_turn_identity)."""
+
+    thread_id: str
+    voice_conversation: str | None
+    voice_thread: str | None
+    user_id: str
+    has_memory_user: bool
+    pin_owner: str | None
+
+
 @dataclasses.dataclass(frozen=True)
 class Speaker:
     """Who a voice-recognizing satellite heard; name is None for an unknown voice."""
@@ -1227,6 +1369,25 @@ class Speaker:
     def key(self) -> str:
         """Name the speaker's history: the person when known, else the voice."""
         return self.person or self.name or STATE_UNKNOWN
+
+
+def _turn_input(messages: list[AnyMessage]) -> State:
+    """
+    Return the graph input that starts a turn.
+
+    Every key given here replaces what the conversation's checkpoint holds, so
+    the per-turn fields are reset and ``summary`` is left out: giving it as ""
+    wiped the summary of the trimmed turns at the start of every turn, before
+    the agent read it (#1048).
+    """
+    return {
+        "messages": messages,
+        "chat_model_usage_metadata": {},
+        "messages_to_remove": [],
+        "selected_tools": [],
+        "tool_routing_map": {},
+        "turn_memories": {},
+    }
 
 
 class HGAConversationEntity(conversation.ConversationEntity, AbstractConversationAgent):
@@ -1425,21 +1586,27 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
         active_apis: dict[str, llm.APIInstance] = {}
         remote_home_assistants: set[str] = set()
         failed_apis: list[str] = []
-        unsupported_api_ids = {
-            api.id for api in llm.async_get_apis(hass) if not llm_api_is_supported(api)
+        admin_only_apis: list[str] = []
+        admin_api_ids = {
+            api.id for api in llm.async_get_apis(hass) if llm_api_requires_admin(api)
         }
         for api_id in active_api_ids:
-            if api_id in unsupported_api_ids:
-                # Stored before the options form hid it; see llm_api_is_supported.
-                _LOGGER.warning(
-                    "Not loading LLM API %s: this integration does not support "
-                    "admin-only LLM APIs yet; deselect it in the options",
-                    api_id,
-                )
-                failed_apis.append(api_id)
-                continue
             try:
                 api = await llm.async_get_api(hass, api_id, llm_context)
+            except Unauthorized:
+                if api_id not in admin_api_ids:
+                    _LOGGER.warning("Could not load LLM API: %s", api_id)
+                    failed_apis.append(api_id)
+                    continue
+                # An admin-only API on a turn with no admin user, such as a
+                # voice satellite's: Home Assistant refuses it, and the turn
+                # goes on with the other APIs (#918).
+                _LOGGER.debug(
+                    "Not loading LLM API %s: this turn's user is not an admin",
+                    api_id,
+                )
+                admin_only_apis.append(api_id)
+                continue
             except HomeAssistantError:
                 _LOGGER.warning("Could not load LLM API: %s", api_id)
                 failed_apis.append(api_id)
@@ -1459,8 +1626,13 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
         if not active_apis:
             msg = (
                 "No LLM APIs could be loaded. "
-                f"Failed: {', '.join(failed_apis)}. "
-                f"Configured: {', '.join(active_api_ids)}"
+                + (f"Failed: {', '.join(failed_apis)}. " if failed_apis else "")
+                + (
+                    f"For admin users only: {', '.join(admin_only_apis)}. "
+                    if admin_only_apis
+                    else ""
+                )
+                + f"Configured: {', '.join(active_api_ids)}"
             )
             raise HomeAssistantError(msg)
 
@@ -1742,6 +1914,42 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
             return None
         return waiting_prompt.get("user")
 
+    @classmethod
+    def _turn_identity(
+        cls,
+        *,
+        conversation_id: str,
+        speaker: Speaker | None,
+        thread_id: str,
+        waiting_prompt: Mapping[str, Any] | None,
+        user_name: str | None,
+    ) -> TurnIdentity:
+        """
+        Return who the turn runs as: the run config's identity keys.
+
+        ``user_id`` is the speaker's memory user, never a followed prompt's
+        owner: that would hand the speaker the owner's memories (#941 review).
+        ``pin_owner`` is the owner, for the PIN owner check only. Keyword-only:
+        the conversation and thread ids are both strings, and swapped they
+        would put every voice on one thread.
+        """
+        clean_user_name, has_memory_user = cls._memory_namespace(user_name, speaker)
+        return TurnIdentity(
+            thread_id=thread_id,
+            # The satellite conversation a voice's thread belongs to: it
+            # holds one PIN prompt across its voices (#974).
+            voice_conversation=conversation_id if speaker else None,
+            # The thread of the voice that spoke, which a PIN-only reply
+            # may have left for another voice's: voices are told apart by
+            # it, since every voice with no linked person is "robot".
+            voice_thread=(
+                cls._thread_id(conversation_id, speaker) if speaker else None
+            ),
+            user_id=clean_user_name,
+            has_memory_user=has_memory_user,
+            pin_owner=cls._pin_owner(user_name, waiting_prompt),
+        )
+
     @staticmethod
     def _thread_id(conversation_id: str, speaker: Speaker | None) -> str:
         """
@@ -1893,9 +2101,11 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
             if isinstance(last, ToolMessage):
                 # A turn ends on a tool round by design: a confirmation
                 # refused before the user was asked for the PIN (graph.py,
-                # `_after_tools`), or the round-limit guard with a PIN line
-                # to follow. _async_finish_reply adds the reply: the PIN
-                # lines, or an apology when there are none.
+                # `_after_tools`), the round-limit guard with a PIN line to
+                # follow, or an empty model reply with a PIN line to follow
+                # (`_empty_reply_fallback`, #1013). _async_finish_reply
+                # adds the reply: the PIN lines, or an apology when there
+                # are none.
                 _LOGGER.debug("Turn ended on a tool round (%s).", last.name)
             else:
                 _LOGGER.error(
@@ -2045,6 +2255,22 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
                 and not last_chat_content.tool_calls
                 else None
             )
+            if (
+                reply is not None
+                and isinstance(last_message, ToolMessage)
+                and stream_error is None
+                and pin_lines_pending is not None
+                and pin_lines_pending()
+            ):
+                # Text streamed after the turn's last tool round, while the
+                # graph ended on that round: a reply the graph dropped (one
+                # left empty once its reasoning was removed, with a PIN line
+                # to follow, #1013). It must not stay next to the PIN line. Not
+                # after a failed stream: the text is then a partial answer the
+                # user already has, and the model call never committed.
+                chat_log.content.pop()
+                reply = None
+                _LOGGER.debug("Dropped streamed text the graph did not keep.")
             has_reply = reply is not None
             replace_partial = (
                 reply is not None
@@ -2138,8 +2364,10 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
         may be gone by then, or replaced. For another voice's prompt, the one
         a PIN would follow (`newest_pin_prompt`) is named; failing that, the
         one that refused it if it can still be answered; with neither, the
-        user is asked to make the request again. Nothing is said once this
-        turn's PIN ran an action, or about the prompt this turn is answering.
+        user is asked to make the request again. A prompt whose PIN reply
+        another turn is handling is named as in progress, not as waiting for
+        a PIN (#1004). Nothing is said once this turn's PIN ran an action, or
+        about the prompt this turn is answering.
         """
         if not refusal_line_due(pending_actions, pin_reply):
             return None
@@ -2158,6 +2386,8 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
                 else None
             )
             waiting, key = followed or refusing, "pin_other_voice_waiting_line"
+            if followed is None and refusing and refusing.get("reply_turn"):
+                key = "pin_in_progress_line"
         else:
             waiting, key = refusing, "pin_in_progress_line"
         if waiting is None:
@@ -2455,6 +2685,82 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
             chat_log, _streaming_failure_content(stream_error)
         )
 
+    async def _async_answer_bare_decline(
+        self,
+        user_input: conversation.ConversationInput,
+        chat_log: conversation.ChatLog,
+        thread_id: str,
+    ) -> conversation.ConversationResult | None:
+        """
+        Answer a spoken "No" to the agent's closing question with a fixed line.
+
+        A reply ending in a question reopens a satellite's microphone, and a
+        bare decline then cost a model call, and a spoken acknowledgement
+        before it, to hear "OK" (#954). Answered here is only a satellite
+        turn whose whole text declines, when the last thing the conversation
+        heard was this agent asking whether there is more to do, and the
+        speaker's thread ends with that question too: another voice's or
+        another agent's question is not this speaker's to close, and a fixed
+        line added after the model's reply is in the chat log only. A PIN
+        prompt asks too, and its answer is never taken from here: any held
+        action on the thread or conversation leaves the turn to the model.
+        The exchange is saved to the thread, so the next turn reads the
+        question as answered. Returns None for a turn left to the model,
+        which includes any failure to read or save the thread.
+        """
+        language = user_input.language
+        reply = (
+            _decline_reply(user_input.text, language)
+            if user_input.satellite_id
+            else None
+        )
+        runtime_data = self.entry.runtime_data
+        if (
+            reply is None
+            or not _asks_if_there_is_more(
+                _reply_before_this_turn(chat_log, self.entity_id), language
+            )
+            or any(
+                thread_id in (action.get("thread_id"), action.get("voice_thread"))
+                or chat_log.conversation_id
+                in (action.get("thread_id"), action.get("voice_conversation"))
+                for action in runtime_data.pending_actions.values()
+            )
+        ):
+            return None
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+        try:
+            app = workflow.compile(
+                store=runtime_data.store, checkpointer=runtime_data.checkpointer
+            )
+            state = await app.aget_state(config)
+            history = state.values.get("messages") or []
+            # `next` is set when the turn before was cut short: its trimming
+            # is still owed, and writing as the last node would skip it.
+            if (
+                state.next
+                or not history
+                or not _asks_if_there_is_more(_message_text(history[-1]), language)
+            ):
+                return None
+            await app.aupdate_state(
+                config,
+                {
+                    "messages": [
+                        HumanMessage(content=user_input.text, id=ulid.ulid_now()),
+                        AIMessage(content=reply, id=ulid.ulid_now()),
+                    ]
+                },
+                # The graph's last node: the thread is left as a finished
+                # turn leaves it, with nothing waiting to run.
+                as_node="summarize_and_remove_messages",
+            )
+        except Exception:
+            _LOGGER.debug("Bare decline left to the model", exc_info=True)
+            return None
+        await self._async_add_spoken_reply(chat_log, reply)
+        return conversation.async_get_result_from_chat_log(user_input, chat_log)
+
     async def _async_handle_message(
         self,
         user_input: conversation.ConversationInput,
@@ -2486,16 +2792,19 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
         # stored prompt is then a live one (end_pin_turn, #974).
         pin_turn_id = ulid.ulid_now()
         try:
+            # A provider this turn cannot connect to is tried once, not once
+            # per model call (#1027).
             async with local_chat_session(deployment, category="chat"):
-                return await self._async_handle_message_active(
-                    user_input,
-                    chat_log,
-                    intent_response,
-                    llm_context,
-                    message_history,
-                    conversation_id,
-                    pin_turn_id=pin_turn_id,
-                )
+                with skipping_unreachable_providers():
+                    return await self._async_handle_message_active(
+                        user_input,
+                        chat_log,
+                        intent_response,
+                        llm_context,
+                        message_history,
+                        conversation_id,
+                        pin_turn_id=pin_turn_id,
+                    )
         finally:
             end_pin_turn(
                 runtime_data.pending_actions,
@@ -2503,7 +2812,7 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
                 ended_prompts=runtime_data.ended_pin_prompts,
             )
 
-    async def _async_handle_message_active(  # noqa: PLR0911, PLR0913, PLR0915
+    async def _async_handle_message_active(  # noqa: PLR0911, PLR0912, PLR0913, PLR0915
         self,
         user_input: conversation.ConversationInput,
         chat_log: conversation.ChatLog,
@@ -2568,6 +2877,13 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
                 unreadable=unreadable,
             )
 
+        if not message_history and (
+            declined := await self._async_answer_bare_decline(
+                user_input, chat_log, thread_id
+            )
+        ):
+            return declined
+
         # Multi-API initialization
         try:
             llm_api = await self._async_init_llm_apis(llm_context)
@@ -2604,7 +2920,7 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
             user_name = user.name
             requester_is_admin = bool(user.is_admin)
         # A user name of None indicates an automation is being run.
-        clean_user_name, has_memory_user = self._memory_namespace(user_name, speaker)
+        clean_user_name, _ = self._memory_namespace(user_name, speaker)
         pin_owner = self._pin_owner(user_name, waiting_prompt)
 
         if result := await self._async_confirm_pin_reply(
@@ -2646,7 +2962,14 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
             llm_context, user_name, llm_api, has_tools=bool(tools)
         )
         volatile_prompt = "\n".join(
-            filter(None, [volatile_prompt, self._speaker_prompt(speaker)])
+            filter(
+                None,
+                [
+                    volatile_prompt,
+                    self._speaker_prompt(speaker),
+                    _voice_turn_prompt(user_input),
+                ],
+            )
         )
 
         # Use the already-configured chat model from __init__.py.
@@ -2679,19 +3002,13 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
 
         app_config: RunnableConfig = {
             "configurable": {
-                "thread_id": thread_id,
-                # The satellite conversation a voice's thread belongs to: it
-                # holds one PIN prompt across its voices (#974).
-                "voice_conversation": conversation_id if speaker else None,
-                # The thread of the voice that spoke, which a PIN-only reply
-                # may have left for another voice's: voices are told apart by
-                # it, since every voice with no linked person is "robot".
-                "voice_thread": (
-                    self._thread_id(conversation_id, speaker) if speaker else None
+                **self._turn_identity(
+                    conversation_id=conversation_id,
+                    speaker=speaker,
+                    thread_id=thread_id,
+                    waiting_prompt=waiting_prompt,
+                    user_name=user_name,
                 ),
-                "user_id": clean_user_name,
-                "has_memory_user": has_memory_user,
-                "pin_owner": pin_owner,
                 "pin_reply": pin_reply,
                 "requester_is_admin": requester_is_admin,
                 "chat_model": base_llm,
@@ -2727,15 +3044,7 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
             *message_history,
             HumanMessage(content=user_input.text, id=ulid.ulid_now()),
         ]
-        app_input: State = {
-            "messages": messages,
-            "summary": "",
-            "chat_model_usage_metadata": {},
-            "messages_to_remove": [],
-            "selected_tools": [],
-            "tool_routing_map": {},
-            "turn_memories": {},
-        }
+        app_input = _turn_input(messages)
 
         # Interact with agent app.
         if options.get(CONF_SCHEMA_FIRST_YAML, False):
@@ -3023,7 +3332,14 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
         sourced from the already-loaded API instances, so the new tools are
         retrievable on the triggering turn.
         """
-        if runtime_data.tool_indexing_in_progress or runtime_data.tool_index_failed:
+        if (
+            runtime_data.tool_indexing_in_progress
+            or runtime_data.tool_index_failed
+            or (
+                not runtime_data.tool_index_ready
+                and monotonic() < runtime_data.tool_index_retry_after
+            )
+        ):
             _LOGGER.debug(
                 "Tool index guard skipped indexing: ready=%s indexing=%s "
                 "failed=%s cached_hashes=%d.",
@@ -3089,13 +3405,45 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
                             "Failed to queue tools of loaded API %s: %s", api_id, err
                         )
             else:
-                # An admin-only API is never loaded for a turn, so it has no
-                # tools to index (and loading it here, with no user, is refused).
+                # An admin-only API loads only for an admin's turn (#918), and
+                # this pass may have no user at all. Its tools are indexed by
+                # the top-up of a turn that loaded it; counting it as
+                # discovered here drops its rows, so a tool it no longer has
+                # does not stay in the index. An admin's next turn puts the
+                # live ones back, as a satellite's does for the timer tools.
+                registered_apis = llm.async_get_apis(self.hass)
                 all_available_api_ids = [
-                    api.id
-                    for api in llm.async_get_apis(self.hass)
-                    if llm_api_is_supported(api)
+                    api.id for api in registered_apis if not llm_api_requires_admin(api)
                 ]
+                discovered_api_ids.update(
+                    api.id for api in registered_apis if llm_api_requires_admin(api)
+                )
+                # A full pass run by an admin's turn has the API in hand:
+                # its tools are indexed in this pass, so their rows are kept
+                # and the next turn needs no top-up.
+                if llm_api is not None:
+                    for api_id, api_instance in llm_api.apis.items():
+                        if api_id not in discovered_api_ids:
+                            continue
+                        try:
+                            self._queue_api_instance_tools(
+                                api_id,
+                                api_instance,
+                                runtime_data,
+                                index_tasks,
+                                new_hashes,
+                                seen_keys,
+                                remote_judged=llm_api.remote_home_assistants,
+                            )
+                        except Exception as err:  # noqa: BLE001
+                            _LOGGER.warning(
+                                "Failed to queue tools of loaded API %s: %s",
+                                api_id,
+                                err,
+                            )
+                            # Its tools were not all read, so the rows of the
+                            # ones missed must not be dropped.
+                            discovered_api_ids.discard(api_id)
                 # 1. Index Providers
                 await self._async_discover_provider_tools(
                     llm_context,
@@ -3286,8 +3634,12 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
             # path; a hung embedding provider must not stall the voice turn.
             async with asyncio.timeout(_TOOL_INDEX_DELTA_TIMEOUT_S):
                 await gather_store_puts_in_chunks(index_tasks)
-        except Exception:
-            _LOGGER.exception("Tool index top-up write failed; retrying next turn")
+        except Exception as err:
+            if isinstance(err, EmbeddingsUnavailableError):
+                # Down, held or timed out: the chain logged why (#969).
+                _LOGGER.debug("Tool index top-up skipped; retrying next turn: %s", err)
+            else:
+                _LOGGER.exception("Tool index top-up write failed; retrying next turn")
             # Terminal sensor signal: retrieval still serves the pre-delta
             # index, so the state is "ready", not a stuck "indexing", unless
             # a build adopted during the write made that index stale.

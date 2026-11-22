@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import sys
 import types
@@ -64,6 +65,7 @@ _stub_ha_conversation()
 
 from custom_components.home_generative_agent import conversation as hga_conversation
 from custom_components.home_generative_agent.agent.helpers import chat_log_tool_result
+from custom_components.home_generative_agent.const import VOICE_TURN_PROMPT
 from custom_components.home_generative_agent.conversation import (
     _get_synthetic_rejections,
     _handle_on_chain_end,
@@ -73,6 +75,7 @@ from custom_components.home_generative_agent.conversation import (
     _sanitize_tool_result_dict,
     _stream_langgraph_to_ha,
     _voice_tool_acknowledgement,
+    _voice_turn_prompt,
     _with_tool_acknowledgement,
 )
 from custom_components.home_generative_agent.core.utils import extract_final
@@ -1013,6 +1016,39 @@ async def test_stream_drops_unclosed_think_block() -> None:
     assert streamed == "Sure. "
 
 
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        ("The user wants the light.\n</think>\n\nIt is on.",),
+        ("The user wants the light.\n</think>", "\n\nIt is ", "on."),
+        (
+            "<",
+            "/think>It is on.",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_stream_drops_reasoning_held_before_a_bare_close(
+    chunks: tuple[str, ...],
+) -> None:
+    """A bare </think> (Qwen3 templates open the tag in the prompt, #1017)."""
+    streamed = await _streamed_text(_replay(_chunked_turn(*chunks)))
+
+    assert streamed == "It is on."
+    assert streamed == extract_final("".join(chunks), collapse_whitespace=False)
+
+
+@pytest.mark.asyncio
+async def test_stream_cannot_recall_reasoning_sent_before_a_bare_close() -> None:
+    """Text already sent stays sent; the tag itself never reaches the chat_log."""
+    streamed = await _streamed_text(
+        _replay(_chunked_turn("Draft answer. ", "</think>Final answer."))
+    )
+
+    assert streamed == "Draft answer. Final answer."
+    assert "</think>" not in streamed
+
+
 @pytest.mark.asyncio
 async def test_stream_keeps_angle_brackets_that_are_not_tags() -> None:
     """A held tag prefix that never completes is released at the end of the turn."""
@@ -1170,6 +1206,42 @@ def test_acknowledgement_only_on_satellite_turns(
 
 
 @pytest.mark.parametrize(
+    ("satellite_id", "device_id", "spoken"),
+    [
+        ("assist_satellite.voice_pe", None, True),
+        (None, "voice_device", False),
+        (None, None, False),
+    ],
+)
+def test_only_a_satellite_turn_is_told_its_reply_is_spoken(
+    satellite_id: str | None, device_id: str | None, *, spoken: bool
+) -> None:
+    """A reply ending in a question reopens a satellite's microphone (#954)."""
+    user_input = cast(
+        "Any", types.SimpleNamespace(satellite_id=satellite_id, device_id=device_id)
+    )
+
+    assert _voice_turn_prompt(user_input) == (VOICE_TURN_PROMPT if spoken else "")
+
+
+def test_the_spoken_turn_instruction_keeps_needed_questions_and_names_no_offer() -> (
+    None
+):
+    """Naming offers in the clause made a local model offer more, not less."""
+    assert "not a question, unless you need an answer" in VOICE_TURN_PROMPT
+    assert "offer" not in VOICE_TURN_PROMPT.lower()
+
+
+def test_the_spoken_turn_instruction_reaches_the_volatile_prompt() -> None:
+    """It varies by turn, so it must stay out of the cached stable prefix."""
+    src = inspect.getsource(
+        hga_conversation.HGAConversationEntity._async_handle_message_active
+    )
+    joined = src[src.index('volatile_prompt = "\\n".join(') :]
+    assert "_voice_turn_prompt(user_input)" in joined[: joined.index("base_llm")]
+
+
+@pytest.mark.parametrize(
     ("configured", "spoken"),
     [
         ("One moment", "One moment."),
@@ -1216,6 +1288,10 @@ async def test_think_filter_survives_characters_that_lengthen_when_lowered() -> 
         ("<think>x</think>Answer\n",),
         ("<thi", "nk>x</think>\n\nLine one.\n\n", "Line two.\n"),
         ("Intro ", "<think>a</think>", " middle ", "<THINK>b</think>", " end\n"),
+        # A bare </think> counts only before any <think>, and only once (#1017).
+        ("<think>a</think>x</think>y",),
+        ("a</think>b</think>c",),
+        ("plan</think>Yes. <think>more</think>Done.",),
     ],
 )
 @pytest.mark.asyncio

@@ -350,16 +350,6 @@ async def test_services_say_so_without_a_database(service: str) -> None:
         await handlers[service](call)
 
 
-async def test_memory_tools_run_without_a_database() -> None:
-    """Saving with an id, listing and forgetting do not raise on a NullStore."""
-    args = {"config": _config(limit=1), "store": hga_component.NullStore()}
-    saved = await upsert_memory.coroutine(content="x", memory_id="a", **args)  # type: ignore[misc]
-    assert saved.startswith("Stored")
-    assert "no memories" in await list_memories.coroutine(**args)  # type: ignore[misc]
-    forgot = await forget_memory.coroutine(memory_id="a", **args)  # type: ignore[misc]
-    assert "Nothing was deleted" in forgot
-
-
 async def test_a_move_onto_an_existing_id_keeps_both_memories() -> None:
     """The target's memory with the same id must not be overwritten."""
     store = InMemoryStore()
@@ -462,3 +452,42 @@ async def test_people_lists_owners_past_the_first_page_only_once() -> None:
     assert "user119" in people
     assert "Anna" not in people
     assert len(people) == len(set(people))
+
+
+async def test_memory_tools_without_a_database_say_nothing_was_kept() -> None:
+    """With no Database subentry the store keeps nothing, so no tool claims it did."""
+    store = hga_component.NullStore()
+    args = {"config": _config(), "store": store}
+
+    saved = await upsert_memory.coroutine(content="I take my coffee black", **args)  # type: ignore[misc]
+    updated = await upsert_memory.coroutine(content="x", memory_id="a", **args)  # type: ignore[misc]
+    listed = await list_memories.coroutine(**args)  # type: ignore[misc]
+    forgot = await forget_memory.coroutine(memory_id="a", **args)  # type: ignore[misc]
+
+    assert saved.startswith("Not stored.")
+    assert "Stored memory" not in saved
+    assert forgot.startswith("Nothing was deleted.")
+    assert updated.startswith("Not stored.")
+    for text in (saved, updated, listed, forgot):
+        assert "no database is set up" in text
+
+
+async def test_null_store_passes_the_tools_store_check() -> None:
+    """
+    Through LangChain, as the graph runs it, the tool itself answers (#1016).
+
+    A store that is not a BaseStore fails the tool's argument check before the
+    tool runs: calling the coroutine directly skips that check.
+    """
+    call = {
+        "name": "upsert_memory",
+        "args": {"content": "x", "store": hga_component.NullStore()},
+        "id": "c1",
+        "type": "tool_call",
+    }
+    config: Any = _config()
+
+    result = await upsert_memory.ainvoke(call, config)
+
+    # A ToolFailure comes back as itself, not wrapped in a ToolMessage.
+    assert "no database is set up" in str(result)

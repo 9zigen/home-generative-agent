@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta
 from functools import partial
@@ -64,6 +64,13 @@ from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.store.base import (
+    BaseStore,
+    ListNamespacesOp,
+    Op,
+    Result,
+    SearchOp,
+)
 from langgraph.store.postgres import AsyncPostgresStore
 from langgraph.store.postgres.base import PostgresIndexConfig
 from ollama import ResponseError as OllamaResponseError
@@ -178,6 +185,7 @@ from .const import (
     DOMAIN,
     EMBEDDING_MODEL_CTX,
     EMBEDDING_MODEL_DIMS,
+    ENROLL_ADMIN_ONLY_MESSAGE,
     FALLBACK_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
     FALLBACK_CIRCUIT_BREAKER_THRESHOLD,
     FALLBACK_CIRCUIT_BREAKER_WINDOW_SECONDS,
@@ -345,6 +353,10 @@ from .core.lifecycle import (
     async_watch_database_deletion,
     defer_start_until_hass_started,
 )
+from .core.llm_api_guard import (
+    async_clear_llm_api_issue,
+    async_sync_llm_api_issue,
+)
 from .core.memories import register_memory_services
 from .core.migrations import migrate_person_gallery
 from .core.openai_client import StatelessReasoningChatOpenAI
@@ -475,6 +487,12 @@ async def async_setup(hass: HomeAssistant, _config: ConfigType) -> bool:
     # Watches every entry of the domain, including one whose setup attempts
     # all fail and so never registers a listener of its own (#870, #883).
     async_watch_database_deletion(hass)
+    # Here and not in entry setup, so the cards load when an entry's setup
+    # fails early (database or provider unreachable). A dashboard would
+    # otherwise show "Custom element doesn't exist" with nothing in the log
+    # pointing at the cards. The enroll card's endpoint comes with them: it
+    # answers "not loaded" itself, where an unregistered route is a bare 404.
+    await _async_register_http(hass)
     return True
 
 
@@ -1538,6 +1556,47 @@ async def _async_load_frontend_cards(hass: HomeAssistant) -> None:
         add_extra_js_url(hass, f"{HGA_CARD_STATIC_PATH}/{card}?v={version}")
 
 
+async def _async_register_http(hass: HomeAssistant) -> None:
+    """
+    Register the enroll endpoint and the dashboard cards, once per run.
+
+    Called from ``async_setup``: aiohttp routes cannot be removed, so nothing
+    here may belong to one config entry. The view resolves the currently
+    loaded entry per request (see EnrollPersonView).
+
+    A failure here is logged and swallowed: a False or an exception from
+    ``async_setup`` would keep every config entry from loading, and the cards
+    are not worth the agent.
+    """
+    try:
+        hass.http.register_view(EnrollPersonView(hass))
+        www_dir = await hass.async_add_executor_job(_resolve_www_dir)
+        if www_dir is None:
+            LOGGER.warning(
+                "The dashboard card files were not found, so the HGA cards "
+                "will not load; reinstall the integration to restore them"
+            )
+            return
+        await hass.http.async_register_static_paths(
+            [
+                # Canonical prefix for all HGA frontend card modules.
+                StaticPathConfig(
+                    HGA_CARD_STATIC_PATH, str(www_dir), cache_headers=True
+                ),
+                # Backward-compatible alias for existing enroll card resources.
+                StaticPathConfig(
+                    HGA_CARD_STATIC_PATH_LEGACY, str(www_dir), cache_headers=True
+                ),
+            ]
+        )
+        await _async_load_frontend_cards(hass)
+    except Exception:
+        LOGGER.exception(
+            "Could not register the HGA dashboard cards or the enroll "
+            "endpoint; the rest of the integration is unaffected"
+        )
+
+
 def _top_p_if_set(top_p: float | None) -> dict[str, float]:
     """Return a configured top-p; without one the server keeps the model's own."""
     return {} if top_p is None else {"top_p": top_p}
@@ -1784,6 +1843,11 @@ async def _async_rebuild_tables(
         )
 
 
+# Model names that only one account can run: OpenAI fine-tunes and Gemini
+# tuned models (#1022 review).
+_ACCOUNT_MODEL_PREFIXES = ("ft:", "tunedModels/")
+
+
 class NullChat:
     """Non-throwing fallback implementing common chat model methods."""
 
@@ -1801,42 +1865,77 @@ class NullChat:
         """Return self, as tool binding is a no-op for the fallback model."""
         return self
 
-    def with_config(self, _config: Any = None, **_cfg: Any) -> NullChat:
-        """Return self, as this is a no-op."""
-        return self
+    def __init__(self, config: Mapping[str, Any] | None = None) -> None:
+        """Initialize the placeholder with the config it was given, if any."""
+        self.config: dict[str, Any] = dict(config or {})
+
+    def with_config(self, config: Any = None, **kwargs: Any) -> NullChat:
+        """
+        Return a placeholder that keeps the config, as a bound model does.
+
+        It runs nothing, but a fallback of the primary's type reads the
+        primary's model and context from it: with the primary down at setup,
+        the fallback is the one that answers (#1022).
+        """
+        new = {**dict(config or {}), **kwargs}
+        configurable = {
+            **dict(self.config.get("configurable") or {}),
+            **dict(new.get("configurable") or {}),
+        }
+        merged = {**self.config, **new}
+        if configurable:
+            merged["configurable"] = configurable
+        return NullChat(merged)
 
 
-class NullStore:
-    """Non-throwing fallback for memory store operations."""
+class NullStore(BaseStore):
+    """
+    Non-throwing fallback for memory store operations.
+
+    A `BaseStore`, because the memory tools declare `store: BaseStore` and
+    LangChain checks it: a plain object failed that check before the tool
+    ran, so with no database every memory request got a validation error
+    asking the model to call the tool again (#1016).
+    """
 
     # core.memories.store_available reads this: the memory services refuse
-    # to run on it, and the memory tools see an empty store.
+    # to run on it, and the memory tools say no database is set up.
     is_null_store = True
 
-    async def asearch(self, *_args: Any, **_kwargs: Any) -> list[Any]:
-        """Return an empty result set."""
-        return []
+    def batch(self, ops: Iterable[Op]) -> list[Result]:
+        """Answer every operation as an empty store that keeps nothing."""
+        return [
+            [] if isinstance(op, (SearchOp, ListNamespacesOp)) else None for op in ops
+        ]
 
-    async def aput(self, *_args: Any, **_kwargs: Any) -> None:
-        """No-op write."""
-        return
+    async def abatch(self, ops: Iterable[Op]) -> list[Result]:
+        """Answer every operation as an empty store that keeps nothing."""
+        return self.batch(ops)
 
-    async def aget(self, *_args: Any, **_kwargs: Any) -> None:
-        """Return no item."""
-        return
 
-    async def adelete(self, *_args: Any, **_kwargs: Any) -> None:
-        """No-op delete."""
-        return
-
-    async def alist_namespaces(self, *_args: Any, **_kwargs: Any) -> list[Any]:
-        """Return no namespaces."""
-        return []
+# How long an Ollama server may take to accept the connection (#1026). The
+# ollama client sets no timeout at all, so a server whose address takes the
+# connection attempt and never answers (a sleeping Mac behind a sleep proxy, a
+# firewall that drops packets) held each call for its whole share of the
+# budget, 90 s of a conversation turn, before the fallback was tried. 8 s lets
+# the kernel's connection retries at 1, 3 and 7 s through, which a Mac waking
+# for the request or a VPN redoing its handshake may need. Reading the reply
+# stays unlimited, bounded by the caller's budget: loading a model into memory
+# happens after the connection is open, and can take minutes.
+OLLAMA_CONNECT_TIMEOUT_S = 8.0
 
 
 def _ollama_httpx_client_kwargs() -> dict[str, Any]:
-    """Return httpx kwargs that avoid creating SSL contexts in the event loop."""
-    return {"verify": client_context(alpn_protocols=SSL_ALPN_HTTP11)}
+    """
+    Return httpx kwargs for an Ollama client.
+
+    The SSL context is built here, off the event loop. The timeout limits only
+    the connect (#1026).
+    """
+    return {
+        "verify": client_context(alpn_protocols=SSL_ALPN_HTTP11),
+        "timeout": httpx.Timeout(None, connect=OLLAMA_CONNECT_TIMEOUT_S),
+    }
 
 
 async def _async_require_admin(
@@ -4250,13 +4349,70 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
             )
         return model.with_config(config={"configurable": config})
 
+    def _with_primary_settings(
+        provider: ModelProviderConfig,
+        category: str,
+        primary: ModelProviderConfig,
+        primary_model: Any,
+    ) -> ModelProviderConfig:
+        """
+        Return the provider, filling unset settings from the primary's model.
+
+        A model provider added in the UI stores only how to reach it, so as a
+        fallback it ran the provider type's recommended model at the
+        recommended context size: a second Ollama server was asked for a model
+        it may not have, with a context that may not fit (#1022). A fallback of
+        the primary's type runs the primary's model instead, and for Ollama its
+        context size and keep-alive. Settings the provider stores itself (a
+        legacy provider's) still come first. The primary's model is read from
+        its bound config, which a placeholder for a primary down at setup
+        keeps too (`NullChat.with_config`).
+        """
+        # An OpenAI-compatible server's models are its own: another server
+        # need not serve the primary's (#1022 review).
+        if (
+            provider.provider_type != primary.provider_type
+            or provider.provider_type == "openai_compatible"
+        ):
+            return provider
+        config = getattr(primary_model, "config", None)
+        configurable = (
+            config.get("configurable") if isinstance(config, Mapping) else None
+        )
+        if not isinstance(configurable, Mapping):
+            return provider
+        inherited: dict[str, Any] = {}
+        model_name = configurable.get("model_name") or configurable.get("model")
+        # A fine-tuned OpenAI or tuned Gemini model belongs to one account, so
+        # another account keeps its recommended model (#1022 review).
+        if model_name and not str(model_name).startswith(_ACCOUNT_MODEL_PREFIXES):
+            inherited[f"{category}_model"] = model_name
+        if provider.provider_type == "ollama":
+            for key, setting in (("num_ctx", "context"), ("keep_alive", "keepalive")):
+                if configurable.get(key) is not None:
+                    inherited[f"{category}_{setting}"] = configurable[key]
+        if not inherited:
+            return provider
+        settings = provider.data.get("settings", {})
+        # Only an inherited key replaces an empty stored value; the provider's
+        # other settings stay exactly as stored.
+        merged = {
+            **settings,
+            **{k: v for k, v in inherited.items() if settings.get(k) in (None, "")},
+        }
+        return replace(provider, data={**provider.data, "settings": merged})
+
     def _configured_model_for_provider(
-        provider: ModelProviderConfig, category: str
+        provider: ModelProviderConfig,
+        category: str,
+        primary: tuple[ModelProviderConfig, Any] | None = None,
     ) -> Any:
         """Return a category-configured model instance for a fallback provider."""
         model = _model_instance_for_provider(provider)
         if model is None:
             return None
+        if primary is not None:
+            provider = _with_primary_settings(provider, category, *primary)
 
         model_name = _fallback_model_name(provider, category)
         spec = MODEL_CATEGORY_SPECS.get(category, {})
@@ -4399,7 +4555,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
             "chat",
         )
         for p in _chat_fb[1:]:
-            m = _configured_model_for_provider(p, "chat")
+            m = _configured_model_for_provider(p, "chat", (_chat_fb[0], chat_model))
             if m is not None:
                 _append_available_model(
                     _chat_chain, m, p.deployment, p.entry_id, "chat"
@@ -4428,7 +4584,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
             "vlm",
         )
         for p in _vlm_fb[1:]:
-            m = _configured_model_for_provider(p, "vlm")
+            m = _configured_model_for_provider(p, "vlm", (_vlm_fb[0], vision_model))
             if m is not None:
                 _append_available_model(_vlm_chain, m, p.deployment, p.entry_id, "vlm")
         vision_model = _finalize_model_chain(
@@ -4455,7 +4611,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
             "summarization",
         )
         for p in _sum_fb[1:]:
-            m = _configured_model_for_provider(p, "summarization")
+            m = _configured_model_for_provider(
+                p, "summarization", (_sum_fb[0], summarization_model)
+            )
             if m is not None:
                 _append_available_model(
                     _sum_chain, m, p.deployment, p.entry_id, "summarization"
@@ -4484,7 +4642,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
             "sentinel",
         )
         for p in _sent_fb[1:]:
-            m = _configured_model_for_provider(p, "sentinel")
+            m = _configured_model_for_provider(
+                p, "sentinel", (_sent_fb[0], sentinel_model)
+            )
             if m is not None:
                 _append_available_model(
                     _sent_chain, m, p.deployment, p.entry_id, "sentinel"
@@ -4743,29 +4903,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
     # Registered once per Home Assistant run: aiohttp routes cannot be removed,
     # so the view resolves the currently loaded entry per request instead of
     # pinning the one that happened to register it (see EnrollPersonView).
-    if not hass.data[DOMAIN].get("http_registered"):
-        hass.http.register_view(EnrollPersonView(hass))
-        www_dir = await hass.async_add_executor_job(_resolve_www_dir)
-        if www_dir is not None:
-            await hass.http.async_register_static_paths(
-                [
-                    # Canonical prefix for all HGA frontend card modules.
-                    StaticPathConfig(
-                        HGA_CARD_STATIC_PATH,
-                        str(www_dir),
-                        cache_headers=True,
-                    ),
-                    # Backward-compatible alias for existing enroll card resources.
-                    StaticPathConfig(
-                        HGA_CARD_STATIC_PATH_LEGACY,
-                        str(www_dir),
-                        cache_headers=True,
-                    ),
-                ]
-            )
-            await _async_load_frontend_cards(hass)
-        hass.data[DOMAIN]["http_registered"] = True
-
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     # Describe only the Ollama servers a chain uses and that answered: with a
@@ -4894,6 +5031,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
     async def _handle_enroll_person(call: ServiceCall) -> None:
         name: str = call.data["name"]
         file_path: str = call.data["file_path"]
+
+        # Like the upload endpoint: an enrolled face is trusted by
+        # recognition, so only an administrator may add one. Checked before
+        # anything else, so a refused caller learns nothing about the setup.
+        # A call with no user (an automation started by a trigger) passes, as
+        # with Home Assistant's own admin services: only an admin can write one.
+        if call.context.user_id:
+            user = await hass.auth.async_get_user(call.context.user_id)
+            if user is None or not user.is_admin:
+                raise HomeAssistantError(ENROLL_ADMIN_ONLY_MESSAGE)
 
         # Captured before the first await: a reload landing during the media
         # read deletes ``entry.runtime_data`` (the service is deregistered on
@@ -5493,6 +5640,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
         entry.entry_id,
         database_missing=db_uri is None and bool(providers),
     )
+    # Same placement: a selection holding only APIs the agent skips (the
+    # admin-only "Home Assistant" API) fails every turn, and an install that
+    # saved one before the Options form refused it (#998) has no other notice
+    # (#1037). An options save reloads the entry, which re-checks it.
+    async_sync_llm_api_issue(hass, entry.entry_id, options)
 
     # Same placement. Checked off the setup path: a model listing and a size
     # request per server that just answered its health check, plus one read of
@@ -5759,6 +5911,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool
     # (a disable would otherwise leave it standing); the next successful
     # setup re-raises it if the database is still missing.
     async_clear_database_issue(hass, entry.entry_id)
+    async_clear_llm_api_issue(hass, entry.entry_id)
     async_clear_ollama_embedding_model_issue(hass, entry.entry_id)
     async_clear_embedding_size_issue(hass, entry.entry_id)
     # Same for the left-out and the held embedding fallbacks: setup re-syncs
@@ -5786,6 +5939,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> None
     would otherwise leave the old ones standing until a restart.
     """
     async_clear_database_issue(hass, entry.entry_id)
+    async_clear_llm_api_issue(hass, entry.entry_id)
     async_clear_ollama_embedding_model_issue(hass, entry.entry_id)
     async_clear_embedding_size_issue(hass, entry.entry_id)
     async_clear_other_model_fallback_issue(hass, entry.entry_id)
@@ -5805,11 +5959,16 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
     - v3 -> v4: move model settings into feature subentries and trim options.
     - v4 -> v5: move sentinel settings into a sentinel subentry.
     - v5 -> v6: store CONF_LLM_HASS_API as a list.
-    - v6.1 -> v6.2: write the Assist default where CONF_LLM_HASS_API is absent
-      or empty, warning when it replaces a stored empty choice.
+    - v6.1 -> v6.2: make entry.options name the CONF_LLM_HASS_API selection
+      that runs: copy one held only in entry.data, restore one an older
+      v5 -> v6 step masked with [], and write the Assist default where none
+      is named, warning when it replaces a stored empty choice.
     """
     current_version = config_entry.version or 1
     current_minor = config_entry.minor_version or 1
+    # A pre-v6 "none" seen by the v5 -> v6 step is a known No control choice;
+    # the v6.2 step must not restore a data selection over it.
+    explicit_no_control = False
     new_data = dict(config_entry.data)
     new_options = dict(config_entry.options)
     merged_options = {**new_data, **new_options}
@@ -6155,7 +6314,11 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
         # v5 -> v6: normalize CONF_LLM_HASS_API from a string to a list.
         # "none" sentinel and absent key both become [] (no APIs); the v6.2
         # step below then replaces that [] with the Assist default (#949).
-        api_val = new_options.get(CONF_LLM_HASS_API)
+        # Runtime lays entry.options over entry.data, so read the selection
+        # the same way: an options [] written for a key held only in data
+        # would mask that selection (issue #998).
+        api_val = {**new_data, **new_options}.get(CONF_LLM_HASS_API)
+        explicit_no_control = api_val == "none"
         if isinstance(api_val, str):
             new_options[CONF_LLM_HASS_API] = [] if api_val == "none" else [api_val]
         elif api_val is None:
@@ -6167,29 +6330,55 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
     # v6.1 -> v6.2: an absent CONF_LLM_HASS_API meant "the Assist default",
     # because the options flow deleted the key when the user deselected every
     # API, and a stored [] failed every conversation with "No LLM APIs could
-    # be loaded" (issue #949). Both become the Assist default that the absent
-    # key was already running, and the form now refuses an empty selection,
-    # so the key always names what runs. A minor bump, so an older release
-    # still loads the entry.
+    # be loaded" (issue #949). Where neither options nor data names an API,
+    # both become the Assist default that the absent key was already running;
+    # a selection held in data is copied into options or restored over a
+    # masking [] (issue #998). The form now refuses an empty selection, so
+    # the key always names what runs. A minor bump, so an older release still
+    # loads the entry.
     if (current_version, current_minor) < (
         CONFIG_ENTRY_VERSION,
         CONFIG_ENTRY_MINOR_VERSION,
-    ) and not normalize_llm_api_value(
+    ):
         # Runtime options lay entry.options over entry.data, so a selection
         # still in data is the one that runs.
-        {**new_data, **new_options}.get(CONF_LLM_HASS_API)
-    ):
-        if CONF_LLM_HASS_API in new_options:
-            # A stored empty choice, including a pre-v6 "No control": the
-            # user turned control off, so say it is back on.
-            LOGGER.warning(
-                "Home Assistant control (LLM API) was turned off for %s, "
-                "which failed every conversation; it is now set to Assist. "
-                "Choose the LLM APIs the agent may use under Control Home "
-                "Assistant in the options (issue #949)",
+        # A pre-v6 "none" is the No control choice, not an API id.
+        merged = {**new_data, **new_options}
+        merged_val = merged.get(CONF_LLM_HASS_API)
+        running_apis = (
+            [] if merged_val == "none" else normalize_llm_api_value(merged_val)
+        )
+        data_val = new_data.get(CONF_LLM_HASS_API)
+        data_apis = [] if data_val == "none" else normalize_llm_api_value(data_val)
+        if not running_apis and data_apis and not explicit_no_control:
+            # The pre-v6.2 v5 -> v6 step read options alone and wrote [] there,
+            # masking a selection held in data; restore what the user picked
+            # rather than Assist and a "turned off" warning (issue #998).
+            LOGGER.info(
+                "Restored the LLM API selection %s held in the data of %s, "
+                "which an earlier upgrade had hidden behind an empty one",
+                data_apis,
                 config_entry.title,
             )
-        new_options[CONF_LLM_HASS_API] = [llm.LLM_API_ASSIST]
+            new_options[CONF_LLM_HASS_API] = data_apis
+        elif not running_apis:
+            if CONF_LLM_HASS_API in merged:
+                # A stored empty choice, in options or data, including a
+                # pre-v6 "No control": the user turned control off, so say
+                # it is back on.
+                LOGGER.warning(
+                    "Home Assistant control (LLM API) was turned off for %s, "
+                    "which failed every conversation; it is now set to Assist. "
+                    "Choose the LLM APIs the agent may use under Control Home "
+                    "Assistant in the options (issue #949)",
+                    config_entry.title,
+                )
+            new_options[CONF_LLM_HASS_API] = [llm.LLM_API_ASSIST]
+        elif CONF_LLM_HASS_API not in new_options:
+            # The options form reads entry.options alone, so it would show
+            # the Assist default and its next save would write that over the
+            # selection held in data (issue #998).
+            new_options[CONF_LLM_HASS_API] = running_apis
 
     if (config_entry.version, config_entry.minor_version) < (
         CONFIG_ENTRY_VERSION,

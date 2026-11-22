@@ -149,6 +149,7 @@
             "extra_body": "Extra request body (JSON, optional)"
           },
           "data_description": {
+            "prompt": "Vocabulary hints sent with the audio, such as names the model gets wrong. Whether it has any effect depends on the server. OpenAI uses it. Some OpenAI-compatible servers accept it and ignore it (OpenRouter does), and the JSON request format, offered for OpenAI-compatible servers, does not send it. No error is shown when it is ignored.",
             "request_format": "How the audio is sent. Multipart upload is OpenAI's own shape and works everywhere. JSON with base64 audio is OpenRouter's native transcription shape - pick it only if your server documents it. It has no translations endpoint and ignores the Prompt field above.",
             "extra_body": "A JSON object merged into the request body, for fields HGA does not expose. On OpenRouter this is where provider options such as keyword biasing go, and those need the JSON request format. See the STT section of the documentation for a worked example. Leave blank if unsure."
           }
@@ -541,6 +542,7 @@
       "cannot_connect": "Can't reach the service. Check keys/URLs and try again.",
       "invalid_pin": "PIN must be 4-10 digits.",
       "llm_api_required": "Select at least one API. The agent needs an LLM API to answer.",
+      "llm_api_admin_only": "Every selected API is for admin users only, so a voice satellite or a user who is not an admin would get no answer. Select Assist or another API as well.",
       "pin_required": "Enter a PIN, or turn off the critical action PIN.",
       "tool_excluded_and_included": "A tool cannot be both excluded and always included. Remove it from one of the two lists.",
       "unknown": "Unexpected error."
@@ -612,6 +614,10 @@
     "embedding_fallback_held_no_reference": {
       "title": "Embedding fallback {providers} has no build to be compared with",
       "description": "Home Generative Agent can't compare the build of **{model}** the embedding fallback **{providers}** holds with the memory store's: the build the primary **{primary}** serves is unknown (it was down at startup, or its server doesn't name its weights in `/api/show`), and the store's record names no build the fallback's matches. A fallback of another build would mix models in the memory store, so this one stays held: while the primary is down, saving memories and camera captions fails, and memory search falls back to recent memories.\n\nTo use it, pull the same build on both servers (for example run `ollama pull {model}` on each), use servers that name their weights (a plain Ollama server does), and reload Home Generative Agent once the primary is back. If the primary answered at startup, its build is read again every 5 minutes, and the fallback is checked as soon as it is read; this issue then clears."
+    },
+    "llm_api_admin_only_selection": {
+      "title": "The agent's selected LLM APIs load for admin users only",
+      "description": "The **Control Home Assistant** selection holds only {apis}, which Home Assistant loads only for a conversation started by an admin user. A voice satellite, an automation, or a user who is not an admin gets \"No LLM APIs could be loaded\".\n\nTo fix it, open **Settings → Devices & services → Home Generative Agent → Configure** and also select **Assist** or another API under **Control Home Assistant**. This issue clears when the entry reloads with a selection every conversation can load."
     }
   }
 }

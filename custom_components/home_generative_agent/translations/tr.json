@@ -135,6 +135,7 @@
             "extra_body": "Ek istek gövdesi (JSON, isteğe bağlı)"
           },
           "data_description": {
+            "prompt": "Sesle birlikte gönderilen sözcük ipuçları, örneğin modelin yanlış yazdığı adlar. Etkisinin olup olmayacağı sunucuya bağlıdır. OpenAI bunu kullanır. Bazı OpenAI uyumlu sunucular kabul edip yok sayar (OpenRouter böyledir) ve OpenAI uyumlu sunucular için sunulan JSON istek biçimi bunu göndermez. Yok sayıldığında hata gösterilmez.",
             "request_format": "Sesin nasıl gönderileceği. Multipart yükleme OpenAI'nin kendi biçimidir ve her yerde çalışır. base64 sesli JSON, OpenRouter'ın yerel deşifre biçimidir - yalnızca sunucunuz bunu belgeliyorsa seçin. Çeviri uç noktası yoktur ve yukarıdaki İstem alanını yok sayar.",
             "extra_body": "HGA'nın sunmadığı alanlar için istek gövdesine eklenen bir JSON nesnesi. OpenRouter'da anahtar sözcük önceliklendirme gibi sağlayıcı seçenekleri buraya yazılır ve bunlar JSON istek biçimini gerektirir. Örnek için belgelerdeki STT bölümüne bakın. Emin değilseniz boş bırakın."
           }
@@ -459,6 +460,7 @@
       "cannot_connect": "Servise ulaşılamıyor. Anahtarları/URL'leri kontrol edip tekrar deneyin.",
       "invalid_pin": "PIN 4-10 rakam olmalıdır.",
       "llm_api_required": "En az bir API seçin. Ajanın yanıt verebilmesi için bir LLM API'si gerekir.",
+      "llm_api_admin_only": "Seçilen tüm API'ler yalnızca yönetici kullanıcılar içindir; bu yüzden bir sesli uydu veya yönetici olmayan bir kullanıcı yanıt alamaz. Assist'i veya başka bir API'yi de seçin.",
       "pin_required": "Bir PIN girin veya kritik işlem PIN'ini kapatın.",
       "tool_excluded_and_included": "Bir araç aynı anda hem hariç tutulan hem de her zaman dahil edilen olamaz. Aracı iki listeden birinden kaldırın.",
       "unknown": "Beklenmeyen hata."
