@@ -293,8 +293,8 @@ from .core.database_guard import (
     async_clear_database_issue,
     async_ensure_pgvector,
     async_sync_database_issue,
-    database_unreachable,
-    is_connection_failure,
+    database_retry_error,
+    is_setup_retryable,
 )
 from .core.db_utils import db_client_keepalives, parse_postgres_uri
 from .core.embedding_model_guard import (
@@ -926,8 +926,9 @@ def _is_battery_like_state(entity_id: str, state: Any) -> bool:
     state (red-team review): a battery device_class or a percent unit
     (excluding percent sensors of another declared class, e.g. humidity),
     or a legacy English "battery" ID token. The state must also be numeric
-    or transiently unavailable — a text state would permanently deadlock
-    the all-of low_battery_sensors evaluator.
+    or transiently unavailable — the low_battery_sensors evaluator skips
+    a state it cannot read as a number, so a sensor with a text state
+    would be listed in the rule and never checked.
     """
     attributes = getattr(state, "attributes", {}) or {}
     device_class = attributes.get("device_class")
@@ -968,8 +969,8 @@ async def _validate_low_battery_params(
     Battery sensor IDs can come from the locale fallback, which promotes an
     unnamed sensor.* evidence ID on text signals alone — evidence paths are
     LLM output, so a hallucinated or paraphrased ID would register a
-    low_battery_sensors rule whose all-of numeric evaluator silently never
-    fires while its semantic key suppresses re-proposals (same
+    low_battery_sensors rule that never fires (the evaluator needs a state
+    for every listed sensor) while its semantic key suppresses re-proposals (same
     permanent-monitoring-gap class as the #518 motion validation). Resolves
     against live states, drops unknown IDs, and returns an error response
     (second element) when no usable battery sensor remains.
@@ -1013,7 +1014,7 @@ async def _validate_low_battery_params(
             # the locale fallback cannot recognize e.g. a Czech
             # voltage/temperature sensor, and registering one would
             # false-fire the percent-threshold evaluator every cycle
-            # (3.1 V <= 40) or deadlock it on a non-numeric state.
+            # (3.1 V <= 40), or sit in it unread with a non-numeric state.
             # This live-state gate is the authoritative filter.
             implausible_battery_ids.append(entity_id)
     if not resolved_battery_ids:
@@ -1814,8 +1815,9 @@ async def _async_rebuild_tables(
     A setup that fails is logged and the next one still runs, so a store that
     cannot be rebuilt (a vector size its index cannot hold) does not keep the
     checkpointer's tables from coming back, and the integration still loads:
-    a missing table only ever failed the writes to it. A lost connection is
-    raised, for setup's retry.
+    a missing table only ever failed the writes to it. A lost connection, or
+    a server that cannot open an extension library, is raised for setup's
+    retry.
     """
     names = tuple(name for record in records for name in MIGRATION_RECORDS[record])
     steps: tuple[Callable[[], Awaitable[None]], ...] = (
@@ -1826,7 +1828,7 @@ async def _async_rebuild_tables(
         try:
             await step()
         except psycopg.Error as err:
-            if is_connection_failure(err):
+            if is_setup_retryable(err):
                 raise
             LOGGER.error(  # noqa: TRY400
                 "Could not create memory store tables again, so writes to them "
@@ -3675,9 +3677,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
             try:
                 await migrate_person_gallery(pool)
             except Exception as err:
-                # A lost connection is retried below; logging it here would
-                # read as a migration bug.
-                if not is_connection_failure(err):
+                # A lost connection or a missing extension library is retried
+                # below; logging it here would read as a migration bug.
+                if not is_setup_retryable(err):
                     LOGGER.exception("Error migrating person_gallery database schema.")
                 raise
 
@@ -3722,9 +3724,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
             if isinstance(err, ConfigEntryError):
                 raise
             # The database went away after the preflight connect (a restart
-            # mid-setup): retry, as for one that was down from the start.
-            if is_connection_failure(err):
-                raise database_unreachable(err) from err
+            # mid-setup), or the server cannot open an extension library
+            # (pgvector's library removed by an upgrade, #1071): retry, as
+            # for a database that was down from the start.
+            if is_setup_retryable(err):
+                raise database_retry_error(err) from err
             LOGGER.exception("Postgresql setup failed; pool closed.")
             return False
     else:

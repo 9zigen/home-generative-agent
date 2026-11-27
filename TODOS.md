@@ -2,6 +2,18 @@
 
 ## Agent
 
+### A timer that carries a PIN-approved command can be changed without the PIN
+
+**What:** After the PIN approves a timer's `conversation_command` (#1087), `HassDecreaseTimer`, `HassUnpauseTimer`, `HassCancelTimer` and `HassCancelAllTimers` still pass the gate: they are in `READ_ONLY_INTENTS` (`agent/helpers.py`). A later turn can bring the approved command forward to a time the user did not approve (decrease, unpause), or drop a protective one ("lock the front door in 10 minutes") without asking.
+
+**Why:** Claude adversarial pass, pass 3 of the #1087 review (2026-11-26). Lindo chose to show the delay in the PIN line in #1087 and leave this as a follow-up. Related coupling from the same review: the hold assumes the command runs past this gate because `LLMContext` (`conversation.py`, `_async_handle_message`) sets no `agent_id`. Setting one makes HA 2026.12 offer `intent__schedule_command` and run the command on this agent, in a new conversation with nobody to answer a second PIN prompt, so the approved command would be parked and never run.
+
+**How to apply:** In `_is_critical_action`, for those four intents, find the targeted timers through HA's `TimerManager` (`hass.data[TIMER_DATA]`, matched by device id and name as `_find_timer` does) and hold when any carries a `conversation_command`. Before anyone sets `agent_id`, decide how a delayed command that comes back to this agent is handled (carry the approval with it, or refuse it).
+
+**Effort:** M
+**Priority:** P2
+**Depends on:** None
+
 ### An always-included short name is not checked against exclusions after the lookup
 
 **What:** `_append_included_tools` (`agent/graph.py`) runs `is_tool_excluded` on the stored name only. A stored `HassTurnOff` with `intent__HassTurnOff` excluded skips that tool only because the live tool list and the fallback set were stripped of exclusions earlier; the fetched tool's own name is never checked. The other force-injection site checks the fetched name.
@@ -139,6 +151,34 @@
 **Why:** Fourth review pass of PR #769, third cycle (2026-10-15), security specialist.
 
 **How to apply:** Log the error type and a redacted message (strip query strings, `token=`, `Bearer`), with the traceback at DEBUG only.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** None
+
+---
+
+### A failed PIN-confirmed MCP call hands the model the whole MCP wrapper
+
+**What:** When a tool reached over MCP fails after a PIN (the MCP error flag, or its own failure report, #1067), `_execute_pending_action` (`agent/tools.py`) puts `parse_tool_response`'s content into the `action_execute_failed` line. That content is the whole MCP result re-encoded: `{"content": [{"type": "text", "text": "{\"success\": false…"}], "isError": false}`. The model reads doubly escaped JSON with a literal `"isError": false` beside "failed", and the remote server's text sits unbounded inside a fixed instruction line.
+
+**Why:** PR for #1067, gstack review (2026-11-26), Claude adversarial pass. Not new with that PR: the `isError: true` branch has done the same since #1007.
+
+**How to apply:** Pass the text of the item that reported the failure, bounded and run through `sanitize_tool_text`, as `err`. Keep the full result out of the fixed line.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** None
+
+---
+
+### MCP failure reports in other shapes still read as done
+
+**What:** `_mcp_reports_failure` (`agent/helpers.py`, #1067) reads a JSON object in a text item. A tool's failure still reads as done when it comes as `structuredContent` with non-JSON text, as doubly encoded JSON, inside a Markdown code fence, as a top-level list, nested under another key, as `"success": "false"`, or as `"errors": [...]`. So does text that starts with a byte order mark, a JSON object followed by prose, a failure inside a `resource` item, and a `status` of `"Error"` in another case. An action intent whose `response_type` is written with a JSON escape is not read as an intent either (#1007). In the other direction, a result whose items disagree (one says `success: true`, another reports an error) reads as wholly failed, though part of it acted. `loads_or_none` does not catch `MemoryError`, and `_run_ha_tool` calls `parse_tool_response` outside its `try`. A self-reported failure after a PIN also gets the same "can ask again" line as any failed call, though another server's `success: false` does not prove nothing acted.
+
+**Why:** PR for #1067, gstack review (2026-11-26), Claude adversarial pass and Codex, second and third cycles. None is a regression; each needs a server other than Home Assistant, whose own tools send a boolean `success`.
+
+**How to apply:** Read `structuredContent` first when it is an object (newer MCP servers send it). Leave the rest until a user reports a tool that uses one. For the PIN line, consider a reply without "ask again" for a self-reported failure.
 
 **Effort:** S
 **Priority:** P3
@@ -1240,15 +1280,29 @@ Since step 6 this also covers `radio_new_device_joined`, and since step 7 `netwo
 
 ---
 
-### Autonomy level is captured before the triage await and reused after it
+### An automatic action is judged on the run's snapshot, which can be minutes old
 
-**What:** `_dispatch_item` computes `effective_autonomy` at `sentinel/engine.py:1672`, then awaits `self._triage_service.triage(...)`, then passes that captured value into `self._execution_service.evaluate_canary(finding, snapshot, effective_autonomy, now)`. `now` is stale across the same await. Lowering the autonomy level -- or a temporary elevated level expiring -- while the model call is in flight still authorizes execution at the old level. The configurable triage timeout makes the window up to 120 seconds wide.
+**What:** A Sentinel run dispatches its findings one after another with one `snapshot` and one `now` (`sentinel/engine.py`, the dispatch loop in `_run_once`). Earlier findings in the run can each wait on triage, an explanation and the notifier. A later finding that carries an action is then approved by `evaluate_canary` on a condition, and a data-quality age, read when the run began. Only the action's targets are re-read live (`_unavailable_targets`, `_not_callable_now`). The autonomy level is no longer part of this: it is read with no wait before the gate and again before each call.
 
-**Why:** Codex adversarial pass, 2026-09-22; mechanically confirmed. Codex rated it P1; downgraded here because auto-execution additionally requires autonomy >= 2 (`_MIN_AUTO_EXECUTE_LEVEL`) *and* a non-empty `sentinel_auto_execute_allowed_services`, which defaults to `[]` meaning no service may be invoked at all. Note the window is *created* by triage: without it there is no await between the capture and the use.
+**Why:** Claude adversarial pass on the #789 gate rework, 2026-11-22. Latent: automatic actions are forced off and no rule builds an action. It replaces the entry "Autonomy level is captured before the triage await", whose level half that PR closed.
 
-**How to apply:** Re-read the autonomy level (and `now`) immediately before the execution-policy evaluation rather than reusing the pre-triage capture. Keep the captured value for the audit record, which should reflect the level the triage decision was made under.
+**How to apply:** Dispatch findings that carry actions before the others, or have the rule that builds an action re-check its condition against live state right before `_auto_execute` (the plug rule can re-read presence and the plug). Do this before live execution is offered (#789 step 4).
 
 **Effort:** S
+**Priority:** P2
+**Depends on:** None
+
+---
+
+### Sentinel's action gate passes its Home Assistant checks when built without `hass`
+
+**What:** `SentinelExecutionService(options)` with no `hass` skips the relay floor (`_relay_reason` returns None), `_unavailable_targets`, the entity expansion of the PIN rules and `stored_action_calls`. The engine always passes `hass` (`sentinel/engine.py`, the constructor), so only tests build it this way, and many of them assert `auto_execute` from it.
+
+**Why:** Security specialist on the #789 gate rework, 2026-11-22. A gate that says yes when it cannot look is the wrong default for a future caller.
+
+**How to apply:** Make `hass` a required argument and refuse in `_critical_reason` when it is None; give the tests in `test_execution_service.py` and `test_sentinel_autonomy_settings.py` that expect an approval a `hass` with states for their targets.
+
+**Effort:** S-M (about 30 test call sites)
 **Priority:** P3
 **Depends on:** None
 
@@ -1571,13 +1625,13 @@ That satisfies all three cases at once: different devices with identical prose s
 
 ---
 
-### Bucket volatile readings out of the low_battery_sensors anomaly-id hash
+### Reject out-of-range low_battery_sensors readings, and non-finite ones at approval
 
-**What:** `_eval_low_battery_sensors` (dynamic_rules.py) puts float `sensor_levels` into finding evidence, and `build_anomaly_id` hashes evidence — so every reading change mints a new anomaly_id, and the notifier's per-finding cooldown (keyed by anomaly_id) never suppresses repeats as a draining battery drifts through the threshold (39, 38, 37 → three distinct anomaly ids). The suppression layer's per-type cooldown limits real-world impact for slow percent drift, but a jittering promoted sensor would notify every cycle.
+**What:** The approval gate `_is_battery_like_state` (`__init__.py`) takes anything `float()` accepts as a battery reading, `nan` and `inf` included. The evaluator skips a non-finite reading and names it in the #1082 warning after a day, but still takes an out-of-range one: `1e3` reads as above the threshold, and negative readings fire. The rule's `threshold` has the same gap in `_coerce_float`: `nan` means the rule never fires, `inf` means every sensor always fires.
 
-**Why:** Red-team finding during the issue #522 ship (2026-08-01). NOT fixed in that PR deliberately: changing evidence hashing changes anomaly IDs for all existing low_battery rules, breaking snooze continuity and audit linkage on existing installs (the evidence-key-order-is-anomaly-id pitfall) — needs its own migration-aware PR. The #522 approval-time battery plausibility gate (`_is_battery_like_state`) removes the pathological wrongly-promoted-sensor case.
+**Why:** Adversarial review of the #1064 PR (#1081, 2026-11-26). Older than that change and not fixed there. No sensor is known to report these; the approval gate's battery plausibility check (#522) makes a wrongly promoted sensor unlikely.
 
-**How to apply:** Floor `sensor_levels` to 5% buckets (or exclude levels/states from the hashed evidence and carry them in a non-hashed field, mirroring the friendly_name exclusion in `_build_finding`), with a migration note that pre-existing anomaly ids for low-battery findings change once.
+**How to apply:** In the approval gate, require `math.isfinite`; in both, treat a reading outside 0-100 as unreadable, as for a non-numeric state. Clamp or reject a non-finite threshold when the rule is registered. (Non-finite readings in the evaluator: done in the #1082 PR.)
 
 **Effort:** S
 **Priority:** P3

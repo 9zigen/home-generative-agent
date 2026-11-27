@@ -2258,8 +2258,8 @@ def _mcp_text_json(response: Any) -> Any | None:
     if not isinstance(item, dict) or item.get("type") != "text":
         return None
     text = item.get("text")
-    # Only an intent response is read, so a large result (a remote
-    # GetLiveContext) is not decoded on every call.
+    # Only an intent response is read here, so other text is not decoded a
+    # second time: `_mcp_reports_failure` reads every item (#1067).
     if not isinstance(text, str) or '"action_done"' not in text:
         return None
     decoded = loads_or_none(text)
@@ -2269,6 +2269,59 @@ def _mcp_text_json(response: Any) -> Any | None:
     except (ValueError, RecursionError):
         return None
     return decoded
+
+
+def _reports_failure(result: dict[str, Any]) -> bool:
+    """
+    Return True when a tool's own JSON object says the call failed.
+
+    ``success`` decides when it is a boolean, so a call that says it worked
+    is never read as failed for a note it carries beside that (#1067 review).
+    Without it, a non-empty ``error`` or a ``status`` of "error" counts. A
+    ``warning`` does not: on another server's tool it need not mean the call
+    did not act, and a call wrongly read as failed invites a repeat.
+    """
+    success = result.get("success")
+    if isinstance(success, bool):
+        return not success
+    return bool(result.get("error")) or result.get("status") == "error"
+
+
+def _mcp_reports_failure(response: dict[str, Any]) -> bool:
+    """
+    Return True when an MCP tool's text says the call failed (#1067).
+
+    A tool reached over MCP (a remote Home Assistant's GetLiveContext or
+    script, any MCP server's tool) can answer ``{"success": false, "error":
+    "..."}`` as text with the MCP error flag unset. Every text item is read,
+    whatever its length: a failure can come with a second item, or with a
+    long error. Only a JSON object counts: plain text that mentions an error
+    does not.
+
+    Home Assistant hands on no mark of where a result came from, so an MCP
+    result is told by its shape: a ``content`` list and no ``success`` of its
+    own, which an MCP result never has. A result with one is the tool's own
+    answer, and text it carries is its data (#1067 review). Nor is an intent
+    response read here, as the result itself or as any of its items: an
+    action intent's devices are read by `intent_results`, and one that acted
+    on some of them must stay a partial run, never a failure to try again.
+    """
+    content = response.get("content")
+    if not isinstance(content, list) or "success" in response:
+        return False
+    if "response_type" in response:
+        return False
+    reports = []
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") != "text":
+            continue
+        text = item.get("text")
+        inner = loads_or_none(text) if isinstance(text, str) else None
+        if isinstance(inner, dict):
+            if "response_type" in inner:
+                return False
+            reports.append(inner)
+    return any(_reports_failure(report) for report in reports)
 
 
 def _action_intent_response(response: Any) -> tuple[dict[str, Any], bool] | None:
@@ -2399,8 +2452,10 @@ def parse_tool_response(
     Return (content, status) from a tool response.
 
     Shared by the normal tool path and the PIN confirmation, so a tool that
-    reports failure in its payload (`success: false`, a `warning`, an alarm
-    that did not change state) reads as a failure on both. An action intent
+    reports failure in its payload (`success: false`, a non-empty `error` or
+    `status: "error"` with no `success`, a `warning`, an alarm that did not
+    change state) reads as a failure on both. So does a tool
+    reached over MCP that reports it inside its text (#1067). An action intent
     that acted on some devices only (``data.failed``) reads as
     TOOL_STATUS_PARTIAL, and one where no device acted as a failure, each with
     a note listing what failed (#948).
@@ -2421,9 +2476,13 @@ def parse_tool_response(
     # its error flag in it, not as ToolResult.error (#1007 review).
     if parsed.get("isError") is True and isinstance(parsed.get("content"), list):
         return content_str, "error"
+    # A tool reached over MCP that reports its own failure in its text, with
+    # the error flag unset (#1067). The text stays as it came: the model
+    # reads the tool's own words, and only the status is ours.
+    if _mcp_reports_failure(parsed):
+        return content_str, "error"
 
     warning = parsed.get("warning")
-    success_val = parsed.get("success", True)
     result_text = (
         parsed.get("result_text") or parsed.get("response") or parsed.get("result")
     )
@@ -2437,9 +2496,15 @@ def parse_tool_response(
     if warning:
         status = "error"
         content_str = str(result_text or warning)
-    elif success_val is False:
+    elif _reports_failure(parsed):
+        # The rule the MCP text follows (#1067), so a local tool answering
+        # only {"error": "..."} is a failure too, not "PIN accepted" (#1078).
+        # Home Assistant's own tools that set error set its error flag too.
         status = "error"
-        content_str = str(result_text or "Action failed.")
+        if parsed.get("success") is False:
+            content_str = str(result_text or "Action failed.")
+        # Otherwise the tool's own JSON stays as it came, as for MCP text: a
+        # "result" or "message" beside the error must not hide the failure.
     elif is_alarm:
         if "arm" in service and inferred_state not in {
             "armed",
@@ -2909,6 +2974,86 @@ def intent_service_calls(
         for state in states
         for call in _intent_calls(tool_name, state.domain, state.entity_id)
     ]
+
+
+# A timer's slot holding a command the timer runs when it finishes.
+START_TIMER_INTENT = "HassStartTimer"
+TIMER_COMMAND_SLOT = "conversation_command"
+# Home Assistant 2026.12's tool that runs a command after a delay, and the
+# namespace Home Assistant gives it.
+SCHEDULE_COMMAND_TOOL = "schedule_command"
+SCHEDULE_COMMAND_ARG = "command"
+_INTENT_NAMESPACE = "intent"
+
+
+def runs_a_command_later(tool_name: str, tool_args: dict[str, Any]) -> bool:
+    """
+    Return True if the call leaves a command for Home Assistant to run later.
+
+    Home Assistant runs it as a new conversation when the delay ends, on the
+    agent the request named. This integration names none, so the command runs
+    on Home Assistant's own agent, which this gate never sees. Its words cannot
+    be read for what they will do.
+
+    Only Home Assistant's own scheduled-command tool counts (`intent__...`,
+    with a remote server's prefix or not): a user's script or another server's
+    tool sharing the last part of its name is read as itself. A timer's
+    command counts whatever its value: Home Assistant runs 0 or False as the
+    text "0" or "False".
+    """
+    parts = tool_name.split(TOOL_NAMESPACE_SEP)
+    if parts[-1] == SCHEDULE_COMMAND_TOOL:
+        return len(parts) > 1 and parts[-2] == _INTENT_NAMESPACE
+    # A timer's tool is named bare (before 2026.9) or in the intent namespace;
+    # an intent script of that name is read by what it runs.
+    return (
+        parts[-1] == START_TIMER_INTENT
+        and (len(parts) == 1 or parts[-2] == _INTENT_NAMESPACE)
+        and bool(delayed_command_text(tool_name, tool_args))
+    )
+
+
+def delayed_command_text(tool_name: str, tool_args: dict[str, Any]) -> str:
+    """Return the command a timer or scheduled command would run, or ""."""
+    key = (
+        SCHEDULE_COMMAND_ARG
+        if base_tool_name(tool_name) == SCHEDULE_COMMAND_TOOL
+        else TIMER_COMMAND_SLOT
+    )
+    value = tool_args.get(key)
+    return "" if value is None else str(value).strip()
+
+
+_DELAY_UNITS = (("hours", 3600), ("minutes", 60), ("seconds", 1))
+
+
+def delayed_command_delay(tool_args: dict[str, Any]) -> str:
+    """
+    Return when a delayed command runs, as H:MM:SS, or "" if it cannot be read.
+
+    The model picks the delay, so the line the PIN approves names it. Any
+    value that is not a whole number of zero or more leaves it unread.
+    """
+    total = 0
+    given = False
+    for key, seconds in _DELAY_UNITS:
+        value = tool_args.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int | str):
+            return ""
+        try:
+            amount = int(value)
+        except ValueError:
+            return ""
+        if amount < 0:
+            return ""
+        total += amount * seconds
+        given = True
+    if not given:
+        return ""
+    hours, rest = divmod(total, 3600)
+    return f"{hours}:{rest // 60:02d}:{rest % 60:02d}"
 
 
 # Intents that only read, list or time things: the gate leaves them alone.
