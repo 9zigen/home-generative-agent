@@ -30,6 +30,7 @@ from custom_components.home_generative_agent.const import (
     CONF_CRITICAL_ACTION_PIN_ENABLED,
     CONF_CRITICAL_ACTION_PIN_HASH,
     CONF_CRITICAL_ACTION_PIN_SALT,
+    CONF_CRITICAL_ACTION_SAFE_SCRIPTS,
     CONF_CRITICAL_ACTIONS,
     CONF_TOOL_EXCLUSIONS,
     CONF_TOOL_INCLUSIONS,
@@ -1078,6 +1079,8 @@ class CriticalActionPolicy(NamedTuple):
     pin_hash: str
     pin_salt: str
     critical_actions: list[dict[str, str]]
+    # Scripts the user marked safe: their own tool is not held for its steps.
+    safe_scripts: frozenset[str] = frozenset()
 
     @property
     def enforceable(self) -> bool:
@@ -1105,6 +1108,21 @@ def resolve_critical_action_policy(options: Mapping[str, Any]) -> CriticalAction
             for rule in options.get(CONF_CRITICAL_ACTIONS)
             or RECOMMENDED_CRITICAL_ACTIONS
         ],
+        safe_scripts=_safe_scripts(options.get(CONF_CRITICAL_ACTION_SAFE_SCRIPTS)),
+    )
+
+
+def _safe_scripts(value: object) -> frozenset[str]:
+    """Return the script entity ids marked safe; anything else is dropped."""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list | tuple | set | frozenset):
+        return frozenset()
+    return frozenset(
+        entity_id.strip().lower()
+        for entity_id in value
+        if isinstance(entity_id, str)
+        and entity_id.strip().lower().startswith("script.")
     )
 
 

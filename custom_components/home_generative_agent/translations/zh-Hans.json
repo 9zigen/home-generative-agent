@@ -505,6 +505,7 @@
           "max_messages_in_context": "聊天上下文最大消息数",
           "critical_action_pin_enabled": "关键操作需要 PIN",
           "critical_action_pin": "关键操作 PIN（解锁、布防或打开敏感设备时需要）",
+          "critical_action_safe_scripts": "无需 PIN 的脚本",
           "schema_first_yaml": "YAML 请求使用 schema 优先的 JSON",
           "stt_filters_section": "语音输入过滤",
           "stt_hallucination_patterns": "忽略的语音转文本子串",
@@ -537,7 +538,8 @@
           "tool_inclusions": "勾选的工具始终提供给模型：它们会在基于向量的工具检索之后追加，不受检索数量上限限制。适合网页搜索这类相似度搜索未必会选中的通用工具。是否使用仍由模型决定。同一个工具不能既被排除又被始终包含。",
           "video_analyzer_uniqueness_enabled": "在 VLM 分析之前跳过视觉上几乎相同的帧。警告：开启后会失去帧与帧之间的运动上下文，而摘要模型要靠它来描述移动。只有在静态场景产生过多重复、并且你接受可能失去运动连贯性时才开启。",
           "video_analyzer_event_recording_enabled": "当 ring-mqtt 的 event_select 实体发布带有新 eventId 的已签名 recordingUrl 时，下载该事件的 MP4，用 ffmpeg 抽取最多 8 帧并分析这些帧，而不是分析保留的定时快照——在电池供电的摄像头上，定时快照可能比事件早多达 10 分钟。需要 Ring Protect 订阅（没有 recordingUrl 的摄像头继续使用快照），以及官方 Home Assistant 镜像自带的 ffmpeg 程序。",
-          "video_analyzer_motion_camera_map": "每行一条映射：binary_sensor.X_motion: camera.Y——当自动匹配选错摄像头时使用。留空则依靠基于设备和名称的自动匹配。"
+          "video_analyzer_motion_camera_map": "每行一条映射：binary_sensor.X_motion: camera.Y——当自动匹配选错摄像头时使用。留空则依靠基于设备和名称的自动匹配。",
+          "critical_action_safe_scripts": "无论这些脚本的步骤做什么，代理都会在没有 PIN 的情况下运行它们。只选择你信任的脚本，例如把命令交给此代理稍后运行的脚本：该命令运行时会再次检查 PIN。点名该脚本的关键操作规则，或其运行触发的执行关键操作的自动化，仍会要求 PIN。"
         }
       }
     },

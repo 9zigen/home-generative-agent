@@ -565,6 +565,7 @@ The **Options** flow (gear icon on the integration page) exposes:
 - Face recognition service URL
 - Context management parameters (`max_messages_in_context`, `max_tokens_in_context`, `manage_context_with_tokens`)
 - Critical action PIN toggle and value
+- **Scripts that need no PIN** (`critical_action_safe_scripts`) — scripts the agent runs as their own tool with no PIN, whatever their steps do. For a script you trust whose steps the PIN check cannot read ahead, such as one that waits and then passes a command to this agent with `conversation.process`: that command is checked for the PIN again when it runs. A critical-action rule naming the script, or an automation its run starts that does a critical action, still asks for the PIN. Running it another way (`HassTurnOn`, `script.turn_on`) is checked as before.
 - Tool retrieval limit and relevance threshold
 - **Excluded tools** (`tool_exclusions`) — per-tool allow/deny picker across every selected LLM API, including MCP servers (see [Excluded tools](#excluded-tools))
 - **Always-included tools** (`tool_inclusions`) — tools appended after vector retrieval, on top of the retrieval limit (see [Always-included tools](#always-included-tools))

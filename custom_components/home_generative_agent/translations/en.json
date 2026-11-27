@@ -505,6 +505,7 @@
           "max_messages_in_context": "Max messages in chat context",
           "critical_action_pin_enabled": "Require critical action PIN",
           "critical_action_pin": "Critical action PIN (required to unlock/arm/open sensitive devices)",
+          "critical_action_safe_scripts": "Scripts that need no PIN",
           "schema_first_yaml": "Schema-first JSON for YAML requests",
           "stt_filters_section": "Speech input filters",
           "stt_hallucination_patterns": "Ignored STT substrings",
@@ -537,7 +538,8 @@
           "tool_inclusions": "Tools ticked here are always offered to the model: they are appended after vector-based tool retrieval, on top of the retrieval limit. Useful for general-purpose tools, such as web search, that similarity search may not select. The model still decides whether to use them. A tool cannot be both excluded and always included.",
           "video_analyzer_uniqueness_enabled": "Skip visually near-identical frames before VLM analysis. Warning: enabling this removes inter-frame motion context that the summary model uses to narrate movement. Only enable if a static scene generates excessive duplicates and you accept that motion continuity may be lost.",
           "video_analyzer_event_recording_enabled": "When a ring-mqtt event_select entity publishes a signed recordingUrl with a new eventId, download the event's MP4, extract up to 8 frames with ffmpeg and analyze those instead of the retained interval snapshot, which on battery cameras can be up to 10 minutes older than the event. Needs a Ring Protect subscription (cameras without a recordingUrl keep using snapshots) and the ffmpeg binary the official Home Assistant image ships.",
-          "video_analyzer_motion_camera_map": "One override per line: binary_sensor.X_motion: camera.Y — use this when automatic resolution picks the wrong camera. Leave blank to rely on device-based and name-based resolution."
+          "video_analyzer_motion_camera_map": "One override per line: binary_sensor.X_motion: camera.Y — use this when automatic resolution picks the wrong camera. Leave blank to rely on device-based and name-based resolution.",
+          "critical_action_safe_scripts": "The agent runs these scripts with no PIN, whatever their steps do. Pick only scripts you trust, such as one that passes a command to this agent to run later: that command is checked for the PIN again when it runs. A critical-action rule naming a script, or an automation its run starts that does a critical action, still asks for the PIN."
         }
       }
     },

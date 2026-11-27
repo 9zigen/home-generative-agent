@@ -425,6 +425,7 @@
           "max_messages_in_context": "Sohbet bağlamındaki maksimum mesaj sayısı",
           "critical_action_pin_enabled": "Kritik eylemler için PIN zorunlu",
           "critical_action_pin": "Kritik eylem PIN’i (kilit açma/kurma/açma için gerekli)",
+          "critical_action_safe_scripts": "PIN gerektirmeyen betikler",
           "schema_first_yaml": "YAML istekleri için şema-öncelikli JSON",
           "stt_filters_section": "Konuşma girişi filtreleri",
           "stt_hallucination_patterns": "Yok sayılan STT alt dizeleri",
@@ -452,7 +453,8 @@
           "tool_relevance_threshold": "Bir aracın getirilmesi için gereken minimum anlamsal benzerlik puanı (0,0 ile 1,0 arasında).",
           "tool_exclusions": "Burada işaretlenen araçlar modele hiçbir zaman sunulmaz ve adıyla istense bile hiçbir zaman çalıştırılmaz. Seçili tüm API'lerin tüm araçlarını açmak için boş bırakın. Bir sunucunun sonradan eklediği araçlar varsayılan olarak kullanılabilir.",
           "tool_inclusions": "Burada işaretlenen araçlar modele her zaman sunulur: vektör tabanlı araç aramasından sonra, arama limitinin üzerine eklenirler. Anlamsal aramanın seçmeyebileceği web araması gibi genel amaçlı araçlar için kullanışlıdır. Aracı kullanıp kullanmamaya yine model karar verir. Bir araç aynı anda hem hariç tutulan hem de her zaman dahil edilen olamaz.",
-          "tool_retrieval_limit": "Kullanıcının sorgusuna anlamsal benzerliğe göre getirilecek maksimum araç sayısı."
+          "tool_retrieval_limit": "Kullanıcının sorgusuna anlamsal benzerliğe göre getirilecek maksimum araç sayısı.",
+          "critical_action_safe_scripts": "Ajan bu betikleri, adımları ne yaparsa yapsın PIN olmadan çalıştırır. Yalnızca güvendiğiniz betikleri seçin; örneğin bir komutu daha sonra çalıştırılmak üzere bu ajana ileten bir betik: o komut çalışırken PIN için yeniden denetlenir. Betiği adlandıran bir kritik eylem kuralı veya betiğin çalışmasının başlattığı ve kritik bir eylem yapan bir otomasyon yine PIN ister."
         }
       }
     },

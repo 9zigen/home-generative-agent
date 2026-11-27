@@ -26,6 +26,7 @@ from custom_components.home_generative_agent.config_flow import (
 from custom_components.home_generative_agent.const import (
     CONF_CRITICAL_ACTION_PIN,
     CONF_CRITICAL_ACTION_PIN_ENABLED,
+    CONF_CRITICAL_ACTION_SAFE_SCRIPTS,
     CONF_SCHEMA_FIRST_YAML,
     CONF_SPEAKER_SENSORS,
     CONF_STT_HALLUCINATION_EXACT_PATTERNS,
@@ -59,7 +60,8 @@ async def test_options_schema_pin_is_directly_under_pin_switch(hass: Any) -> Non
 
     pin_switch_idx = keys.index(CONF_CRITICAL_ACTION_PIN_ENABLED)
     assert keys[pin_switch_idx + 1] == CONF_CRITICAL_ACTION_PIN
-    assert keys[pin_switch_idx + 2] == CONF_SCHEMA_FIRST_YAML
+    assert keys[pin_switch_idx + 2] == CONF_CRITICAL_ACTION_SAFE_SCRIPTS
+    assert keys[pin_switch_idx + 3] == CONF_SCHEMA_FIRST_YAML
 
 
 @pytest.mark.asyncio

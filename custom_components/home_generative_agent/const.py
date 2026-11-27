@@ -69,6 +69,8 @@ CONF_CRITICAL_ACTION_PIN = "critical_action_pin"
 CONF_CRITICAL_ACTION_PIN_HASH = "critical_action_pin_hash"
 CONF_CRITICAL_ACTION_PIN_SALT = "critical_action_pin_salt"
 CONF_CRITICAL_ACTIONS = "critical_actions"
+# Scripts whose own tool runs with no PIN: the user vouches for their steps.
+CONF_CRITICAL_ACTION_SAFE_SCRIPTS = "critical_action_safe_scripts"
 # Matched by `matches_critical_rule` (agent/helpers.py) for both direct tool
 # calls and the contents of LLM-authored automations. An `entity_match` rule
 # also fires when the call's real targets cannot be resolved at check time

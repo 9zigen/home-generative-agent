@@ -58,6 +58,7 @@ from .const import (
     CONF_CRITICAL_ACTION_PIN_ENABLED,
     CONF_CRITICAL_ACTION_PIN_HASH,
     CONF_CRITICAL_ACTION_PIN_SALT,
+    CONF_CRITICAL_ACTION_SAFE_SCRIPTS,
     CONF_FACE_API_URL,
     CONF_FACE_RECOGNITION,
     CONF_MANAGE_CONTEXT_WITH_TOKENS,
@@ -941,6 +942,15 @@ async def _schema_for_options(
 
     schema[
         vol.Optional(
+            CONF_CRITICAL_ACTION_SAFE_SCRIPTS,
+            description={
+                "suggested_value": opts.get(CONF_CRITICAL_ACTION_SAFE_SCRIPTS, [])
+            },
+        )
+    ] = EntitySelector(EntitySelectorConfig(domain="script", multiple=True))
+
+    schema[
+        vol.Optional(
             CONF_SCHEMA_FIRST_YAML,
             description={"suggested_value": opts.get(CONF_SCHEMA_FIRST_YAML, False)},
             default=opts.get(CONF_SCHEMA_FIRST_YAML, False),
@@ -1389,6 +1399,8 @@ class HomeGenerativeAgentOptionsFlow(OptionsFlowWithReload):
             options.pop(CONF_VOICE_TOOL_ACK, None)
         if not user_input.get(CONF_SPEAKER_SENSORS):
             options.pop(CONF_SPEAKER_SENSORS, None)
+        if not user_input.get(CONF_CRITICAL_ACTION_SAFE_SCRIPTS):
+            options.pop(CONF_CRITICAL_ACTION_SAFE_SCRIPTS, None)
         errors: dict[str, str] = {}
         api_err = _llm_api_selection_error(self.hass, options.get(CONF_LLM_HASS_API))
 

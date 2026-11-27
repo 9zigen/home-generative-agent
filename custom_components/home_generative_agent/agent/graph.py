@@ -576,6 +576,9 @@ def _critical_action_guard(  # noqa: PLR0913
             tool_name,
             ctx.hass,
             origin=origin,
+            safe_scripts=resolve_critical_action_policy(
+                ctx.config.get("configurable", {}).get("options") or {}
+            ).safe_scripts,
         )
     if not critical:
         return None
@@ -4522,16 +4525,21 @@ def _coerce_entity_ids(args: dict[str, Any]) -> list[str]:
     return entity_ids
 
 
-def _is_critical_action(  # noqa: PLR0911, PLR0912
+def _is_critical_action(  # noqa: PLR0911, PLR0912, PLR0913
     tool_args: dict[str, Any],
     critical_actions: list[dict[str, str]],
     tool_name: str,
     hass: HomeAssistant | None = None,
     *,
     origin: ToolOrigin | None = None,
+    safe_scripts: frozenset[str] = frozenset(),
 ) -> bool:
     """
     Return True if the call could do a critical action.
+
+    A script in ``safe_scripts`` is not held for its steps when run as its
+    own tool; a rule naming it, or an automation its run sets off, still
+    holds it.
 
     A call matching a domain/service/entity rule is critical. Beyond the
     rules: an actuating intent is checked per entity HA will act on, and
@@ -4616,12 +4624,14 @@ def _is_critical_action(  # noqa: PLR0911, PLR0912
 
     # A script's own tool names no domain or service; what it runs decides.
     if (script_id := script_tool_entity_id(tool_name)) is not None:
-        return _script_tool_is_critical(script_id, critical_actions, hass)
+        return _script_tool_is_critical(script_id, critical_actions, hass, safe_scripts)
     # A tool named like a script (HA before 2026.9 named script tools so) may
     # be that script's tool or another tool sharing its name: screen both.
     if (
         bare_script := bare_script_tool_entity_id(tool_name, hass)
-    ) is not None and _script_tool_is_critical(bare_script, critical_actions, hass):
+    ) is not None and _script_tool_is_critical(
+        bare_script, critical_actions, hass, safe_scripts
+    ):
         return True
 
     # Alarm panels already enforce their own code; never gate them with the
@@ -4820,11 +4830,25 @@ def _script_tool_is_critical(
     entity_id: str,
     critical_actions: list[dict[str, str]],
     hass: HomeAssistant | None,
+    safe_scripts: frozenset[str] = frozenset(),
 ) -> bool:
-    """Return True if a rule names the script or a step it runs is critical."""
-    return script_rule_matches(
-        hass, entity_id, critical_actions
-    ) or runs_critical_action(hass, entity_id, critical_actions)
+    """
+    Return True if a rule names the script or a step it runs is critical.
+
+    A script the user marked safe is not read for its steps: they may hand a
+    command to an agent or run another script, which cannot be read ahead.
+    What its run sets off is not the script's own steps, so an automation
+    that reacts to it is still read.
+    """
+    if script_rule_matches(hass, entity_id, critical_actions):
+        return True
+    if entity_id.lower() in safe_scripts:
+        if hass is None or getattr(hass, "data", None) is None:
+            return True  # what reacts to it cannot be read
+        return StoredActionCheck(hass, critical_actions).reactors_critical(
+            entity_id.lower()
+        )
+    return runs_critical_action(hass, entity_id, critical_actions)
 
 
 def _intent_is_critical(  # noqa: PLR0911
