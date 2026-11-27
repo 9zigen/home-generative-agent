@@ -375,6 +375,7 @@ def test_the_action_node_routes_through_after_tools() -> None:
     branch = graph_module.workflow.branches["action"]["_after_tools"]
     assert branch.ends == {
         "agent": "agent",
+        "action_done_reply": "action_done_reply",
         "summarize_and_remove_messages": "summarize_and_remove_messages",
     }
     assert ("action", "agent") not in graph_module.workflow.edges

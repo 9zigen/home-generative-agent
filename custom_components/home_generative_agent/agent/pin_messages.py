@@ -90,6 +90,9 @@ if TYPE_CHECKING:
 # wording can be tuned per-language independently.
 _MESSAGES: dict[str, dict[str, str]] = {
     "en": {
+        # Not a PIN line: the reply to a round of device actions that all
+        # succeeded, said without a second model call (graph.py).
+        "action_done": "Done.",
         "automation_pin_unset": (
             "This automation performs a critical action, but the "
             "critical-action PIN is enabled without a PIN being set, so "
@@ -255,6 +258,7 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "kind_device": "every device",
     },
     "cs": {
+        "action_done": "Hotovo.",
         "automation_pin_unset": (
             "Tato automatizace provádí kritickou akci, ale PIN pro "
             "kritické akce je povolen bez nastaveného PIN kódu, takže ji "
@@ -413,6 +417,7 @@ _MESSAGES: dict[str, dict[str, str]] = {
     # Simplified Chinese (zh-Hans); _resolve_language maps HA's zh-Hans,
     # zh-CN and zh-SG here and leaves zh-Hant on English.
     "zh": {
+        "action_done": "好了。",
         "automation_pin_unset": (
             "这个自动化会执行关键操作，但关键操作 PIN 已启用却没有设置 PIN，"
             "因此无法确认。请在集成选项中设置 PIN 后重试。"
@@ -537,6 +542,7 @@ _MESSAGES: dict[str, dict[str, str]] = {
         "kind_device": "所有设备",
     },
     "ru": {
+        "action_done": "Готово.",
         "automation_pin_unset": (
             "Эта автоматизация выполняет важное действие, но ПИН-код ещё не задан, "
             "поэтому подтвердить её нельзя. Задайте ПИН-код в настройках интеграции "

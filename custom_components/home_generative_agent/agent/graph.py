@@ -5182,7 +5182,7 @@ def _pin_line_ends_turn(msg: BaseMessage, pin_reply: PinReply | None) -> bool:
 
 def _after_tools(
     state: State, config: RunnableConfig
-) -> Literal["agent", "summarize_and_remove_messages"]:
+) -> Literal["agent", "action_done_reply", "summarize_and_remove_messages"]:
     """
     Return the next node after a tool round.
 
@@ -5195,12 +5195,64 @@ def _after_tools(
     guessed a PIN three times, spoke its prompt three times, and the turn ended
     in the round-limit apology. The turn ends here instead, and the user's next
     message is the prompt's reply.
+
+    A round of device actions that all succeeded ends the turn too, on a
+    fixed "Done." in Home Assistant's language (`_action_done_reply`): the
+    model's next call would only describe what the results already say, and
+    on a local model that call is a second wait the user hears as delay.
     """
     responses = _last_round_responses(state["messages"])
     pin_reply = config.get("configurable", {}).get("pin_reply")
     if responses and all(_pin_line_ends_turn(msg, pin_reply) for msg in responses):
         return "summarize_and_remove_messages"
+    if _round_only_acted(responses) and not _pin_line_is_the_reply(config):
+        return "action_done_reply"
     return "agent"
+
+
+def _intent_action_result(msg: ToolMessage) -> dict[str, Any] | None:
+    """Return the ``data`` of an HA intent result that acted, else None."""
+    if not isinstance(msg.content, str):
+        return None
+    data = loads_or_none(msg.content)
+    if isinstance(data, str):
+        # Encoded once more on the way (`parse_tool_response`).
+        data = loads_or_none(data)
+    if not isinstance(data, dict) or data.get("response_type") != "action_done":
+        return None
+    result = data.get("data")
+    return result if isinstance(result, dict) else None
+
+
+def _round_only_acted(responses: Sequence[ToolMessage]) -> bool:
+    """
+    Return True for a round of HA intent actions that each fully succeeded.
+
+    Every result must say ``action_done``, name at least one device it acted
+    on and none it failed on, and carry no failure note (`_result_succeeded`).
+    A lookup, a script's or service tool's result, a held action and a
+    partial failure all leave the reply to the model, which has something to
+    say about them.
+    """
+    if not responses:
+        return False
+    for msg in responses:
+        result = _intent_action_result(msg)
+        if (
+            result is None
+            or not result.get("success")
+            or result.get("failed")
+            or not _result_succeeded(msg)
+        ):
+            return False
+    return True
+
+
+async def _action_done_reply(state: State, config: RunnableConfig) -> dict[str, Any]:
+    """Reply "Done." in Home Assistant's language after a round that acted."""
+    del state
+    hass = config.get("configurable", {}).get("hass")
+    return {"messages": [AIMessage(content=pin_msg(hass, "action_done"))]}
 
 
 def _pin_line_is_the_reply(config: RunnableConfig) -> bool:
@@ -5392,6 +5444,7 @@ workflow.add_node("retrieve_tools", _retrieve_tools)
 workflow.add_node("agent", _call_model)
 workflow.add_node("action", _call_tools)
 workflow.add_node("tool_loop_guard", _tool_loop_guard)
+workflow.add_node("action_done_reply", _action_done_reply)
 workflow.add_node("summarize_and_remove_messages", _summarize_and_remove_messages)
 
 # Define edges.
@@ -5400,4 +5453,5 @@ workflow.add_edge("retrieve_tools", "agent")
 workflow.add_conditional_edges("agent", _should_continue)
 workflow.add_conditional_edges("action", _after_tools)
 workflow.add_edge("tool_loop_guard", "summarize_and_remove_messages")
+workflow.add_edge("action_done_reply", "summarize_and_remove_messages")
 workflow.add_edge("summarize_and_remove_messages", END)
