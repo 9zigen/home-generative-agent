@@ -86,6 +86,19 @@ their own. See [RELEASING.md](RELEASING.md).
 - **A Sentinel Model on a second Ollama server is no longer held back by chat on the first** ([#877](https://github.com/goruck/home-generative-agent/issues/877)). The local GPU gates decided by deployment alone, so with the Sentinel Model on its own Ollama server, Sentinel still waited for every chat and camera turn on the Conversation server (and its 30 s grace), had its calls cancelled by chat there, and kept the per-run triage limit and the gap between calls: during a conversation, findings went out untriaged and without explanations. Now, when no server in the Sentinel Model's chain (its fallbacks included) is one a Conversation, camera, summarization or embedding model or any of their fallbacks can reach, none of those gates hold Sentinel back, and the log says so at startup. A stalled-provider probe to such a server is also sent during chat. Any shared server, or one whose address is not known, keeps every gate exactly as before. A server is its host name: two Ollama instances on one machine count as one, and every loopback address (`localhost`, `127.0.0.1`, `::1`) is the same. Also fixed: a reload during a Sentinel model call could leave the old Sentinel engine subscribed to state changes.
 - **The docs no longer say `model_provider_uncontended` and `video_model_semaphore` are in a form** (reported on [#1074](https://github.com/goruck/home-generative-agent/issues/1074)). Neither has a form field: the Sentinel docs said to set the first in Options, and the camera docs listed both under the Camera Image Analysis subentry. [Global Options](docs/configuration.md#global-options) now says how to set them, and its last five entries, which had ended up under Prompt caching, are back in the list, with **House notification cooldown** added.
 
+## [3.46.0-beta.9.alab.8] - 2026-11-28
+
+Fork release: 3.46.0-beta.8.alab.7 plus upstream's main after [v3.46.0-beta.9](https://github.com/goruck/home-generative-agent/releases/tag/v3.46.0-beta.9), with two fork changes found on a voice satellite.
+
+### Added
+
+- **Scripts that need no PIN** (see Unreleased). A script that hands a command to the agent to run later can be marked safe, so a delayed request for a light no longer asks for the PIN; the command it hands over is checked again when it runs.
+- **A fixed "Done." after device actions that all succeeded.** When every tool call in a round was a device action that succeeded, the reply is "Done." in Home Assistant's language ("Готово." in Russian) without another model call. A lookup, a failure, a partial result or a PIN prompt still leaves the reply to the model.
+
+### Changed
+
+- **Everything in upstream's main up to 2026-11-27**, including the PIN check on delayed commands ([#1087](https://github.com/goruck/home-generative-agent/pull/1087)). Its PIN prompts for a command run later now have Russian text.
+
 ## [3.46.0-beta.8.alab.7] - 2026-11-22
 
 Fork release: 3.45.3-alab.6 plus upstream's [v3.46.0-beta.8](https://github.com/goruck/home-generative-agent/releases/tag/v3.46.0-beta.8), for field validation of the 3.46.0 bundle with the fork's PIN and memory fixes.
